@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
+from untaped_orchestration.application.results import FederatedSnapshot as FederatedSnapshot
 from untaped_orchestration.application.results import (
     FileDeletion as FileDeletion,
 )
@@ -19,6 +20,7 @@ from untaped_orchestration.application.results import (
 from untaped_orchestration.application.results import (
     RawReference as RawReference,
 )
+from untaped_orchestration.application.results import StoreEntry as StoreEntry
 from untaped_orchestration.application.results import (
     StoreLocation as StoreLocation,
 )
@@ -39,8 +41,10 @@ __all__ = [
     "IdGenerator",
     "LoadedRecord",
     "LockManager",
+    "MutationProjector",
     "RawRecord",
     "RawReference",
+    "StoreEntry",
     "StoreLocation",
     "StoreLockTimeout",
     "StoreReader",
@@ -67,7 +71,7 @@ class StoreReader(Protocol):
 
     def read_file(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord: ...
 
-    def list_files(self, location: StoreLocation) -> tuple[PurePosixPath, ...]: ...
+    def list_entries(self, location: StoreLocation) -> tuple[StoreEntry, ...]: ...
 
 
 class StoreWriter(Protocol):
@@ -88,7 +92,21 @@ class LockManager(Protocol):
 
 
 class ViewRenderer(Protocol):
-    def expected(self, snapshot: StoreSnapshot) -> Mapping[PurePosixPath, bytes]: ...
+    def managed_paths(self) -> tuple[PurePosixPath, ...]: ...
+
+    def expected(
+        self, snapshot: StoreSnapshot | FederatedSnapshot
+    ) -> Mapping[PurePosixPath, bytes]: ...
+
+
+class MutationProjector(Protocol):
+    def project(
+        self,
+        current: FederatedSnapshot,
+        selected: StoreLocation,
+        replacements: Sequence[FileReplacement],
+        deletions: Sequence[FileDeletion],
+    ) -> FederatedSnapshot: ...
 
 
 class CanonicalFormatter(Protocol):

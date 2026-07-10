@@ -6,7 +6,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
-from untaped_orchestration.application.ports import RawReference, StoreLocation
+from untaped_orchestration.application.ports import RawReference, StoreEntry, StoreLocation
 from untaped_orchestration.domain.models import Revision
 
 STORE_ANCHOR = Path(".untaped/orchestration/store.toml")
@@ -298,9 +298,9 @@ def safe_read_path(location: StoreLocation, relative_path: PurePosixPath) -> Pat
     return absolute
 
 
-def store_file_paths(location: StoreLocation) -> tuple[PurePosixPath, ...]:
+def store_entries(location: StoreLocation) -> tuple[StoreEntry, ...]:
     _validate_location(location)
-    paths: list[PurePosixPath] = []
+    entries: list[StoreEntry] = []
     pending = [location.real_root]
     while pending:
         directory = pending.pop()
@@ -309,19 +309,16 @@ def store_file_paths(location: StoreLocation) -> tuple[PurePosixPath, ...]:
         ):
             relative = PurePosixPath(entry.relative_to(location.real_root).as_posix())
             if entry.is_symlink():
-                raise PathSafetyError(
-                    relative, "symlinks below the resolved store root are forbidden"
-                )
-            if entry.is_dir():
+                entries.append(StoreEntry(relative, "symlink"))
+            elif entry.is_dir():
+                entries.append(StoreEntry(relative, "directory"))
                 pending.append(entry)
             elif entry.is_file():
-                paths.append(relative)
+                entries.append(StoreEntry(relative, "file"))
             else:
-                raise PathSafetyError(
-                    relative, "store entries must be regular files or directories"
-                )
-    reject_casefold_path_aliases(paths)
-    return tuple(sorted(paths, key=lambda value: value.as_posix()))
+                entries.append(StoreEntry(relative, "other"))
+    reject_casefold_path_aliases(value.path for value in entries)
+    return tuple(sorted(entries, key=lambda value: value.path.as_posix()))
 
 
 def _is_writable_canonical_path(relative_path: PurePosixPath) -> bool:

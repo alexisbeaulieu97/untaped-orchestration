@@ -341,6 +341,25 @@ def test_registry_revision_hashes_exact_bytes_and_store_revision_excludes_views_
     assert repository.load_local(location, headers_only=True).store_revision == first.store_revision
 
 
+def test_store_entry_enumeration_exposes_directories_symlinks_and_atomic_temporaries(
+    local_store: Path,
+    tmp_path: Path,
+) -> None:
+    local_store.joinpath("views").mkdir()
+    local_store.joinpath("views", "nested").mkdir()
+    local_store.joinpath(".store.toml.untaped-tmp-orphan").write_bytes(b"partial")
+    local_store.joinpath("linked").symlink_to(tmp_path)
+
+    entries = FilesystemStoreRepository().list_entries(location_from_root(local_store))
+
+    assert {(value.path.as_posix(), value.kind) for value in entries} >= {
+        ("views", "directory"),
+        ("views/nested", "directory"),
+        (".store.toml.untaped-tmp-orphan", "file"),
+        ("linked", "symlink"),
+    }
+
+
 def test_read_raw_returns_exact_binary_content_and_metadata(local_store: Path) -> None:
     path = PurePosixPath(f"tasks/{TASK_ID}-broken.md")
     absolute = local_store.joinpath(*path.parts)

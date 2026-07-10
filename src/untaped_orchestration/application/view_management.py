@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+
+from untaped_orchestration.application.ports import (
+    FileDeletion,
+    FileReplacement,
+    StoreLocation,
+    StoreReader,
+    StoreSnapshot,
+    StoreWriter,
+    ViewRenderer,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ViewState:
+    intended_paths: tuple[PurePosixPath, ...]
+    changed_paths: tuple[PurePosixPath, ...]
+    current: bool
+
+
+def _content(reader: StoreReader, location: StoreLocation, path: PurePosixPath) -> bytes | None:
+    try:
+        return reader.read_file(location, path).content
+    except FileNotFoundError:
+        return None
+
+
+def view_comparisons(
+    reader: StoreReader,
+    location: StoreLocation,
+    renderer: ViewRenderer,
+    snapshot: StoreSnapshot,
+) -> tuple[dict[PurePosixPath, bytes], dict[PurePosixPath, bool]]:
+    expected = dict(renderer.expected(snapshot))
+    comparisons = {
+        path: (
+            _content(reader, location, path) == expected[path]
+            if path in expected
+            else _content(reader, location, path) is None
+        )
+        for path in renderer.managed_paths()
+    }
+    return expected, comparisons
+
+
+def apply_views(
+    reader: StoreReader,
+    writer: StoreWriter,
+    location: StoreLocation,
+    renderer: ViewRenderer,
+    snapshot: StoreSnapshot,
+) -> ViewState:
+    managed = renderer.managed_paths()
+    try:
+        expected, before = view_comparisons(reader, location, renderer, snapshot)
+    except OSError, ValueError:
+        return ViewState(managed, (), False)
+    intended = tuple(path for path in managed if path in expected or not before[path])
+    try:
+        for path in managed:
+            if before[path]:
+                continue
+            if path in expected:
+                writer.replace(location, FileReplacement(path, expected[path]))
+            else:
+                writer.delete(location, FileDeletion(path))
+    except OSError, ValueError:
+        pass
+
+    after = {
+        path: (
+            _content(reader, location, path) == expected[path]
+            if path in expected
+            else _content(reader, location, path) is None
+        )
+        for path in managed
+    }
+    changed = tuple(path for path in intended if not before[path] and after[path])
+    return ViewState(intended, changed, all(after.values()))

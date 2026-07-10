@@ -2,15 +2,23 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
+import pytest
+
 from tests.builders import write_store
-from untaped_orchestration.application.mutations import IntendedMutation, MutationExecutor
+from untaped_orchestration.application.mutations import (
+    IntendedMutation,
+    InvalidMutationState,
+    MutationExecutor,
+    MutationLockSetError,
+)
 from untaped_orchestration.application.ports import FileReplacement
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
-from untaped_orchestration.infrastructure.filesystem import file_revision, location_from_root
+from untaped_orchestration.infrastructure.filesystem import location_from_root
+from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
+from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
 
 
 class RecordingLocks:
@@ -21,8 +29,7 @@ class RecordingLocks:
     @contextmanager
     def acquire(self, locations: Sequence, *, timeout: float) -> Iterator[None]:
         assert timeout == 10.0
-        assert len(locations) == 2
-        self.events.append("lock")
+        self.events.append(f"lock:{len(locations)}")
         self.active = True
         try:
             yield
@@ -31,30 +38,65 @@ class RecordingLocks:
             self.events.append("unlock")
 
 
-class RecordingReader:
-    def __init__(self, snapshots, events: list[str], locks: RecordingLocks) -> None:
-        self.snapshots = list(snapshots)
+class RecordingRepository:
+    def __init__(
+        self,
+        delegate: FilesystemStoreRepository,
+        events: list[str],
+        locks: RecordingLocks,
+    ) -> None:
+        self.delegate = delegate
         self.events = events
         self.locks = locks
+        self.writes: list[PurePosixPath] = []
 
     def load_local(self, location, *, headers_only: bool):
         assert self.locks.active
         self.events.append("reload")
-        return self.snapshots.pop(0)
+        return self.delegate.load_local(location, headers_only=headers_only)
 
-
-class RecordingWriter:
-    def __init__(self, events: list[str], locks: RecordingLocks) -> None:
-        self.events = events
-        self.locks = locks
+    def read_file(self, location, path):
+        return self.delegate.read_file(location, path)
 
     def replace(self, location, change) -> None:
         assert self.locks.active
         self.events.append(f"write:{change.path.as_posix()}")
+        self.writes.append(change.path)
+        self.delegate.replace(location, change)
 
     def delete(self, location, change) -> None:
         assert self.locks.active
         self.events.append(f"delete:{change.path.as_posix()}")
+        self.delegate.delete(location, change)
+
+
+class RecordingProjector:
+    def __init__(
+        self,
+        delegate: FilesystemStoreRepository,
+        events: list[str],
+        locks: RecordingLocks,
+    ) -> None:
+        self.delegate = delegate
+        self.events = events
+        self.locks = locks
+
+    def project(self, current, selected, replacements, deletions):
+        assert self.locks.active
+        self.events.append("project")
+        return self.delegate.project(current, selected, replacements, deletions)
+
+
+class StaleReloadRepository(RecordingRepository):
+    def __init__(self, delegate, events, locks, stale) -> None:
+        super().__init__(delegate, events, locks)
+        self.stale = stale
+
+    def load_local(self, location, *, headers_only: bool):
+        del location, headers_only
+        assert self.locks.active
+        self.events.append("reload")
+        return self.stale
 
 
 class RecordingViews:
@@ -62,6 +104,9 @@ class RecordingViews:
         self.events = events
         self.locks = locks
         self.fail = fail
+
+    def managed_paths(self) -> tuple[PurePosixPath, ...]:
+        return (PurePosixPath("views/decisions.md"),)
 
     def expected(self, snapshot) -> Mapping[PurePosixPath, bytes]:
         assert self.locks.active
@@ -71,105 +116,247 @@ class RecordingViews:
         return {PurePosixPath("views/decisions.md"): b"view\n"}
 
 
-def _snapshots(tmp_path: Path):
+def _state(tmp_path: Path):
     first_root = write_store(tmp_path / "first")
     second_root = write_store(tmp_path / "second", store_id="sto_019f0000000070008000000000000001")
     repository = FilesystemStoreRepository()
     first = repository.load_local(location_from_root(first_root), headers_only=False)
     second = repository.load_local(location_from_root(second_root), headers_only=False)
-    current = FederatedSnapshot(first, (first, second), Completeness())
-    after = replace(first, store_revision=file_revision(b"after"))
-    intended = FederatedSnapshot(after, (after, second), Completeness())
-    return first, second, current, intended
+    return repository, FederatedSnapshot(first, (first, second), Completeness())
 
 
-def test_shared_finalizer_enforces_the_exact_phase_order_under_the_complete_lock_set(
+def _replacement(current: FederatedSnapshot) -> FileReplacement:
+    assert current.selected.registry is not None
+    raw = (
+        b'schema = "untaped.orchestration.registry/v1"\n'
+        + f'store_id = "{current.selected.registry.store_id.root}"\n'.encode()
+        + b"\n[[children]]\n"
+        + b'id = "sto_019f0000000070008000000000000001"\n'
+        + b'path = "../../second/.untaped/orchestration"\n'
+    )
+    return FileReplacement(PurePosixPath("registry.toml"), raw)
+
+
+def test_shared_finalizer_projects_bytes_and_enforces_exact_phase_order(
     tmp_path: Path,
 ) -> None:
-    first, second, current, intended = _snapshots(tmp_path)
+    repository, current = _state(tmp_path)
     events: list[str] = []
     locks = RecordingLocks(events)
-    reader = RecordingReader((intended.selected,), events, locks)
-    writer = RecordingWriter(events, locks)
+    adapter = RecordingRepository(repository, events, locks)
+    projector = RecordingProjector(repository, events, locks)
     views = RecordingViews(events, locks)
 
-    def load() -> FederatedSnapshot:
-        assert locks.active
-        events.append("load")
-        return current
-
-    validations = iter(("validate-current", "validate-intended"))
+    validations = iter(("validate-current", "validate-intended", "validate-after"))
 
     def validate(snapshot: FederatedSnapshot):
         del snapshot
         events.append(next(validations))
         return ()
 
-    def guard(snapshot: FederatedSnapshot) -> None:
-        assert snapshot is current
-        events.append("guard")
+    def load() -> FederatedSnapshot:
+        events.append("load")
+        return current
 
-    def build(snapshot: FederatedSnapshot) -> IntendedMutation:
-        assert snapshot is current
-        events.append("build")
-        return IntendedMutation(
-            snapshot=intended,
-            replacements=(FileReplacement(PurePosixPath("registry.toml"), b"new\n"),),
-        )
-
-    result = MutationExecutor(reader, writer, locks, views, validator=validate).execute(
-        locations=(second.location, first.location),
-        selected=first.location,
+    result = MutationExecutor(
+        adapter,
+        adapter,
+        locks,
+        views,
+        projector=projector,
+        validator=validate,
+    ).execute(
+        locations=tuple(value.location for value in reversed(current.stores)),
+        selected=current.selected.location,
         load=load,
-        guard=guard,
-        build=build,
+        guard=lambda _: events.append("guard"),
+        build=lambda snapshot: (
+            events.append("build") or IntendedMutation(replacements=(_replacement(snapshot),))
+        ),
     )
 
     assert events == [
-        "lock",
+        "lock:2",
         "load",
         "validate-current",
         "guard",
         "build",
+        "project",
         "validate-intended",
         "write:registry.toml",
         "reload",
+        "validate-after",
         "render",
         "write:views/decisions.md",
         "unlock",
     ]
     assert result.canonical_applied
     assert result.views_current
-    assert result.store_revision == file_revision(b"after")
     assert result.intended_paths == (
         PurePosixPath("registry.toml"),
         PurePosixPath("views/decisions.md"),
     )
 
 
-def test_renderer_failure_preserves_canonical_success_and_reports_views_not_current(
+@pytest.mark.parametrize("mode", ["missing", "extra", "wrong-selected"])
+def test_finalizer_rejects_any_lock_set_or_selected_location_mismatch_before_build(
     tmp_path: Path,
+    mode: str,
 ) -> None:
-    first, second, current, intended = _snapshots(tmp_path)
+    repository, current = _state(tmp_path)
     events: list[str] = []
     locks = RecordingLocks(events)
-    reader = RecordingReader((intended.selected,), events, locks)
-    writer = RecordingWriter(events, locks)
+    adapter = RecordingRepository(repository, events, locks)
+    projector = RecordingProjector(repository, events, locks)
+    locations = [value.location for value in current.stores]
+    selected = current.selected.location
+    if mode == "missing":
+        locations.pop()
+    elif mode == "extra":
+        extra_root = write_store(
+            tmp_path / "extra", store_id="sto_019f0000000070008000000000000002"
+        )
+        locations.append(location_from_root(extra_root))
+    else:
+        selected = current.stores[1].location
+
+    with pytest.raises(MutationLockSetError):
+        MutationExecutor(
+            adapter, adapter, locks, RecordingViews(events, locks), projector=projector
+        ).execute(
+            locations=locations,
+            selected=selected,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda _: pytest.fail("build must not run"),
+        )
+
+    assert adapter.writes == []
+
+
+def test_invalid_replacement_bytes_cannot_hide_behind_a_fabricated_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = RecordingRepository(repository, events, locks)
+    projector = RecordingProjector(repository, events, locks)
+    invalid = FileReplacement(PurePosixPath("registry.toml"), b"not = [valid\n")
+
+    with pytest.raises(InvalidMutationState) as captured:
+        MutationExecutor(
+            adapter, adapter, locks, RecordingViews(events, locks), projector=projector
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda _: IntendedMutation(replacements=(invalid,)),
+        )
+
+    assert captured.value.diagnostics
+    assert adapter.writes == []
+
+
+def test_renderer_failure_preserves_complete_intended_view_paths(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = RecordingRepository(repository, events, locks)
+    projector = RecordingProjector(repository, events, locks)
     views = RecordingViews(events, locks, fail=True)
 
-    result = MutationExecutor(reader, writer, locks, views, validator=lambda _: ()).execute(
-        locations=(first.location, second.location),
-        selected=first.location,
+    result = MutationExecutor(
+        adapter,
+        adapter,
+        locks,
+        views,
+        projector=projector,
+        validator=lambda _: (),
+    ).execute(
+        locations=tuple(value.location for value in current.stores),
+        selected=current.selected.location,
         load=lambda: current,
         guard=lambda _: None,
-        build=lambda _: IntendedMutation(
-            snapshot=intended,
-            replacements=(FileReplacement(PurePosixPath("registry.toml"), b"new\n"),),
-        ),
+        build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
     )
 
-    assert "write:registry.toml" in events
-    assert result.applied
     assert result.canonical_applied
     assert not result.views_current
+    assert result.intended_paths == (
+        PurePosixPath("registry.toml"),
+        PurePosixPath("views/decisions.md"),
+    )
     assert result.changed_paths == (PurePosixPath("registry.toml"),)
+
+
+def test_finalizer_rejects_a_durable_result_that_differs_from_the_projection(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = StaleReloadRepository(repository, events, locks, current.selected)
+    projector = RecordingProjector(repository, events, locks)
+
+    with pytest.raises(InvalidMutationState) as captured:
+        MutationExecutor(
+            adapter,
+            adapter,
+            locks,
+            RecordingViews(events, locks),
+            projector=projector,
+            validator=lambda _: (),
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
+        )
+
+    assert captured.value.diagnostics[0].code == "ORC007"
+
+
+def test_mutation_deletes_inapplicable_managed_views_under_the_same_lock(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    root = current.selected.location.root
+    views_root = root / "views"
+    views_root.mkdir()
+    managed = MarkdownViewRenderer().managed_paths()
+    for path in managed:
+        root.joinpath(*path.parts).write_bytes(b"sensitive or stale\n")
+    store_path = root / "store.toml"
+    replacement = FileReplacement(
+        PurePosixPath("store.toml"),
+        store_path.read_bytes().replace(b"active_tasks = true", b"active_tasks = false"),
+    )
+
+    result = MutationExecutor(
+        repository,
+        repository,
+        FileLockManager(),
+        MarkdownViewRenderer(),
+        projector=repository,
+    ).execute(
+        locations=tuple(value.location for value in current.stores),
+        selected=current.selected.location,
+        load=lambda: current,
+        guard=lambda _: None,
+        build=lambda _: IntendedMutation(replacements=(replacement,)),
+    )
+
+    deleted = {
+        PurePosixPath("views/roadmap.md"),
+        PurePosixPath("views/backlog.md"),
+        PurePosixPath("views/inbox.md"),
+    }
+    assert deleted <= set(result.intended_paths)
+    assert deleted <= set(result.changed_paths)
+    assert all(not root.joinpath(*path.parts).exists() for path in deleted)
+    assert root.joinpath("views/decisions.md").is_file()

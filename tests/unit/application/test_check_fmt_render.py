@@ -4,7 +4,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from tests.builders import DECISION_ID, STORE_ID, decision_bytes
+from tests.builders import DECISION_ID, STORE_ID, TASK_ID, decision_bytes, task_bytes
 from untaped_orchestration.application.bootstrap import InitializeStore, InitRequest
 from untaped_orchestration.application.maintenance import (
     CheckStore,
@@ -24,6 +24,7 @@ class RecordingWriter:
     def __init__(self, delegate: FilesystemStoreRepository) -> None:
         self.delegate = delegate
         self.replacements: list[PurePosixPath] = []
+        self.deletions: list[PurePosixPath] = []
 
     def prepare(self, root: Path):
         return self.delegate.prepare(root)
@@ -33,13 +34,36 @@ class RecordingWriter:
         self.delegate.replace(location, change)
 
     def delete(self, location, change) -> None:
+        self.deletions.append(change.path)
         self.delegate.delete(location, change)
 
 
 class FailingViews:
+    def managed_paths(self):
+        return MarkdownViewRenderer().managed_paths()
+
     def expected(self, snapshot):
         del snapshot
         raise OSError("renderer unavailable")
+
+
+class ExplodingViews(FailingViews):
+    def expected(self, snapshot):
+        del snapshot
+        raise AssertionError("invalid state must not be rendered")
+
+
+class FailAfterDurableViewWrite(RecordingWriter):
+    def __init__(self, delegate: FilesystemStoreRepository, stop_after: int) -> None:
+        super().__init__(delegate)
+        self.stop_after = stop_after
+        self.writes = 0
+
+    def replace(self, location, change) -> None:
+        super().replace(location, change)
+        self.writes += 1
+        if self.writes == self.stop_after:
+            raise OSError("view acknowledgement lost")
 
 
 def _initialized(tmp_path: Path):
@@ -202,3 +226,167 @@ def test_fmt_view_failure_preserves_canonical_write_and_reports_stale_views(
     assert result.canonical_applied
     assert not result.views_current
     assert b"# comment" not in store.read_bytes()
+
+
+def test_decision_only_conversion_diagnoses_and_deletes_all_sensitive_task_views(
+    tmp_path: Path,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    sensitive = b"private unfinished acquisition target\n"
+    for name in ("roadmap.md", "backlog.md", "inbox.md"):
+        root.joinpath("views", name).write_bytes(sensitive)
+    store = root / "store.toml"
+    store.write_bytes(store.read_bytes().replace(b"active_tasks = true", b"active_tasks = false"))
+    location = location_from_root(root)
+
+    before = CheckStore(repository, locks, views).execute(location)
+    rendered = RenderStore(repository, repository, locks, views).write(location)
+    after = CheckStore(repository, locks, views).execute(location)
+
+    stale = {
+        PurePosixPath("views/roadmap.md"),
+        PurePosixPath("views/backlog.md"),
+        PurePosixPath("views/inbox.md"),
+    }
+    assert {value.path for value in before.diagnostics if value.code == "ORC008"} == {
+        *(path.as_posix() for path in stale),
+        "views/decisions.md",
+    }
+    assert stale <= set(rendered.intended_paths)
+    assert stale <= set(rendered.changed_paths)
+    assert all(not root.joinpath(*path.parts).exists() for path in stale)
+    assert tuple(path.name for path in root.joinpath("views").iterdir()) == ("decisions.md",)
+    assert after.valid
+    assert after.views_current
+
+
+def test_check_keeps_partial_scaffold_and_orphan_temp_diagnostics_after_view_repair(
+    tmp_path: Path,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    root.joinpath("registry.toml").unlink()
+    root.joinpath("AGENTS.md").unlink()
+    root.joinpath("CLAUDE.md").unlink()
+    orphan = root / ".store.toml.untaped-tmp-orphan"
+    orphan.write_bytes(b"partial")
+    root.joinpath("views/roadmap.md").unlink()
+    location = location_from_root(root)
+
+    RenderStore(repository, repository, locks, views).write(location)
+    result = CheckStore(repository, locks, views).execute(location)
+
+    assert not result.valid
+    assert {(value.code, value.path) for value in result.diagnostics} >= {
+        ("ORC003", "registry.toml"),
+        ("ORC003", "AGENTS.md"),
+        ("ORC003", "CLAUDE.md"),
+        ("ORC003", orphan.name),
+    }
+    assert not any(value.code == "ORC008" for value in result.diagnostics)
+
+
+@pytest.mark.parametrize("kind", ["decision", "task"])
+def test_check_aggregates_duplicate_identity_without_calling_renderer(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    root, repository, locks, _ = _initialized(tmp_path)
+    item_id, raw, directory = (
+        (DECISION_ID, decision_bytes(), root / "decisions")
+        if kind == "decision"
+        else (TASK_ID, task_bytes(), root / "tasks")
+    )
+    directory.mkdir()
+    directory.joinpath(f"{item_id}-first.md").write_bytes(raw)
+    directory.joinpath(f"{item_id}-second.md").write_bytes(raw)
+
+    result = CheckStore(repository, locks, ExplodingViews()).execute(location_from_root(root))
+
+    assert not result.valid
+    duplicates = [
+        value for value in result.diagnostics if value.code == "ORC003" and value.field == "id"
+    ]
+    assert len(duplicates) == 2
+
+
+def test_check_reports_malformed_item_without_calling_renderer(tmp_path: Path) -> None:
+    root, repository, locks, _ = _initialized(tmp_path)
+    decisions = root / "decisions"
+    decisions.mkdir()
+    decisions.joinpath(f"{DECISION_ID}-broken.md").write_bytes(b"+++\nnot = [valid\n")
+
+    result = CheckStore(repository, locks, ExplodingViews()).execute(location_from_root(root))
+
+    assert not result.valid
+    assert any(value.code == "ORC001" for value in result.diagnostics)
+
+
+def test_fmt_deletes_inapplicable_managed_views_after_capability_change(
+    tmp_path: Path,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    store = root / "store.toml"
+    store.write_bytes(store.read_bytes().replace(b"active_tasks = true", b"active_tasks = false"))
+    location = location_from_root(root)
+    revision = repository.load_local(location, headers_only=True).store_revision
+    recording = RecordingWriter(repository)
+
+    result = FormatStore(repository, recording, locks, views, CanonicalStoreFormatter()).write(
+        location, expected_store_revision=revision
+    )
+
+    expected_deletions = {
+        PurePosixPath("views/roadmap.md"),
+        PurePosixPath("views/backlog.md"),
+        PurePosixPath("views/inbox.md"),
+    }
+    assert set(recording.deletions) == expected_deletions
+    assert expected_deletions <= set(result.changed_paths)
+    assert result.views_current
+
+
+@pytest.mark.parametrize("service", ["fmt", "render"])
+def test_write_refusal_preserves_exact_validation_diagnostics(
+    tmp_path: Path,
+    service: str,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    decisions = root / "decisions"
+    decisions.mkdir()
+    decisions.joinpath(f"{DECISION_ID}-first.md").write_bytes(decision_bytes())
+    decisions.joinpath(f"{DECISION_ID}-second.md").write_bytes(decision_bytes())
+    location = location_from_root(root)
+
+    with pytest.raises(InvalidStoreState) as captured:
+        if service == "fmt":
+            revision = repository.load_local(location, headers_only=True).store_revision
+            FormatStore(repository, repository, locks, views, CanonicalStoreFormatter()).write(
+                location, expected_store_revision=revision
+            )
+        else:
+            RenderStore(repository, repository, locks, views).write(location)
+
+    assert captured.value.diagnostics
+    assert not captured.value.result.valid
+    assert captured.value.result.diagnostics == captured.value.diagnostics
+    assert (
+        captured.value.diagnostics
+        == CheckStore(repository, locks, views).execute(location).diagnostics
+    )
+
+
+def test_partial_render_failure_reports_every_durably_matching_view_change(
+    tmp_path: Path,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    location = location_from_root(root)
+    for name in ("roadmap.md", "backlog.md", "inbox.md", "decisions.md"):
+        root.joinpath("views", name).write_text("stale\n")
+    failing = FailAfterDurableViewWrite(repository, stop_after=2)
+
+    result = RenderStore(repository, failing, locks, views).write(location)
+
+    expected_order = views.managed_paths()
+    assert result.intended_paths == expected_order
+    assert result.changed_paths == expected_order[:2]
+    assert not result.views_current

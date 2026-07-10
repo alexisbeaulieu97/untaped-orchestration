@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
+    FederatedSnapshot,
     FileDeletion,
     FileReplacement,
     LoadedRecord,
     RawRecord,
     RawReference,
+    StoreEntry,
     StoreLocation,
     StoreReader,
     StoreSnapshot,
@@ -35,7 +38,7 @@ from untaped_orchestration.infrastructure.filesystem import (
     safe_raw_path,
     safe_read_path,
     safe_write_path,
-    store_file_paths,
+    store_entries,
     store_revision_from_file_revisions,
 )
 
@@ -170,8 +173,8 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
             content=raw,
         )
 
-    def list_files(self, location: StoreLocation) -> tuple[PurePosixPath, ...]:
-        return store_file_paths(location)
+    def list_entries(self, location: StoreLocation) -> tuple[StoreEntry, ...]:
+        return store_entries(location)
 
     def prepare(self, root: Path) -> StoreLocation:
         return prepare_store_root(root)
@@ -192,6 +195,104 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
 
     def item_bytes(self, metadata: CanonicalItem, body: bytes) -> bytes:
         return self._items.canonical_bytes(ItemDocument(metadata=metadata, body=body, original=b""))
+
+    def project(
+        self,
+        current: FederatedSnapshot,
+        selected: StoreLocation,
+        replacements: Sequence[FileReplacement],
+        deletions: Sequence[FileDeletion],
+    ) -> FederatedSnapshot:
+        files = {
+            path: selected.real_root.joinpath(*path.parts).read_bytes()
+            for path in canonical_input_paths(selected)
+        }
+        for replacement in replacements:
+            files[replacement.path] = replacement.content
+        for deletion in deletions:
+            files.pop(deletion.path, None)
+        projected = self._snapshot_from_bytes(selected, files)
+        stores = tuple(
+            projected if value.location.real_root == selected.real_root else value
+            for value in current.stores
+        )
+        return FederatedSnapshot(projected, stores, current.completeness)
+
+    def _snapshot_from_bytes(
+        self,
+        location: StoreLocation,
+        files: dict[PurePosixPath, bytes],
+    ) -> StoreSnapshot:
+        diagnostics: list[Diagnostic] = []
+        store = None
+        registry = None
+        records: list[LoadedRecord] = []
+        raw_index: list[RawReference] = []
+        revisions = {path: file_revision(raw) for path, raw in files.items()}
+        for path, raw in sorted(files.items(), key=lambda value: value[0].as_posix()):
+            if _is_item_path(path):
+                try:
+                    parsed = self._items.parse(raw, relative_path=path)
+                except CodecError as error:
+                    diagnostics.append(error.diagnostic)
+                    continue
+                records.append(LoadedRecord(path, revisions[path], parsed.metadata, parsed.body))
+                raw_index.append(RawReference(path, revisions[path], len(raw)))
+            elif path == PurePosixPath("store.toml"):
+                try:
+                    store = self._stores.parse(raw)
+                except CodecError as error:
+                    diagnostics.append(error.diagnostic)
+            elif path == PurePosixPath("registry.toml"):
+                try:
+                    registry = self._registries.parse(raw)
+                except CodecError as error:
+                    diagnostics.append(error.diagnostic)
+        if store is not None and registry is not None and store.id != registry.store_id:
+            diagnostics.append(
+                Diagnostic(
+                    code="ORC003",
+                    severity="error",
+                    path="registry.toml",
+                    field="store_id",
+                    message="registry store identity does not match store.toml",
+                    hint="Set registry.toml store_id to the immutable local store ID.",
+                )
+            )
+        records.sort(key=lambda value: value.path.as_posix())
+        raw_index.sort(
+            key=lambda value: (
+                value.path.name.casefold(),
+                value.path.name,
+                value.path.as_posix(),
+            )
+        )
+        store_config_revision = revisions.get(PurePosixPath("store.toml"))
+        if store_config_revision is None:
+            store_config_revision = current_revision = file_revision(b"")
+            diagnostics.append(
+                Diagnostic(
+                    code="ORC003",
+                    severity="error",
+                    path="store.toml",
+                    field="path",
+                    message="store anchor cannot be deleted by a mutation",
+                    hint="Keep the immutable store.toml anchor.",
+                )
+            )
+        else:
+            current_revision = store_revision_from_file_revisions(revisions)
+        return StoreSnapshot(
+            location=location,
+            store=store,
+            registry=registry,
+            records=tuple(records),
+            load_diagnostics=sort_diagnostics(diagnostics),
+            raw_index=tuple(raw_index),
+            store_revision=current_revision,
+            registry_revision=revisions.get(PurePosixPath("registry.toml")),
+            store_config_revision=store_config_revision,
+        )
 
 
 def _is_item_path(relative_path: PurePosixPath) -> bool:

@@ -140,9 +140,30 @@ class InitializeStore:
         ordered = tuple(expected)
 
         with self._locks.acquire((location,), timeout=self._lock_timeout):
-            present = tuple(
-                path for path in self._reader.list_files(location) if not _ignored(path)
+            entries = self._reader.list_entries(location)
+            unsafe = next(
+                (
+                    entry
+                    for entry in entries
+                    if entry.kind not in {"file", "directory"}
+                    or (entry.kind == "directory" and entry.path != PurePosixPath("views"))
+                ),
+                None,
             )
+            if unsafe is not None:
+                raise InitConflictError(
+                    f"unsafe or unexpected store entry: {unsafe.path.as_posix()} ({unsafe.kind})"
+                )
+            present = tuple(
+                entry.path for entry in entries if entry.kind == "file" and not _ignored(entry.path)
+            )
+            has_view_file = any(path.parent == PurePosixPath("views") for path in present)
+            if any(
+                entry.kind == "directory"
+                and (entry.path != PurePosixPath("views") or not has_view_file)
+                for entry in entries
+            ):
+                raise InitConflictError("unexpected directory blocks init recovery")
             unexpected = next((path for path in present if path not in expected), None)
             if unexpected is not None:
                 raise InitConflictError(f"unexpected file blocks init: {unexpected.as_posix()}")

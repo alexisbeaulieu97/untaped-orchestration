@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -7,6 +8,7 @@ from untaped_orchestration.application.ports import (
     FileDeletion,
     FileReplacement,
     LockManager,
+    MutationProjector,
     StoreLocation,
     StoreReader,
     StoreWriter,
@@ -18,6 +20,7 @@ from untaped_orchestration.application.results import (
     MutationReceipt,
 )
 from untaped_orchestration.application.validation import validate_snapshot
+from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.domain.diagnostics import Diagnostic
 
 DEFAULT_LOCK_TIMEOUT = 10.0
@@ -29,9 +32,12 @@ class InvalidMutationState(ValueError):
         super().__init__("mutation requires a valid complete intended store state")
 
 
+class MutationLockSetError(ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class IntendedMutation:
-    snapshot: FederatedSnapshot
     replacements: tuple[FileReplacement, ...] = ()
     deletions: tuple[FileDeletion, ...] = ()
 
@@ -51,6 +57,30 @@ def _valid_or_raise(
         raise InvalidMutationState(diagnostics)
 
 
+def _location_key(location: StoreLocation) -> str:
+    return os.path.normcase(str(location.real_root)).casefold()
+
+
+def _validate_lock_set(
+    locations: Sequence[StoreLocation],
+    selected: StoreLocation,
+    current: FederatedSnapshot,
+) -> None:
+    locked = tuple(_location_key(value) for value in locations)
+    resolved = tuple(_location_key(value.location) for value in current.stores)
+    selected_key = _location_key(selected)
+    if (
+        len(set(locked)) != len(locked)
+        or set(locked) != set(resolved)
+        or len(set(resolved)) != len(resolved)
+        or selected_key != _location_key(current.selected.location)
+        or selected_key not in set(locked)
+    ):
+        raise MutationLockSetError(
+            "locked locations must exactly match resolved stores and include the selected store"
+        )
+
+
 class MutationExecutor:
     def __init__(
         self,
@@ -59,6 +89,7 @@ class MutationExecutor:
         locks: LockManager,
         views: ViewRenderer,
         *,
+        projector: MutationProjector,
         validator: SnapshotValidator | None = None,
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     ) -> None:
@@ -68,6 +99,7 @@ class MutationExecutor:
         self._writer = writer
         self._locks = locks
         self._views = views
+        self._projector = projector
         self._validator = validator or (
             lambda snapshot: validate_snapshot(snapshot, require_children=True)
         )
@@ -86,9 +118,16 @@ class MutationExecutor:
         with self._locks.acquire(locations, timeout=self._lock_timeout):
             current = load()
             _valid_or_raise(current, self._validator)
+            _validate_lock_set(locations, selected, current)
             guard(current)
             intended = build(current)
-            _valid_or_raise(intended.snapshot, self._validator)
+            projected = self._projector.project(
+                current,
+                selected,
+                intended.replacements,
+                intended.deletions,
+            )
+            _valid_or_raise(projected, self._validator)
 
             changed = []
             for replacement in intended.replacements:
@@ -100,27 +139,40 @@ class MutationExecutor:
 
             canonical_applied = bool(intended.replacements or intended.deletions)
             selected_after = self._reader.load_local(selected, headers_only=False)
-            views_current = True
-            try:
-                expected_views = self._views.expected(selected_after)
-                for path, content in expected_views.items():
-                    try:
-                        matches = self._reader.read_file(selected, path).content == content
-                    except AttributeError, FileNotFoundError:
-                        matches = False
-                    if matches:
-                        continue
-                    self._writer.replace(selected, FileReplacement(path, content))
-                    changed.append(path)
-            except OSError, ValueError:
-                views_current = False
-                expected_views = {}
+            after = FederatedSnapshot(
+                selected_after,
+                tuple(
+                    selected_after
+                    if _location_key(value.location) == _location_key(selected)
+                    else value
+                    for value in projected.stores
+                ),
+                projected.completeness,
+            )
+            _valid_or_raise(after, self._validator)
+            if selected_after != projected.selected:
+                raise InvalidMutationState(
+                    (
+                        Diagnostic(
+                            code="ORC007",
+                            severity="error",
+                            path=selected.root.as_posix(),
+                            field="store_revision",
+                            message="durable mutation result differs from projected intended state",
+                            hint="Stop and inspect exact changed paths before retrying.",
+                        ),
+                    )
+                )
 
+            view_state = apply_views(
+                self._reader, self._writer, selected, self._views, selected_after
+            )
+            changed.extend(view_state.changed_paths)
             intended_paths = tuple(
                 (
                     *(value.path for value in intended.replacements),
                     *(value.path for value in intended.deletions),
-                    *expected_views,
+                    *view_state.intended_paths,
                 )
             )
 
@@ -128,7 +180,7 @@ class MutationExecutor:
                 applied=bool(changed),
                 replayed=replayed,
                 canonical_applied=canonical_applied,
-                views_current=views_current,
+                views_current=view_state.current,
                 intended_paths=intended_paths,
                 changed_paths=tuple(changed),
                 item_revisions=tuple(

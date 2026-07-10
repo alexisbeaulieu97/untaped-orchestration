@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 from tests.builders import DECISION_ID, STORE_ID, TASK_ID, decision_bytes, task_bytes, write_store
-from untaped_orchestration.application.results import LoadedRecord
+from untaped_orchestration.application.results import Completeness, FederatedSnapshot, LoadedRecord
 from untaped_orchestration.domain.ids import DecisionId, StoreId
 from untaped_orchestration.domain.models import Link, LinkRelation, TaskStage
 from untaped_orchestration.infrastructure.codec import ItemCodec
@@ -223,12 +223,22 @@ def test_views_never_include_bodies_or_another_store_snapshot(tmp_path: Path) ->
     snapshot = _empty_snapshot(tmp_path)
     local = _record(f"decisions/{DECISION_ID}-choice.md", decision_bytes(), body=b"SECRET BODY")
     foreign = local.metadata.model_copy(update={"id": SECOND_DECISION_ID, "title": "Foreign"})
-    snapshot = replace(
-        snapshot,
-        records=(local,),
+    selected = replace(snapshot, records=(local,))
+    foreign_snapshot = replace(
+        _empty_snapshot(tmp_path / "foreign"),
+        records=(
+            _record(
+                f"decisions/{SECOND_DECISION_ID}-foreign.md",
+                decision_bytes(),
+                metadata=foreign,
+                body=b"FOREIGN SECRET",
+            ),
+        ),
     )
+    federated = FederatedSnapshot(selected, (selected, foreign_snapshot), Completeness())
 
-    raw = b"".join(MarkdownViewRenderer().expected(snapshot).values())
+    raw = b"".join(MarkdownViewRenderer().expected(federated).values())
 
     assert b"SECRET BODY" not in raw
+    assert b"FOREIGN SECRET" not in raw
     assert foreign.title.encode() not in raw

@@ -70,6 +70,14 @@ type IncompletenessReason = Literal[
     "changed",
 ]
 
+type StoreEntryKind = Literal["file", "directory", "symlink", "other"]
+
+
+@dataclass(frozen=True, slots=True)
+class StoreEntry:
+    path: PurePosixPath
+    kind: StoreEntryKind
+
 
 @dataclass(frozen=True, slots=True)
 class IncompleteStore:

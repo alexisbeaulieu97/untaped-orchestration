@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -174,6 +175,29 @@ def test_init_refuses_an_unexpected_nonignored_file_instead_of_treating_it_as_a_
         _service().execute(_request(target))
 
     assert root.joinpath("notes.md").read_text() == "unrelated\n"
+    assert not root.joinpath("store.toml").exists()
+
+
+@pytest.mark.parametrize("unsafe", ["empty-directory", "nested-directory", "symlink", "nonregular"])
+def test_init_refuses_unexpected_directory_and_symlink_entries(
+    tmp_path: Path,
+    unsafe: str,
+) -> None:
+    target = tmp_path / "repository"
+    root = target / ".untaped" / "orchestration"
+    root.mkdir(parents=True)
+    if unsafe == "empty-directory":
+        root.joinpath("notes").mkdir()
+    elif unsafe == "nested-directory":
+        root.joinpath("views", "nested").mkdir(parents=True)
+    elif unsafe == "symlink":
+        root.joinpath("notes").symlink_to(tmp_path)
+    else:
+        os.mkfifo(root / "pipe")
+
+    with pytest.raises(InitConflictError, match=r"unexpected|unsafe"):
+        _service().execute(_request(target))
+
     assert not root.joinpath("store.toml").exists()
 
 
