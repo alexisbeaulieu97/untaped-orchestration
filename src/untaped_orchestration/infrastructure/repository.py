@@ -53,6 +53,7 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
         relative_paths = canonical_input_paths(location)
         diagnostics: list[Diagnostic] = []
         store = None
+        store_config_revision = None
         registry = None
         registry_revision = None
         records: list[LoadedRecord] = []
@@ -93,6 +94,7 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
             revision = file_revision(raw)
             file_revisions[relative_path] = revision
             if relative_path == PurePosixPath("store.toml"):
+                store_config_revision = revision
                 try:
                     store = self._stores.parse(raw)
                 except CodecError as error:
@@ -136,6 +138,7 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
             raw_index=tuple(raw_index),
             store_revision=store_revision_from_file_revisions(file_revisions),
             registry_revision=registry_revision,
+            store_config_revision=store_config_revision,
         )
 
     def read_raw(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord:

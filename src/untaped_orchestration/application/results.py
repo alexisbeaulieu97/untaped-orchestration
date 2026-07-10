@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from untaped_orchestration.domain.canonical import CanonicalItem
 from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.ids import StoreId
 from untaped_orchestration.domain.models import Registry, Revision, StoreConfig
 
 
@@ -49,6 +51,49 @@ class StoreSnapshot:
     raw_index: tuple[RawReference, ...]
     store_revision: Revision
     registry_revision: Revision | None
+    store_config_revision: Revision | None = None
+
+
+type IncompletenessReason = Literal[
+    "missing",
+    "invalid",
+    "identity-mismatch",
+    "duplicate",
+    "cycle",
+    "timeout",
+    "changed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class IncompleteStore:
+    expected_store_id: StoreId
+    reason: IncompletenessReason
+    diagnostic: Diagnostic
+
+
+@dataclass(frozen=True, slots=True)
+class Completeness:
+    entries: tuple[IncompleteStore, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.entries
+
+    @property
+    def missing_store_ids(self) -> tuple[str, ...]:
+        return tuple(sorted({entry.expected_store_id.root for entry in self.entries}))
+
+    @property
+    def diagnostics(self) -> tuple[Diagnostic, ...]:
+        return tuple(entry.diagnostic for entry in self.entries)
+
+
+@dataclass(frozen=True, slots=True)
+class FederatedSnapshot:
+    selected: StoreSnapshot
+    stores: tuple[StoreSnapshot, ...]
+    completeness: Completeness
 
 
 @dataclass(frozen=True, slots=True)

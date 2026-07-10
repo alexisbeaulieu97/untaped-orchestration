@@ -309,6 +309,7 @@ def test_registry_revision_hashes_exact_bytes_and_store_revision_excludes_views_
     location = location_from_root(local_store)
     first = repository.load_local(location, headers_only=True)
     registry_raw = local_store.joinpath("registry.toml").read_bytes()
+    store_config_raw = local_store.joinpath("store.toml").read_bytes()
     canonical = {
         path: local_store.joinpath(*path.parts).read_bytes()
         for path in (
@@ -320,6 +321,7 @@ def test_registry_revision_hashes_exact_bytes_and_store_revision_excludes_views_
     }
 
     assert first.registry_revision == file_revision(registry_raw)
+    assert first.store_config_revision == file_revision(store_config_raw)
     assert first.store_revision == store_revision(canonical)
 
     views = local_store / "views"
