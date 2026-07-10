@@ -104,6 +104,7 @@ files. Record the returned repository/PR/main SHAs in the execution log:
 ```bash
 set -euo pipefail
 git fetch --prune origin
+git rev-parse origin/main
 gh repo view alexisbeaulieu97/untaped-orchestration --json nameWithOwner,owner,visibility
 gh pr view 2 --json state,mergedAt,mergeCommit
 git show origin/main:docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md
@@ -1276,4 +1277,4 @@ Before declaring the local implementation branch ready for external review, map 
 
 The implementation phase is complete only when this table has no unproved row, the full verification block passes from a clean checkout, and independent review has no unresolved actionable finding. Release, self-adoption, content cohorts, empty-store cohorts, and private-hub migration remain later phases with their own approval gates.
 
-_Independently reviewed (4 reviewers): 27 findings — 27 incorporated, 0 surfaced above, 0 dismissed. Ask to see the full review._
+_Independently reviewed (4 reviewers): 28 findings — 28 incorporated, 0 surfaced above, 0 dismissed. Ask to see the full review._
