@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Execute from a fresh `codex/` implementation branch cut from verified `origin/main` at or after `041c477fbf9eba85eac8bbd4b491ce58e8f6cdd9`; do not implement on the plan branch.
+- Execute only after PR #2 is merged, from a fresh `codex/` implementation branch cut from verified `origin/main` that contains both this plan and its reviewed design clarifications; the pre-plan base `041c477fbf9eba85eac8bbd4b491ce58e8f6cdd9` is not sufficient. Do not implement on the plan branch.
 - Treat `docs/superpowers/specs/2026-07-09-orchestration-v1-design.md` as the behavioral authority. If code pressure exposes an ambiguity or contradiction, stop and amend the design through review instead of silently choosing a new contract.
 - Use test-driven development for every behavior slice: add one focused failing test, observe the expected failure, add the smallest implementation, run the focused test, then run the affected suite.
 - Import SDK APIs only from `untaped.api`. Domain imports neither application, infrastructure, CLI, nor SDK. Application imports domain and its own ports only. Infrastructure imports domain and application ports but never CLI. CLI is the composition root.
@@ -26,7 +26,7 @@
 
 ### Repository and package surfaces
 
-- Create `pyproject.toml`, `uv.lock`, `.python-version`, `.gitignore`, `.pre-commit-config.yaml`, `LICENSE`, `CHANGELOG.md`, `CONTRIBUTING.md`, and `SECURITY.md` for the Python package and development contract.
+- Create `pyproject.toml`, `uv.lock`, `.python-version`, `.gitignore`, `.pre-commit-config.yaml`, `CHANGELOG.md`, `CONTRIBUTING.md`, and `SECURITY.md` for the Python package and development contract; preserve and verify the existing MIT `LICENSE` without rewriting it.
 - Create `.github/workflows/ci.yml` for source CI. Add `.github/workflows/release.yml` only in the final package-readiness slice, from the reviewed core release template pinned to core commit `80bb8411cd0017f3e0cde818656aaf6fd0233368`.
 - Update `README.md` from specification-only status to installation, CLI orientation, file-format safety, and recovery guidance.
 - Update `AGENTS.md` so it describes the implemented layers, field ownership, test commands, and release/adoption gates instead of the specification-only phase.
@@ -96,12 +96,43 @@
 
 ---
 
+## Pre-Implementation Gate
+
+Run this read-only gate before creating the implementation branch or package
+files. Record the returned repository/PR/main SHAs in the execution log:
+
+```bash
+set -euo pipefail
+git fetch --prune origin
+gh repo view alexisbeaulieu97/untaped-orchestration --json nameWithOwner,owner,visibility
+gh pr view 2 --json state,mergedAt,mergeCommit
+git show origin/main:docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md
+git show origin/main:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md
+uv run --no-project --python 3.14 --with 'untaped==3.1.0' python -c 'from importlib.metadata import version; assert version("untaped") == "3.1.0"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' https://pypi.org/pypi/untaped-orchestration/json)" = 404
+remote_branch_status=0
+git ls-remote --exit-code --heads origin refs/heads/codex/orchestration-v1-implementation || remote_branch_status=$?
+test "$remote_branch_status" -eq 2
+```
+
+The unauthenticated PyPI query must return HTTP 404; HTTP 200 means the
+distribution name is no longer available and implementation stops. Confirm
+the repository is still public and owned by `alexisbeaulieu97`, PR #2 is
+merged, and both reviewed documents are on the fetched `origin/main`. Stop and
+replan on any mismatch, unavailable SDK 3.1.0, network result that cannot
+establish the PyPI state, or pre-existing intended implementation branch. Only
+after this gate passes may branch `codex/orchestration-v1-implementation` and
+its worktree be created. Adoption-branch checks remain mandatory again at each
+later cohort gate.
+
+---
+
 ## Task 1: Scaffold the Package and Lock the Architectural Boundary
 
 **Files:**
 
 - Create: the package entry/settings files plus `src/untaped_orchestration/cli/__init__.py` and the initial complete packaged skill.
-- Create: `pyproject.toml`, `uv.lock`, `.python-version`, `.gitignore`, `.pre-commit-config.yaml`, `LICENSE`, and `.github/workflows/ci.yml`.
+- Create: `pyproject.toml`, `uv.lock`, `.python-version`, `.gitignore`, `.pre-commit-config.yaml`, and `.github/workflows/ci.yml`; verify the existing `LICENSE` remains byte-identical.
 - Create: `tests/unit/test_tool_entrypoint.py`
 - Create: `tests/unit/test_layering.py`
 - Create: `tests/unit/test_ci_workflow.py`
@@ -225,7 +256,7 @@ Inspect the wheel and assert it contains `py.typed` and the skill, contains no `
 - [ ] **Step 6: Commit the scaffold**
 
 ```bash
-git add .github/workflows/ci.yml .gitignore .pre-commit-config.yaml .python-version LICENSE pyproject.toml uv.lock src tests/unit/test_layering.py tests/unit/test_tool_entrypoint.py tests/unit/test_ci_workflow.py tests/unit/test_packaged_skill.py
+git add .github/workflows/ci.yml .gitignore .pre-commit-config.yaml .python-version pyproject.toml uv.lock src tests/unit/test_layering.py tests/unit/test_tool_entrypoint.py tests/unit/test_ci_workflow.py tests/unit/test_packaged_skill.py
 git commit -m "build: scaffold orchestration tool"
 ```
 
@@ -1245,4 +1276,4 @@ Before declaring the local implementation branch ready for external review, map 
 
 The implementation phase is complete only when this table has no unproved row, the full verification block passes from a clean checkout, and independent review has no unresolved actionable finding. Release, self-adoption, content cohorts, empty-store cohorts, and private-hub migration remain later phases with their own approval gates.
 
-_Independently reviewed (3 reviewers): 24 findings — 24 incorporated, 0 surfaced above, 0 dismissed. Ask to see the full review._
+_Independently reviewed (4 reviewers): 27 findings — 27 incorporated, 0 surfaced above, 0 dismissed. Ask to see the full review._
