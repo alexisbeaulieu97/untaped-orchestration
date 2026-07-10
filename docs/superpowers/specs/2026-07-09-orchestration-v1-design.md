@@ -163,8 +163,9 @@ max_rows_per_section = 10
 max_total_bytes = 32768
 ```
 
-`init` defaults to a private task-capable store. `init --public` creates a
-public decision-only store; `visibility = "public"` requires
+`init` defaults to a private task-capable store. `init --decisions-only`
+creates a private decision-only store; `init --public` implies decision-only
+and creates the fleet's normal public store. `visibility = "public"` requires
 `capabilities.active_tasks = false`. `check` rejects any active/archive task in
 a decision-only or public store, including after a hand-edited policy change.
 V1 deliberately has no public-task escape hatch: unfinished tasks remain
@@ -206,7 +207,8 @@ The registry key order shown above is canonical: schema/store ID first, then
 `[[children]]` records sorted by child ID with `id` before `path`. `fmt` covers
 both administrative TOML files as well as item front matter; it validates and
 canonicalizes the full `store.toml`/`registry.toml` shapes using the key/table
-order in this section.
+order in this section. Comments in canonical administrative TOML are
+noncanonical and are removed by `fmt --write`, matching item metadata.
 
 ## 4. Item file format
 
@@ -380,12 +382,15 @@ unique and strictly ordered after every individual replacement, so interruption
 never reorders the scope.
 
 Rebalance is a semantically neutral phase completed before a requested move or
-transition. Only after that phase is durable does one atomic replacement of the
-primary task change its `parent`, `stage`, and/or final rank. If rebalance is
-interrupted, the task remains in its original parent/stage and the caller
-rereads the item/store revisions before retrying. Users move items with
-`--first`, `--last`, `--before`, or `--after`; generic update never sets rank
-or parent.
+transition. When the primary already belongs to the target scope, it
+participates in that neutral complete-scope rebalance and may receive its
+neutral rank while remaining in the same relative position. Only after that
+phase is durable does one atomic replacement of the primary task change its
+`parent`, `stage`, and/or rank to the requested final position. If rebalance is
+interrupted, the task remains in its original parent/stage and all scope members
+retain their original relative order; the caller rereads item/store revisions
+before retrying. Users move items with `--first`, `--last`, `--before`, or
+`--after`; generic update never sets rank or parent.
 
 Global ordering is priority, ancestor rank vector, own rank, then ID.
 
@@ -418,7 +423,7 @@ Due dates use the configured timezone and injected clock:
   `started_at`, plus `in_progress_review_days`.
 - Backlog/planned: due only when `review_on` is set; backlog always retains
   `revisit_when` as its semantic trigger.
-- Decisions: due only when `review_on` is set.
+- Active decisions: due only when `review_on` is set.
 
 `curate next` sorts due date, kind (`task` before `decision`), then task
 priority/rank or decision title, then ID. `curate acknowledge` sets
@@ -797,7 +802,7 @@ use the fault-state protocol below.
 
 | Operation | Only accepted intermediate state | Detection and recovery |
 |---|---|---|
-| Move or stage transition | Optional same-order rebalance is partly/fully applied; primary task still has its old parent/stage/rank until its one final replacement | Store remains graph-valid and order-equivalent; inspect diff, reread item/store revisions, rerun. Final target state is an idempotent success. |
+| Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff, reread item/store revisions, rerun. Final target state is an idempotent success. |
 | Ordinary close | Complete archive exists while semantically matching active source remains | `check` reports the pair; guarded retry or `repair duplicate` removes only the matched active source. |
 | Superseded close | Exact successor link may exist before the close pair | `check` reports a successor pointing at an active predecessor; reread both revisions and retry the same successor/outcome. |
 | Decision supersede | One exact linked successor may exist before pin replacement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement. |
@@ -871,7 +876,12 @@ The provider-neutral importer reads already-separated metadata/body files. It
 contains no legacy Markdown parser. It accepts explicit IDs, timestamps,
 destinations, stages/outcomes, evidence, and links; validates normal schema,
 policy, graph, filename, collision, and visibility rules; reports exact
-destination/hash; defaults to dry-run; and writes with `--apply`.
+destination/hash; defaults to dry-run; and writes with `--apply`. Every
+manifest `source_ref` is validated as an evidence reference and inserted into
+the resulting canonical item as `relation = "tracked-by"` evidence unless that
+identical evidence record is already present; conflicting/duplicate normalized
+evidence is rejected. The external manifest is therefore not the sole owner of
+migration provenance.
 
 Fleet manifests set `require_empty_items = true`; apply then also requires the
 explicit `store import MANIFEST --if-clean --apply` guard. On the first attempt,
@@ -1030,8 +1040,8 @@ inbox file, and operating paragraph receives a disposition. Whole-file
 “migrated” assertions are insufficient.
 
 Expected counts, destinations, references, views, and public-task privacy must
-all validate before deletion. Source evidence is retained in import
-`source_ref`.
+all validate before deletion. Every import `source_ref` remains durable as the
+destination item's canonical `tracked-by` evidence.
 
 ### 16.3 Hub-specific final adoption
 
@@ -1075,7 +1085,8 @@ removed through a separately reviewed change.
 - Registry cycles, lock contention/timeouts, header-only scans.
 - Raw lookup with invalid TOML/ID mismatch and lazy empty directories.
 - Atomic-write fault injection at file replacement boundaries.
-- Interrupted order-preserving rebalance before move/transition final replace.
+- Interrupted order-preserving rebalance before move/transition final replace,
+  including a primary task already in the target scope.
 - Interrupted close duplicate detection/safe repair.
 - Interrupted supersede/pin repair by retry or Git restoration.
 - Interrupted import exact-subset resume and divergent refusal.
