@@ -1,0 +1,10 @@
+schema = "untaped.orchestration.registry/v1"
+store_id = "sto_019f0000000070008000000000000000"
+
+[[children]]
+id = "sto_019f0000000070008000000000000001"
+path = "../../first/.untaped/orchestration"
+
+[[children]]
+id = "sto_019f0000000070008000000000000002"
+path = "../../second/.untaped/orchestration"

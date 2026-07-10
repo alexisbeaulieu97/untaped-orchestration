@@ -1,0 +1,19 @@
+schema = "untaped.orchestration.store/v1"
+id = "sto_019f0000000070008000000000000000"
+name = "Untaped orchestration hub"
+visibility = "private"
+timezone = "America/Montreal"
+
+[capabilities]
+active_tasks = true
+
+[curation]
+inbox_review_days = 7
+in_progress_review_days = 14
+
+[brief]
+pinned_decisions = []
+max_decision_body_bytes = 4096
+max_total_body_bytes = 16384
+max_rows_per_section = 10
+max_total_bytes = 32768
