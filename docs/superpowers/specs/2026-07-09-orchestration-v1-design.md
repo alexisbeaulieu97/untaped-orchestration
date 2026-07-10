@@ -837,7 +837,7 @@ use the fault-state protocol below.
 | Task/decision create | The caller-stable ID is absent or one matching active item is fully durable | Retry with the same ID/inputs returns the existing item and `replayed=true`; mismatch or archived/inactive state conflicts. Fault injection includes final fsync before stdout. |
 | Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff, reread item/store revisions, rerun. Final target state is an idempotent success. |
 | Ordinary close | Complete archive exists with matching active source, or the active source is gone and the archive is final but acknowledgement was lost | `check` reports a duplicate pair; guarded retry/`repair duplicate` removes only a match. Retry of the same outcome/note against the final archive returns it with `replayed=true`; divergent closure conflicts. |
-| Superseded close | Exact successor link may exist before the close pair | `check` reports a successor pointing at an active predecessor; reread both revisions and retry the same successor/outcome. |
+| Superseded close | Exact successor link may exist before the close pair, or the linked successor/final archive remain after active deletion but acknowledgement is lost | `check` reports a successor pointing at an active predecessor; reread both revisions and retry. When predecessor archive, successor link, outcome, and note exactly match the requested final state, retry returns `replayed=true`; every divergence conflicts. |
 | Decision supersede | One exact linked successor may exist before pin replacement, or successor/pins are final before acknowledgement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement, or returns the final state with `replayed=true`. |
 | Decision retire | Retirement fields may exist before pin removal, or retirement/pins are final before acknowledgement | Inactive pin is reported; same-note retry finishes removal or returns the final state with `replayed=true`. |
 | Import | Exact subset of the external manifest may exist | Generic `check` cannot infer intent; rerun the same manifest/`--if-clean`, which reconstructs the guarded base and writes the remainder. |
@@ -1158,6 +1158,8 @@ removed through a separately reviewed change.
 - Atomic-write fault injection at file replacement boundaries.
 - Init at every scaffold boundary and acknowledgement loss after final fsync.
 - Create acknowledgement loss and close after active deletion/before stdout.
+- Superseded-close acknowledgement loss after the final archive/link fsync and
+  before stdout.
 - Interrupted order-preserving rebalance before move/transition final replace,
   including a primary task already in the target scope.
 - Interrupted close duplicate detection/safe repair.
