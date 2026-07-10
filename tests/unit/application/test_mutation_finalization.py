@@ -6,14 +6,15 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from tests.builders import write_store
+from tests.builders import STORE_ID
+from untaped_orchestration.application.bootstrap import InitializeStore, InitRequest
 from untaped_orchestration.application.mutations import (
     IntendedMutation,
     InvalidMutationState,
     MutationExecutor,
     MutationLockSetError,
 )
-from untaped_orchestration.application.ports import FileReplacement
+from untaped_orchestration.application.ports import FileDeletion, FileReplacement
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
@@ -57,6 +58,9 @@ class RecordingRepository:
 
     def read_file(self, location, path):
         return self.delegate.read_file(location, path)
+
+    def list_entries(self, location):
+        return self.delegate.list_entries(location)
 
     def replace(self, location, change) -> None:
         assert self.locks.active
@@ -117,9 +121,26 @@ class RecordingViews:
 
 
 def _state(tmp_path: Path):
-    first_root = write_store(tmp_path / "first")
-    second_root = write_store(tmp_path / "second", store_id="sto_019f0000000070008000000000000001")
     repository = FilesystemStoreRepository()
+    views = MarkdownViewRenderer()
+    locks = FileLockManager()
+    first_target = tmp_path / "first"
+    second_target = tmp_path / "second"
+    first_target.mkdir()
+    second_target.mkdir()
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(first_target, STORE_ID, "First", "UTC")
+    )
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(
+            second_target,
+            "sto_019f0000000070008000000000000001",
+            "Second",
+            "UTC",
+        )
+    )
+    first_root = first_target / ".untaped" / "orchestration"
+    second_root = second_target / ".untaped" / "orchestration"
     first = repository.load_local(location_from_root(first_root), headers_only=False)
     second = repository.load_local(location_from_root(second_root), headers_only=False)
     return repository, FederatedSnapshot(first, (first, second), Completeness())
@@ -213,9 +234,17 @@ def test_finalizer_rejects_any_lock_set_or_selected_location_mismatch_before_bui
     if mode == "missing":
         locations.pop()
     elif mode == "extra":
-        extra_root = write_store(
-            tmp_path / "extra", store_id="sto_019f0000000070008000000000000002"
+        extra_target = tmp_path / "extra"
+        extra_target.mkdir()
+        InitializeStore(repository, repository, FileLockManager(), MarkdownViewRenderer()).execute(
+            InitRequest(
+                extra_target,
+                "sto_019f0000000070008000000000000002",
+                "Extra",
+                "UTC",
+            )
         )
+        extra_root = extra_target / ".untaped" / "orchestration"
         locations.append(location_from_root(extra_root))
     else:
         selected = current.stores[1].location
@@ -253,6 +282,50 @@ def test_invalid_replacement_bytes_cannot_hide_behind_a_fabricated_snapshot(
             load=lambda: current,
             guard=lambda _: None,
             build=lambda _: IntendedMutation(replacements=(invalid,)),
+        )
+
+    assert captured.value.diagnostics
+    assert adapter.writes == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        IntendedMutation(deletions=(FileDeletion(PurePosixPath("registry.toml")),)),
+        IntendedMutation(deletions=(FileDeletion(PurePosixPath("AGENTS.md")),)),
+        IntendedMutation(deletions=(FileDeletion(PurePosixPath("CLAUDE.md")),)),
+        IntendedMutation(replacements=(FileReplacement(PurePosixPath("AGENTS.md"), b"changed\n"),)),
+        IntendedMutation(
+            replacements=(FileReplacement(PurePosixPath("CLAUDE.md"), b"@OTHER.md\n"),)
+        ),
+        IntendedMutation(
+            replacements=(FileReplacement(PurePosixPath("unexpected.txt"), b"unsafe\n"),)
+        ),
+    ],
+)
+def test_projected_shape_rejects_required_deletions_instruction_changes_and_unsafe_paths(
+    tmp_path: Path,
+    change: IntendedMutation,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = RecordingRepository(repository, events, locks)
+    projector = RecordingProjector(repository, events, locks)
+
+    with pytest.raises(InvalidMutationState) as captured:
+        MutationExecutor(
+            adapter,
+            adapter,
+            locks,
+            RecordingViews(events, locks),
+            projector=projector,
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda _: change,
         )
 
     assert captured.value.diagnostics
@@ -327,7 +400,7 @@ def test_mutation_deletes_inapplicable_managed_views_under_the_same_lock(
     repository, current = _state(tmp_path)
     root = current.selected.location.root
     views_root = root / "views"
-    views_root.mkdir()
+    views_root.mkdir(exist_ok=True)
     managed = MarkdownViewRenderer().managed_paths()
     for path in managed:
         root.joinpath(*path.parts).write_bytes(b"sensitive or stale\n")

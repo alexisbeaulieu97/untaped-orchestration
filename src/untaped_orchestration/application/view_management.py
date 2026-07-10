@@ -12,12 +12,14 @@ from untaped_orchestration.application.ports import (
     StoreWriter,
     ViewRenderer,
 )
+from untaped_orchestration.application.results import PathComparison
 
 
 @dataclass(frozen=True, slots=True)
 class ViewState:
     intended_paths: tuple[PurePosixPath, ...]
     changed_paths: tuple[PurePosixPath, ...]
+    comparisons: tuple[PathComparison, ...]
     current: bool
 
 
@@ -57,7 +59,12 @@ def apply_views(
     try:
         expected, before = view_comparisons(reader, location, renderer, snapshot)
     except OSError, ValueError:
-        return ViewState(managed, (), False)
+        return ViewState(
+            managed,
+            (),
+            tuple(PathComparison(path, False) for path in managed),
+            False,
+        )
     intended = tuple(path for path in managed if path in expected or not before[path])
     try:
         for path in managed:
@@ -79,4 +86,5 @@ def apply_views(
         for path in managed
     }
     changed = tuple(path for path in intended if not before[path] and after[path])
-    return ViewState(intended, changed, all(after.values()))
+    comparisons = tuple(PathComparison(path, after[path]) for path in managed)
+    return ViewState(intended, changed, comparisons, all(after.values()))

@@ -21,12 +21,14 @@ from untaped_orchestration.application.results import (
     PathComparison,
     StoreSnapshot,
 )
+from untaped_orchestration.application.scaffold import ShapeInspection, inspect_store_shape
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.application.view_management import apply_views, view_comparisons
 from untaped_orchestration.domain.diagnostics import Diagnostic, sort_diagnostics
 from untaped_orchestration.domain.models import Revision
 
 DEFAULT_LOCK_TIMEOUT = 10.0
+_ZERO_REVISION = Revision("sha256:" + "0" * 64)
 
 
 class InvalidStoreState(ValueError):
@@ -73,71 +75,15 @@ def _invalid_result(
     )
 
 
-def _shape_diagnostic(path: PurePosixPath, message: str) -> Diagnostic:
-    return Diagnostic(
-        code="ORC003",
-        severity="error",
-        path=path.as_posix(),
-        field="path",
-        message=message,
-        hint="Restore the exact scaffold or remove only the proven orphaned entry.",
+def _shape_result(inspection: ShapeInspection) -> CheckResult:
+    return CheckResult(
+        store_id="",
+        store_revision=_ZERO_REVISION,
+        registry_revision=None,
+        valid=False,
+        views_current=False,
+        diagnostics=inspection.diagnostics,
     )
-
-
-def _store_shape_diagnostics(
-    reader: StoreReader,
-    location: StoreLocation,
-    managed_views: tuple[PurePosixPath, ...],
-) -> tuple[Diagnostic, ...]:
-    entries = reader.list_entries(location)
-    files = {value.path for value in entries if value.kind == "file"}
-    diagnostics: list[Diagnostic] = []
-    for required in (
-        PurePosixPath("registry.toml"),
-        PurePosixPath("AGENTS.md"),
-        PurePosixPath("CLAUDE.md"),
-    ):
-        if required not in files:
-            diagnostics.append(_shape_diagnostic(required, "required scaffold file is missing"))
-
-    allowed_directories = {
-        PurePosixPath("tasks"),
-        PurePosixPath("decisions"),
-        PurePosixPath("archive"),
-        PurePosixPath("archive/tasks"),
-        PurePosixPath("views"),
-    }
-    allowed_files = {
-        PurePosixPath("store.toml"),
-        PurePosixPath("registry.toml"),
-        PurePosixPath("AGENTS.md"),
-        PurePosixPath("CLAUDE.md"),
-        PurePosixPath(".lock"),
-        *managed_views,
-    }
-    for entry in entries:
-        path = entry.path
-        name = path.name
-        if ".untaped-tmp-" in name:
-            diagnostics.append(_shape_diagnostic(path, "orphan atomic-write temporary exists"))
-            continue
-        if entry.kind in {"symlink", "other"}:
-            diagnostics.append(_shape_diagnostic(path, f"unsafe {entry.kind} entry exists"))
-            continue
-        if entry.kind == "directory":
-            if path not in allowed_directories:
-                diagnostics.append(_shape_diagnostic(path, "unexpected directory exists"))
-            continue
-        if path in allowed_files:
-            continue
-        if path.parts[:-1] in {("tasks",), ("decisions",), ("archive", "tasks")}:
-            continue
-        if name == ".DS_Store" or name.endswith(("~", ".swp", ".swo", ".tmp")):
-            continue
-        if name.startswith((".#", "#")):
-            continue
-        diagnostics.append(_shape_diagnostic(path, "unexpected store file exists"))
-    return sort_diagnostics(diagnostics)
 
 
 def _comparisons(
@@ -194,14 +140,15 @@ class CheckStore:
 
     def execute(self, location: StoreLocation) -> CheckResult:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
+            inspection = inspect_store_shape(self._reader, location)
+            if not inspection.load_safe:
+                return _shape_result(inspection)
             snapshot = self._reader.load_local(location, headers_only=False)
             semantic_diagnostics = _validate(snapshot)
             diagnostics = list(semantic_diagnostics)
-            diagnostics.extend(
-                _store_shape_diagnostics(self._reader, location, self._views.managed_paths())
-            )
+            diagnostics.extend(inspection.diagnostics)
             view_matches = False
-            if snapshot.store is not None and not _invalid(semantic_diagnostics):
+            if snapshot.store is not None and not _invalid(tuple(diagnostics)):
                 _, managed = view_comparisons(self._reader, location, self._views, snapshot)
                 view_matches = all(managed.values())
                 for path, matches in managed.items():
@@ -258,6 +205,9 @@ class RenderStore:
 
     def _execute(self, location: StoreLocation, *, write: bool) -> MaintenanceResult:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
+            inspection = inspect_store_shape(self._reader, location)
+            if inspection.diagnostics:
+                raise InvalidStoreState(inspection.diagnostics, _shape_result(inspection))
             snapshot = self._reader.load_local(location, headers_only=False)
             diagnostics = _validate(snapshot)
             if _invalid(diagnostics):
@@ -272,10 +222,7 @@ class RenderStore:
                 state = apply_views(self._reader, self._writer, location, self._views, snapshot)
                 changed = state.changed_paths
                 views_current = state.current
-                result_comparisons = tuple(
-                    PathComparison(path, state.current or path not in state.intended_paths)
-                    for path in self._views.managed_paths()
-                )
+                result_comparisons = state.comparisons
             else:
                 changed = ()
                 views_current = all(managed.values())
@@ -340,6 +287,9 @@ class FormatStore:
         expected_store_revision: Revision | None,
     ) -> MaintenanceResult:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
+            inspection = inspect_store_shape(self._reader, location)
+            if inspection.diagnostics:
+                raise InvalidStoreState(inspection.diagnostics, _shape_result(inspection))
             snapshot = self._reader.load_local(location, headers_only=False)
             diagnostics = _validate(snapshot)
             if _invalid(diagnostics) or snapshot.store is None or snapshot.registry is None:

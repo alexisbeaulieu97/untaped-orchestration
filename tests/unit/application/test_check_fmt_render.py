@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -264,15 +265,18 @@ def test_check_keeps_partial_scaffold_and_orphan_temp_diagnostics_after_view_rep
     tmp_path: Path,
 ) -> None:
     root, repository, locks, views = _initialized(tmp_path)
+    root.joinpath("views/roadmap.md").unlink()
+    location = location_from_root(root)
+
+    RenderStore(repository, repository, locks, views).write(location)
     root.joinpath("registry.toml").unlink()
     root.joinpath("AGENTS.md").unlink()
     root.joinpath("CLAUDE.md").unlink()
     orphan = root / ".store.toml.untaped-tmp-orphan"
     orphan.write_bytes(b"partial")
-    root.joinpath("views/roadmap.md").unlink()
-    location = location_from_root(root)
-
-    RenderStore(repository, repository, locks, views).write(location)
+    snapshot = repository.load_local(location, headers_only=False)
+    for path, raw in views.expected(snapshot).items():
+        root.joinpath(*path.parts).write_bytes(raw)
     result = CheckStore(repository, locks, views).execute(location)
 
     assert not result.valid
@@ -283,6 +287,28 @@ def test_check_keeps_partial_scaffold_and_orphan_temp_diagnostics_after_view_rep
         ("ORC003", orphan.name),
     }
     assert not any(value.code == "ORC008" for value in result.diagnostics)
+
+    with pytest.raises(InvalidStoreState) as captured:
+        FormatStore(repository, repository, locks, views, CanonicalStoreFormatter()).write(
+            location,
+            expected_store_revision=repository.load_local(
+                location, headers_only=True
+            ).store_revision,
+        )
+    assert captured.value.diagnostics
+    assert any(value.path == "registry.toml" for value in captured.value.diagnostics)
+
+
+def test_check_reports_a_missing_anchor_without_attempting_semantic_load(
+    tmp_path: Path,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    root.joinpath("store.toml").unlink()
+
+    result = CheckStore(repository, locks, views).execute(location_from_root(root))
+
+    assert not result.valid
+    assert [(value.code, value.path) for value in result.diagnostics] == [("ORC003", "store.toml")]
 
 
 @pytest.mark.parametrize("kind", ["decision", "task"])
@@ -389,4 +415,100 @@ def test_partial_render_failure_reports_every_durably_matching_view_change(
     expected_order = views.managed_paths()
     assert result.intended_paths == expected_order
     assert result.changed_paths == expected_order[:2]
+    assert tuple(value.matches for value in result.comparisons) == (True, True, False, False)
     assert not result.views_current
+
+
+@pytest.mark.parametrize(
+    ("relative", "entry", "code"),
+    [
+        ("tasks/bad.txt", "file", "ORC003"),
+        ("decisions/bad.md", "symlink", "ORC003"),
+        ("archive/tasks/pipe.md", "nonregular", "ORC003"),
+        ("views/bad.txt", "file", "ORC008"),
+        ("views/nested", "directory", "ORC008"),
+        ("unexpected", "directory", "ORC003"),
+    ],
+)
+def test_check_reports_unsafe_shape_before_tolerant_semantic_load(
+    tmp_path: Path,
+    relative: str,
+    entry: str,
+    code: str,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    path = root.joinpath(*PurePosixPath(relative).parts)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if entry == "file":
+        path.write_bytes(b"unexpected\n")
+    elif entry == "symlink":
+        path.symlink_to(tmp_path)
+    elif entry == "directory":
+        path.mkdir()
+    else:
+        os.mkfifo(path)
+
+    result = CheckStore(repository, locks, views).execute(location_from_root(root))
+
+    assert not result.valid
+    assert [(value.code, value.path) for value in result.diagnostics] == [(code, relative)]
+
+
+def test_fmt_and_render_refusal_carry_unsafe_shape_diagnostics(tmp_path: Path) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    unsafe = root / "decisions" / "linked.md"
+    unsafe.parent.mkdir()
+    unsafe.symlink_to(tmp_path)
+    location = location_from_root(root)
+    checked = CheckStore(repository, locks, views).execute(location)
+
+    for operation in (
+        lambda: RenderStore(repository, repository, locks, views).write(location),
+        lambda: FormatStore(repository, repository, locks, views, CanonicalStoreFormatter()).write(
+            location,
+            expected_store_revision=repository.read_file(
+                location, PurePosixPath("store.toml")
+            ).revision,
+        ),
+    ):
+        with pytest.raises(InvalidStoreState) as captured:
+            operation()
+        assert captured.value.diagnostics == checked.diagnostics
+
+
+@pytest.mark.parametrize(
+    ("relative", "raw"),
+    [
+        ("AGENTS.md", b"changed instructions\n"),
+        ("CLAUDE.md", b"@OTHER.md\n"),
+    ],
+)
+def test_exact_instruction_bytes_are_required_and_render_cannot_repair_them(
+    tmp_path: Path,
+    relative: str,
+    raw: bytes,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    baseline = repository.load_local(location_from_root(root), headers_only=True).store_revision
+    root.joinpath(relative).write_bytes(raw)
+    location = location_from_root(root)
+
+    checked = CheckStore(repository, locks, views).execute(location)
+    with pytest.raises(InvalidStoreState) as captured:
+        RenderStore(repository, repository, locks, views).write(location)
+    after = CheckStore(repository, locks, views).execute(location)
+
+    assert [(value.code, value.path) for value in checked.diagnostics] == [("ORC003", relative)]
+    assert captured.value.diagnostics == checked.diagnostics
+    assert after.diagnostics == checked.diagnostics
+    assert checked.store_revision != baseline
+
+
+def test_check_accepts_a_safe_outer_symlink_store_root(tmp_path: Path) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    alias = tmp_path / "linked-store"
+    alias.symlink_to(root, target_is_directory=True)
+
+    result = CheckStore(repository, locks, views).execute(location_from_root(alias))
+
+    assert result.valid

@@ -14,15 +14,17 @@ from untaped_orchestration.application.ports import (
     ViewRenderer,
 )
 from untaped_orchestration.application.results import MutationReceipt, StoreSnapshot
+from untaped_orchestration.application.scaffold import (
+    AGENTS_BYTES,
+    AGENTS_PATH,
+    CLAUDE_BYTES,
+    CLAUDE_PATH,
+    REGISTRY_PATH,
+    STORE_PATH,
+)
 from untaped_orchestration.domain.models import Registry, Revision, StoreConfig
 
 DEFAULT_LOCK_TIMEOUT = 10.0
-_AGENTS = b"""# Local orchestration store
-
-Use `untaped-orchestration` for all canonical reads and writes. Do not read generated
-views as tool input. Keep unfinished tasks private, preserve revision guards, and get
-explicit approval before pushes, merges, releases, publications, or external changes.
-"""
 _IGNORED_NAMES = frozenset({".lock", ".DS_Store"})
 
 
@@ -120,10 +122,10 @@ class InitializeStore:
         root = request.target / ".untaped" / "orchestration"
         location = self._writer.prepare(root)
         canonical = {
-            PurePosixPath("store.toml"): _canonical_toml(config),
-            PurePosixPath("registry.toml"): _canonical_toml(registry),
-            PurePosixPath("AGENTS.md"): _AGENTS,
-            PurePosixPath("CLAUDE.md"): b"@AGENTS.md\n",
+            STORE_PATH: _canonical_toml(config),
+            REGISTRY_PATH: _canonical_toml(registry),
+            AGENTS_PATH: AGENTS_BYTES,
+            CLAUDE_PATH: CLAUDE_BYTES,
         }
         snapshot = StoreSnapshot(
             location=location,
@@ -133,8 +135,8 @@ class InitializeStore:
             load_diagnostics=(),
             raw_index=(),
             store_revision=_store_revision(canonical),
-            registry_revision=_revision(canonical[PurePosixPath("registry.toml")]),
-            store_config_revision=_revision(canonical[PurePosixPath("store.toml")]),
+            registry_revision=_revision(canonical[REGISTRY_PATH]),
+            store_config_revision=_revision(canonical[STORE_PATH]),
         )
         expected = {**canonical, **self._views.expected(snapshot)}
         ordered = tuple(expected)
@@ -157,10 +159,10 @@ class InitializeStore:
             present = tuple(
                 entry.path for entry in entries if entry.kind == "file" and not _ignored(entry.path)
             )
-            has_view_file = any(path.parent == PurePosixPath("views") for path in present)
+            admin_prefix_complete = set(canonical) <= set(present)
             if any(
                 entry.kind == "directory"
-                and (entry.path != PurePosixPath("views") or not has_view_file)
+                and (entry.path != PurePosixPath("views") or not admin_prefix_complete)
                 for entry in entries
             ):
                 raise InitConflictError("unexpected directory blocks init recovery")

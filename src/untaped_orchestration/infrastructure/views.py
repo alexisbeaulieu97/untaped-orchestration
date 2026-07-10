@@ -5,7 +5,12 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import timedelta
 from pathlib import PurePosixPath
 
-from untaped_orchestration.application.ports import FederatedSnapshot, StoreSnapshot, ViewRenderer
+from untaped_orchestration.application.ports import (
+    MANAGED_VIEW_PATHS,
+    FederatedSnapshot,
+    StoreSnapshot,
+    ViewRenderer,
+)
 from untaped_orchestration.domain.graph import (
     DecisionNode,
     DecisionRef,
@@ -162,12 +167,7 @@ def _decision_rows(snapshot: StoreSnapshot) -> list[Sequence[str]]:
 
 class MarkdownViewRenderer(ViewRenderer):
     def managed_paths(self) -> tuple[PurePosixPath, ...]:
-        return (
-            PurePosixPath("views/roadmap.md"),
-            PurePosixPath("views/backlog.md"),
-            PurePosixPath("views/inbox.md"),
-            PurePosixPath("views/decisions.md"),
-        )
+        return MANAGED_VIEW_PATHS
 
     def expected(
         self, snapshot: StoreSnapshot | FederatedSnapshot

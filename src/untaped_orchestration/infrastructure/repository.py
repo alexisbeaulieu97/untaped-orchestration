@@ -9,6 +9,7 @@ from untaped_orchestration.application.ports import (
     FileDeletion,
     FileReplacement,
     LoadedRecord,
+    ProjectedMutation,
     RawRecord,
     RawReference,
     StoreEntry,
@@ -28,6 +29,7 @@ from untaped_orchestration.infrastructure.codec import (
     StoreConfigCodec,
 )
 from untaped_orchestration.infrastructure.filesystem import (
+    ADMIN_PATHS,
     AtomicFilesystem,
     StoreNotFoundError,
     canonical_input_paths,
@@ -202,21 +204,35 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
         selected: StoreLocation,
         replacements: Sequence[FileReplacement],
         deletions: Sequence[FileDeletion],
-    ) -> FederatedSnapshot:
-        files = {
+    ) -> ProjectedMutation:
+        entry_map = {entry.path: entry for entry in store_entries(selected)}
+        contents = {
             path: selected.real_root.joinpath(*path.parts).read_bytes()
-            for path in canonical_input_paths(selected)
+            for path, entry in entry_map.items()
+            if entry.kind == "file"
         }
         for replacement in replacements:
-            files[replacement.path] = replacement.content
+            entry_map[replacement.path] = StoreEntry(replacement.path, "file")
+            contents[replacement.path] = replacement.content
         for deletion in deletions:
-            files.pop(deletion.path, None)
+            entry_map.pop(deletion.path, None)
+            contents.pop(deletion.path, None)
+        entries = tuple(sorted(entry_map.values(), key=lambda value: value.path.as_posix()))
+        files = {
+            path: raw
+            for path, raw in contents.items()
+            if path in ADMIN_PATHS or _is_item_path(path)
+        }
         projected = self._snapshot_from_bytes(selected, files)
         stores = tuple(
             projected if value.location.real_root == selected.real_root else value
             for value in current.stores
         )
-        return FederatedSnapshot(projected, stores, current.completeness)
+        return ProjectedMutation(
+            FederatedSnapshot(projected, stores, current.completeness),
+            entries,
+            contents,
+        )
 
     def _snapshot_from_bytes(
         self,

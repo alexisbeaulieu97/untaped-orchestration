@@ -14,6 +14,7 @@ from untaped_orchestration.application.results import (
 from untaped_orchestration.application.results import (
     LoadedRecord as LoadedRecord,
 )
+from untaped_orchestration.application.results import ProjectedMutation as ProjectedMutation
 from untaped_orchestration.application.results import (
     RawRecord as RawRecord,
 )
@@ -34,6 +35,7 @@ from untaped_orchestration.domain.canonical import CanonicalItem
 from untaped_orchestration.domain.models import Registry, StoreConfig
 
 __all__ = [
+    "MANAGED_VIEW_PATHS",
     "CanonicalFormatter",
     "Clock",
     "FileDeletion",
@@ -42,6 +44,7 @@ __all__ = [
     "LoadedRecord",
     "LockManager",
     "MutationProjector",
+    "ProjectedMutation",
     "RawRecord",
     "RawReference",
     "StoreEntry",
@@ -52,6 +55,13 @@ __all__ = [
     "StoreWriter",
     "ViewRenderer",
 ]
+
+MANAGED_VIEW_PATHS = (
+    PurePosixPath("views/roadmap.md"),
+    PurePosixPath("views/backlog.md"),
+    PurePosixPath("views/inbox.md"),
+    PurePosixPath("views/decisions.md"),
+)
 
 
 class Clock(Protocol):
@@ -106,7 +116,7 @@ class MutationProjector(Protocol):
         selected: StoreLocation,
         replacements: Sequence[FileReplacement],
         deletions: Sequence[FileDeletion],
-    ) -> FederatedSnapshot: ...
+    ) -> ProjectedMutation: ...
 
 
 class CanonicalFormatter(Protocol):

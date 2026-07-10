@@ -19,6 +19,10 @@ from untaped_orchestration.application.results import (
     ItemRevision,
     MutationReceipt,
 )
+from untaped_orchestration.application.scaffold import (
+    inspect_store_shape,
+    validate_store_shape,
+)
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.domain.diagnostics import Diagnostic
@@ -116,17 +120,24 @@ class MutationExecutor:
         replayed: bool = False,
     ) -> MutationReceipt:
         with self._locks.acquire(locations, timeout=self._lock_timeout):
+            current_shape = inspect_store_shape(self._reader, selected)
+            if current_shape.diagnostics:
+                raise InvalidMutationState(current_shape.diagnostics)
             current = load()
             _valid_or_raise(current, self._validator)
             _validate_lock_set(locations, selected, current)
             guard(current)
             intended = build(current)
-            projected = self._projector.project(
+            projection = self._projector.project(
                 current,
                 selected,
                 intended.replacements,
                 intended.deletions,
             )
+            shape_diagnostics = validate_store_shape(projection.entries, projection.contents)
+            if shape_diagnostics:
+                raise InvalidMutationState(shape_diagnostics)
+            projected = projection.snapshot
             _valid_or_raise(projected, self._validator)
 
             changed = []
@@ -138,6 +149,9 @@ class MutationExecutor:
                 changed.append(deletion.path)
 
             canonical_applied = bool(intended.replacements or intended.deletions)
+            after_shape = inspect_store_shape(self._reader, selected)
+            if after_shape.diagnostics:
+                raise InvalidMutationState(after_shape.diagnostics)
             selected_after = self._reader.load_local(selected, headers_only=False)
             after = FederatedSnapshot(
                 selected_after,

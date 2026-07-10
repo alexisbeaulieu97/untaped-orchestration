@@ -111,6 +111,13 @@ class FederatedSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectedMutation:
+    snapshot: FederatedSnapshot
+    entries: tuple[StoreEntry, ...]
+    contents: dict[PurePosixPath, bytes]
+
+
+@dataclass(frozen=True, slots=True)
 class FileReplacement:
     path: PurePosixPath
     content: bytes

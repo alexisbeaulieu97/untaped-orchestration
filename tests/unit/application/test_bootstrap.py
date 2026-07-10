@@ -137,6 +137,48 @@ def test_init_accepts_every_exact_anchored_prefix_and_completed_replay(tmp_path:
         assert result.replayed is (length == len(ordered))
 
 
+@pytest.mark.parametrize("event", ["mkdir:views", "fsync-dir-parent:."])
+def test_init_retries_after_durable_empty_views_parent_creation(
+    tmp_path: Path,
+    event: str,
+) -> None:
+    target = tmp_path / "repository"
+    target.mkdir()
+
+    def stop(boundary: str) -> None:
+        if boundary == event:
+            raise _StopBeforeAnchor(boundary)
+
+    with pytest.raises(_StopBeforeAnchor):
+        _service(atomic=AtomicFilesystem(event_hook=stop)).execute(_request(target))
+
+    root = target / ".untaped" / "orchestration"
+    assert root.joinpath("views").is_dir()
+    assert not tuple(root.joinpath("views").iterdir())
+    assert tuple(_files(target)) == (
+        PurePosixPath("store.toml"),
+        PurePosixPath("registry.toml"),
+        PurePosixPath("AGENTS.md"),
+        PurePosixPath("CLAUDE.md"),
+    )
+
+    recovered = _service().execute(_request(target))
+
+    assert recovered.applied
+    assert len(_files(target)) == 8
+
+
+def test_init_rejects_empty_views_parent_without_the_exact_anchored_admin_prefix(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "repository"
+    root = target / ".untaped" / "orchestration"
+    root.joinpath("views").mkdir(parents=True)
+
+    with pytest.raises(InitConflictError, match="unexpected directory"):
+        _service().execute(_request(target))
+
+
 @pytest.mark.parametrize("divergent_index", range(8))
 def test_init_refuses_divergence_at_every_scaffold_position(
     tmp_path: Path,
