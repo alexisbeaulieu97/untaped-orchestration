@@ -357,3 +357,65 @@ def test_wrong_id_duplicate_of_valid_subtree_id_cannot_leak_or_poison_valid_stor
     )
     assert valid_snapshot.location.real_root == valid.resolve()
     assert valid_snapshot.records == ()
+
+
+@pytest.mark.integration
+def test_real_discovery_reports_absent_child_as_warning_and_unsafe_anchors_as_errors(
+    tmp_path: Path,
+) -> None:
+    selected = write_store(tmp_path / "hub", store_id=STORE_ID)
+    symlinked = store_root(tmp_path / "symlinked")
+    symlinked.mkdir(parents=True)
+    target = tmp_path / "outside-store.toml"
+    target.write_bytes(store_bytes(store_id=CHILD_STORE_ID))
+    symlinked.joinpath("store.toml").symlink_to(target)
+    nonregular = store_root(tmp_path / "nonregular")
+    nonregular.mkdir(parents=True)
+    nonregular.joinpath("store.toml").mkdir()
+    absent = store_root(tmp_path / "absent")
+    _write_registry(
+        selected,
+        STORE_ID,
+        (CHILD_STORE_ID, _relative(selected, symlinked)),
+        (SECOND_CHILD_ID, _relative(selected, nonregular)),
+        (GRANDCHILD_ID, _relative(selected, absent)),
+    )
+
+    result = _service().load(
+        location_from_root(selected),
+        local=False,
+        headers_only=True,
+    )
+
+    by_id = {entry.expected_store_id.root: entry for entry in result.completeness.entries}
+    assert by_id[CHILD_STORE_ID].diagnostic.severity == "error"
+    assert by_id[SECOND_CHILD_ID].diagnostic.severity == "error"
+    assert by_id[GRANDCHILD_ID].diagnostic.severity == "warning"
+
+
+@pytest.mark.integration
+def test_stable_anchors_accept_under_lock_record_content_change_as_complete(
+    tmp_path: Path,
+) -> None:
+    selected = write_store(tmp_path / "hub", store_id=STORE_ID)
+    record = selected / "decisions" / f"{DECISION_ID}-changing.md"
+    record.parent.mkdir()
+    record.write_bytes(decision_bytes())
+    changed = decision_bytes().replace(
+        b"The envelope is machine-owned.\n",
+        b"Changed while waiting for the lock.\n",
+    )
+    service = FederationService(
+        FilesystemStoreRepository(),
+        MutatingLocks(lambda: record.write_bytes(changed)),
+    )
+
+    result = service.load(
+        location_from_root(selected),
+        local=False,
+        headers_only=False,
+    )
+
+    assert result.completeness.complete
+    assert result.selected.records[0].body == b"Changed while waiting for the lock.\n"
+    assert result.stores == (result.selected,)

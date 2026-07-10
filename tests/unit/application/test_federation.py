@@ -491,3 +491,36 @@ def test_child_discovery_severity_distinguishes_availability_from_invalidity(
     )
 
     assert result.completeness.entries[0].diagnostic.severity == expected_severity
+
+
+def test_untrusted_children_are_locked_in_global_order_but_missing_children_are_not() -> None:
+    root = Path("/work/z-root")
+    malformed_root = Path("/work/a-malformed")
+    missing_root = Path("/work/b-missing")
+    wrong_root = Path("/work/m-wrong")
+    selected = _snapshot(
+        root,
+        STORE_ID,
+        (CHILD_STORE_ID, "../a-malformed"),
+        (SECOND_CHILD_ID, "../m-wrong"),
+        (GRANDCHILD_ID, "../b-missing"),
+    )
+    malformed = replace(_snapshot(malformed_root, CHILD_STORE_ID), store=None)
+    wrong = _snapshot(wrong_root, GRANDCHILD_ID)
+    reader = ScriptedReader((selected, malformed, wrong))
+    reader.set_discovery(missing_root, FileNotFoundError("missing"))
+    locks = RecordingLocks()
+
+    result = FederationService(reader, locks).load(
+        selected.location,
+        local=False,
+        headers_only=True,
+    )
+
+    assert result.stores == (selected,)
+    assert [location.real_root for location in locks.calls[0][0]] == [
+        malformed_root,
+        wrong_root,
+        root,
+    ]
+    assert missing_root not in {location.real_root for location in locks.calls[0][0]}

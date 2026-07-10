@@ -57,15 +57,54 @@ def test_discovery_accepts_a_file_start_and_symlinked_repository_root(tmp_path: 
     assert location.real_root == root.resolve()
 
 
-def test_discovery_rejects_an_absent_or_nonregular_anchor(tmp_path: Path) -> None:
+def test_discovery_distinguishes_absent_roots_and_anchors_from_unsafe_existing_paths(
+    tmp_path: Path,
+) -> None:
     with pytest.raises(StoreNotFoundError):
-        discover_location(tmp_path)
+        discover_location(tmp_path / "absent", override=tmp_path / "absent")
 
+    no_anchor = tmp_path / "no-anchor"
+    no_anchor.mkdir()
+    with pytest.raises(StoreNotFoundError):
+        discover_location(tmp_path, override=no_anchor)
+
+    file_root = tmp_path / "file-root"
+    file_root.write_text("not a directory\n")
+    with pytest.raises(PathSafetyError, match="not a directory"):
+        discover_location(tmp_path, override=file_root)
+
+
+@pytest.mark.parametrize("unsafe_anchor", ["directory", "symlink", "broken-symlink"])
+def test_explicit_discovery_rejects_every_existing_nonregular_anchor(
+    tmp_path: Path,
+    unsafe_anchor: str,
+) -> None:
     root = tmp_path / "explicit"
     root.mkdir()
-    root.joinpath("store.toml").mkdir()
-    with pytest.raises(StoreNotFoundError):
+    anchor = root / "store.toml"
+    if unsafe_anchor == "directory":
+        anchor.mkdir()
+    elif unsafe_anchor == "symlink":
+        target = tmp_path / "target.toml"
+        target.write_text("anchor bytes\n")
+        anchor.symlink_to(target)
+    else:
+        anchor.symlink_to(tmp_path / "missing-target.toml")
+
+    with pytest.raises(PathSafetyError, match=r"store\.toml anchor"):
         discover_location(tmp_path, override=root)
+
+
+def test_upward_discovery_stops_at_an_unsafe_nearer_anchor(tmp_path: Path) -> None:
+    write_store(tmp_path)
+    nested = tmp_path / "nested"
+    unsafe = nested / ".untaped" / "orchestration" / "store.toml"
+    unsafe.mkdir(parents=True)
+    start = nested / "src"
+    start.mkdir()
+
+    with pytest.raises(PathSafetyError, match=r"store\.toml anchor"):
+        discover_location(start)
 
 
 def test_registry_location_allows_real_sibling_dotdot_and_symlinked_store_roots(

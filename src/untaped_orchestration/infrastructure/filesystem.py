@@ -60,14 +60,25 @@ def _is_regular_nonsymlink(path: Path) -> bool:
     return path.is_file() and not path.is_symlink()
 
 
+def _entry_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _validate_existing_anchor(anchor: Path) -> None:
+    if not _is_regular_nonsymlink(anchor):
+        raise PathSafetyError(anchor, "store.toml anchor must be a regular nonsymlink file")
+
+
 def location_from_root(root: Path) -> StoreLocation:
     absolute = _absolute_without_resolving(root)
     try:
         real_root = absolute.resolve(strict=True)
     except FileNotFoundError as error:
+        if absolute.is_symlink():
+            raise PathSafetyError(absolute, "store root is a broken symlink") from error
         raise StoreNotFoundError(f"store root does not exist: {absolute}") from error
     if not real_root.is_dir():
-        raise StoreNotFoundError(f"store root is not a directory: {absolute}")
+        raise PathSafetyError(absolute, "store root is not a directory")
     return StoreLocation(root=absolute, real_root=real_root)
 
 
@@ -83,18 +94,26 @@ def _validate_location(location: StoreLocation) -> None:
 def discover_location(start: Path, override: Path | None = None) -> StoreLocation:
     if override is not None:
         root = _absolute_without_resolving(override)
+        location = location_from_root(root)
         anchor = root / "store.toml"
-        if not _is_regular_nonsymlink(anchor):
+        if not _entry_exists(anchor):
             raise StoreNotFoundError(f"no regular store.toml anchor at explicit root: {root}")
-        return location_from_root(root)
+        _validate_existing_anchor(anchor)
+        return location
 
     current = _absolute_without_resolving(start)
     if current.is_file():
         current = current.parent
     for candidate in (current, *current.parents):
-        anchor = candidate / STORE_ANCHOR
-        if _is_regular_nonsymlink(anchor):
-            return location_from_root(anchor.parent)
+        root = candidate / STORE_ANCHOR.parent
+        if not _entry_exists(root):
+            continue
+        location = location_from_root(root)
+        anchor = root / "store.toml"
+        if not _entry_exists(anchor):
+            continue
+        _validate_existing_anchor(anchor)
+        return location
     raise StoreNotFoundError(f"no .untaped/orchestration/store.toml found above: {start}")
 
 
