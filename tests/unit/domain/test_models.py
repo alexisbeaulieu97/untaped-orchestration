@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from untaped_orchestration.domain.models import (
     ActiveTask,
@@ -11,9 +11,11 @@ from untaped_orchestration.domain.models import (
     BriefConfig,
     Decision,
     ImportManifest,
+    ItemRecord,
     Link,
     Registry,
     StoreConfig,
+    TaskRecord,
 )
 from untaped_orchestration.domain.time import (
     CalendarDate,
@@ -79,6 +81,30 @@ def decision_data() -> dict[str, Any]:
     }
 
 
+def archived_task_data() -> dict[str, Any]:
+    data = task_data()
+    data.pop("stage")
+    data.update(
+        {
+            "closed_from": "inbox",
+            "outcome": "declined",
+            "closed_at": TIMESTAMP,
+            "close_note": "No longer needed",
+        }
+    )
+    return data
+
+
+def core_schema_contains_type(value: object, schema_type: str) -> bool:
+    if isinstance(value, dict):
+        return value.get("type") == schema_type or any(
+            core_schema_contains_type(item, schema_type) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(core_schema_contains_type(item, schema_type) for item in value)
+    return False
+
+
 @pytest.mark.parametrize(
     "value",
     [TIMESTAMP, "2000-02-29T23:59:59.999Z"],
@@ -116,7 +142,7 @@ def test_iana_timezone_accepts_installed_iana_names(value: str) -> None:
     assert IanaTimezone(value).root == value
 
 
-@pytest.mark.parametrize("value", ["Mars/Olympus_Mons", "", "America\\Montreal"])
+@pytest.mark.parametrize("value", ["Mars/Olympus_Mons", "", "America\\Montreal", "posixrules"])
 def test_iana_timezone_rejects_unknown_names(value: str) -> None:
     with pytest.raises(ValidationError):
         IanaTimezone(value)
@@ -301,16 +327,7 @@ def test_active_and_archive_shapes_cannot_mix_lifecycle_owned_fields() -> None:
     with pytest.raises(ValidationError):
         ActiveTask.model_validate(active)
 
-    archived = task_data()
-    archived.pop("stage")
-    archived.update(
-        {
-            "closed_from": "inbox",
-            "outcome": "declined",
-            "closed_at": TIMESTAMP,
-            "close_note": "No longer needed",
-        }
-    )
+    archived = archived_task_data()
     parsed = ArchivedTask.model_validate(archived)
     assert parsed.closed_from.value == "inbox"
 
@@ -346,6 +363,127 @@ def test_links_are_typed_and_forbid_unknown_fields() -> None:
                 "extra": True,
             }
         )
+
+
+@pytest.mark.parametrize("source", ["active-task", "archived-task", "decision"])
+@pytest.mark.parametrize("relation", ["depends-on", "governed-by", "follow-up-to", "supersedes"])
+@pytest.mark.parametrize("target_kind", ["task", "decision"])
+def test_item_models_enforce_every_source_relation_and_target_kind_combination(
+    source: str, relation: str, target_kind: str
+) -> None:
+    target = TASK_ID if target_kind == "task" else DECISION_ID
+    if source == "active-task":
+        model = ActiveTask
+        data = task_data()
+        source_kind = "task"
+    elif source == "archived-task":
+        model = ArchivedTask
+        data = archived_task_data()
+        source_kind = "task"
+    else:
+        model = Decision
+        data = decision_data()
+        source_kind = "decision"
+    data["links"] = [{"relation": relation, "target_store_id": STORE_ID, "target": target}]
+
+    allowed = (
+        source_kind == "task"
+        and (relation, target_kind)
+        in {
+            ("depends-on", "task"),
+            ("governed-by", "decision"),
+            ("follow-up-to", "task"),
+            ("supersedes", "task"),
+        }
+    ) or (source_kind == "decision" and (relation, target_kind) == ("supersedes", "decision"))
+
+    if allowed:
+        parsed = model.model_validate(data)
+        assert parsed.links[0].target.root == target
+    else:
+        with pytest.raises(ValidationError):
+            model.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"closed_from": "in-progress"}, "closed from in-progress"),
+        ({"outcome": "cancelled"}, "cancelled tasks require started_at"),
+        (
+            {"outcome": "delivered", "waiting_on": ["alexis"]},
+            "delivered tasks cannot retain waiting parties",
+        ),
+    ],
+)
+def test_archived_task_rejects_locally_provable_close_invariant_violations(
+    changes: dict[str, object], message: str
+) -> None:
+    data = archived_task_data()
+    data.update(changes)
+
+    with pytest.raises(ValidationError, match=message):
+        ArchivedTask.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"closed_from": "in-progress", "started_at": TIMESTAMP},
+        {"outcome": "cancelled", "started_at": TIMESTAMP},
+        {"outcome": "delivered", "waiting_on": []},
+    ],
+)
+def test_archived_task_accepts_locally_valid_close_shapes(changes: dict[str, object]) -> None:
+    data = archived_task_data()
+    data.update(changes)
+
+    assert ArchivedTask.model_validate(data).closed_at.root == TIMESTAMP
+
+
+def test_task_record_is_a_callable_discriminated_alias_for_active_and_archived_shapes() -> None:
+    adapter = TypeAdapter(TaskRecord)
+
+    assert core_schema_contains_type(adapter.core_schema, "tagged-union")
+    assert isinstance(adapter.validate_python(task_data()), ActiveTask)
+    assert isinstance(adapter.validate_python(archived_task_data()), ArchivedTask)
+
+
+def test_item_record_is_a_nested_discriminated_alias_for_task_and_decision_kinds() -> None:
+    adapter = TypeAdapter(ItemRecord)
+
+    assert core_schema_contains_type(adapter.core_schema, "tagged-union")
+    task = adapter.validate_python(task_data())
+    decision = adapter.validate_python(decision_data())
+    assert isinstance(task, ActiveTask)
+    assert isinstance(decision, Decision)
+    assert adapter.dump_python(task, mode="json")["schema"] == "untaped.orchestration.task/v1"
+
+
+@pytest.mark.parametrize("adapter", [TypeAdapter(TaskRecord), TypeAdapter(ItemRecord)])
+def test_discriminated_record_aliases_reject_ambiguous_task_shapes(
+    adapter: TypeAdapter[Any],
+) -> None:
+    data = archived_task_data()
+    data["stage"] = "inbox"
+
+    with pytest.raises(ValidationError) as error:
+        adapter.validate_python(data)
+
+    assert error.value.errors()[0]["type"] == "union_tag_not_found"
+
+
+def test_item_record_discriminator_rejects_missing_or_unknown_kind() -> None:
+    adapter = TypeAdapter(ItemRecord)
+    missing_kind = task_data()
+    missing_kind.pop("kind")
+    unknown_kind = task_data()
+    unknown_kind["kind"] = "unknown"
+
+    for data in (missing_kind, unknown_kind):
+        with pytest.raises(ValidationError) as error:
+            adapter.validate_python(data)
+        assert error.value.errors()[0]["type"] == "union_tag_not_found"
 
 
 @pytest.mark.parametrize(

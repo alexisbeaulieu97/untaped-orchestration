@@ -1,12 +1,18 @@
 import re
 from datetime import UTC, date, datetime
+from functools import cache
 from typing import Self
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from pydantic import ConfigDict, RootModel, field_validator
 
 UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
 CALENDAR_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+@cache
+def _available_iana_timezones() -> frozenset[str]:
+    return frozenset(available_timezones())
 
 
 class UtcTimestamp(RootModel[str]):
@@ -44,6 +50,8 @@ class IanaTimezone(RootModel[str]):
     @field_validator("root")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
+        if value not in _available_iana_timezones():
+            raise ValueError("expected a valid IANA timezone")
         try:
             ZoneInfo(value)
         except (ValueError, ZoneInfoNotFoundError) as error:

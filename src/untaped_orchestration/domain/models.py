@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
@@ -5,9 +6,11 @@ from typing import Annotated, Literal
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Discriminator,
     Field,
     RootModel,
     StrictBool,
+    Tag,
     field_validator,
     model_validator,
 )
@@ -255,6 +258,7 @@ class ActiveTask(_CommonItem):
 
     @model_validator(mode="after")
     def _validate_active_lifecycle_shape(self) -> ActiveTask:
+        _validate_task_source_links(self.links)
         if self.stage is TaskStage.BACKLOG and self.revisit_when is None:
             raise ValueError("backlog tasks require revisit_when")
         if self.stage is not TaskStage.BACKLOG and self.revisit_when is not None:
@@ -298,10 +302,17 @@ class ArchivedTask(_CommonItem):
 
     @model_validator(mode="after")
     def _validate_archived_lifecycle_shape(self) -> ArchivedTask:
+        _validate_task_source_links(self.links)
         if self.closed_from is TaskStage.BACKLOG and self.revisit_when is None:
             raise ValueError("tasks closed from backlog retain revisit_when")
         if self.closed_from is not TaskStage.BACKLOG and self.revisit_when is not None:
             raise ValueError("only tasks closed from backlog retain revisit_when")
+        if self.closed_from is TaskStage.IN_PROGRESS and self.started_at is None:
+            raise ValueError("tasks closed from in-progress require started_at")
+        if self.outcome is TaskOutcome.CANCELLED and self.started_at is None:
+            raise ValueError("cancelled tasks require started_at")
+        if self.outcome is TaskOutcome.DELIVERED and self.waiting_on:
+            raise ValueError("delivered tasks cannot retain waiting parties")
         return self
 
 
@@ -316,6 +327,7 @@ class Decision(_CommonItem):
 
     @model_validator(mode="after")
     def _validate_retirement_pair(self) -> Decision:
+        _validate_decision_source_links(self.links)
         if (self.retired_at is None) != (self.retire_note is None):
             raise ValueError("retired_at and retire_note must be present together")
         if self.retire_note is not None and not self.retire_note.strip():
@@ -366,5 +378,54 @@ class ImportManifest(_FrozenModel):
     records: tuple[ImportRecord, ...]
 
 
-type TaskRecord = ActiveTask | ArchivedTask
-type ItemRecord = ActiveTask | ArchivedTask | Decision
+def _validate_task_source_links(links: tuple[Link, ...]) -> None:
+    for link in links:
+        if link.relation is LinkRelation.SUPERSEDES and not isinstance(link.target, TaskId):
+            raise ValueError("task supersedes links require a task target")
+
+
+def _validate_decision_source_links(links: tuple[Link, ...]) -> None:
+    for link in links:
+        if link.relation is not LinkRelation.SUPERSEDES or not isinstance(link.target, DecisionId):
+            raise ValueError("decisions permit only supersedes links to decisions")
+
+
+def _task_record_discriminator(value: object) -> str | None:
+    if isinstance(value, ActiveTask):
+        return "active"
+    if isinstance(value, ArchivedTask):
+        return "archived"
+    if not isinstance(value, Mapping):
+        return None
+    has_active_shape = "stage" in value
+    has_archived_shape = any(
+        field in value for field in ("closed_from", "outcome", "closed_at", "close_note")
+    )
+    if has_active_shape == has_archived_shape:
+        return None
+    return "active" if has_active_shape else "archived"
+
+
+def _item_record_discriminator(value: object) -> str | None:
+    if isinstance(value, (ActiveTask, ArchivedTask)):
+        return "task"
+    if isinstance(value, Decision):
+        return "decision"
+    if not isinstance(value, Mapping):
+        return None
+    kind = value.get("kind")
+    if kind == ItemKind.TASK:
+        return "task"
+    if kind == ItemKind.DECISION:
+        return "decision"
+    return None
+
+
+type TaskRecord = Annotated[
+    Annotated[ActiveTask, Tag("active")] | Annotated[ArchivedTask, Tag("archived")],
+    Discriminator(_task_record_discriminator),
+]
+type ItemRecord = Annotated[
+    Annotated[TaskRecord, Tag("task")] | Annotated[Decision, Tag("decision")],
+    Discriminator(_item_record_discriminator),
+]
