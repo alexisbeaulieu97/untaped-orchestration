@@ -109,8 +109,9 @@ Rules:
 - `.lock`, sibling atomic-write temporary files, and editor artifacts are
   ignored.
 - Canonical files and applicable generated views are committed.
-- Public decision-only stores generate only `views/decisions.md`.
-- A private task-capable store generates all four views.
+- Decision-only stores generate only `views/decisions.md`.
+- A private task-capable store generates all four views. Public task-capable
+  stores are forbidden in v1.
 - Views project one local store only. They never contain recursive federation
   data or private data from another repository.
 - Agents use the CLI and never read views as input. Humans may read but not edit
@@ -132,18 +133,47 @@ Schema: `untaped.orchestration.store/v1`.
 | `capabilities.active_tasks` | Whether active and archived tasks may exist |
 | `curation.inbox_review_days` | Positive integer; default `7` |
 | `curation.in_progress_review_days` | Positive integer; default `14` |
-| `brief.pinned_decisions` | Ordered local decision IDs; maximum 10 |
+| `brief.pinned_decisions` | Ordered unique active local decision IDs; maximum 10 |
 | `brief.max_decision_body_bytes` | Default `4096` |
 | `brief.max_total_body_bytes` | Default `16384` |
 | `brief.max_rows_per_section` | Default `10` |
 | `brief.max_total_bytes` | Default `32768` |
 
-`init` defaults to a private task-capable store. `init --public
---decisions-only` creates the fleet's normal public store. `check` rejects any
-active or archived task in a decision-only store. Creating or importing a task
-into a public task-capable store requires `--confirm-public-task`. Visibility
-and capabilities are hand-edited administrative settings in v1; a valid
-`check` is required before subsequent typed mutations.
+Canonical private task-capable configuration:
+
+```toml
+schema = "untaped.orchestration.store/v1"
+id = "sto_019f0000000070008000000000000000"
+name = "Untaped orchestration hub"
+visibility = "private"
+timezone = "America/Montreal"
+
+[capabilities]
+active_tasks = true
+
+[curation]
+inbox_review_days = 7
+in_progress_review_days = 14
+
+[brief]
+pinned_decisions = []
+max_decision_body_bytes = 4096
+max_total_body_bytes = 16384
+max_rows_per_section = 10
+max_total_bytes = 32768
+```
+
+`init` defaults to a private task-capable store. `init --public` creates a
+public decision-only store; `visibility = "public"` requires
+`capabilities.active_tasks = false`. `check` rejects any active/archive task in
+a decision-only or public store, including after a hand-edited policy change.
+V1 deliberately has no public-task escape hatch: unfinished tasks remain
+private, and an explicit future schema is required before public task stores
+can exist.
+
+Visibility and capabilities remain hand-editable administrative declarations;
+the tool does not query Git hosting visibility. A valid `check` is required
+before subsequent typed mutations and in adoption CI.
 
 ### 3.3 `registry.toml`
 
@@ -155,7 +185,7 @@ store_id = "sto_019f0000000070008000000000000000"
 
 [[children]]
 id = "sto_019f0000000070008000000000000001"
-path = "../untaped/.untaped/orchestration"
+path = "../../untaped/.untaped/orchestration"
 ```
 
 - Every entry contains the expected immutable store ID and a POSIX-style path
@@ -171,6 +201,12 @@ path = "../untaped/.untaped/orchestration"
 - Every store may register children recursively.
 - Missing or invalid children create explicit incompleteness, never silent
   omission.
+
+The registry key order shown above is canonical: schema/store ID first, then
+`[[children]]` records sorted by child ID with `id` before `path`. `fmt` covers
+both administrative TOML files as well as item front matter; it validates and
+canonicalizes the full `store.toml`/`registry.toml` shapes using the key/table
+order in this section.
 
 ## 4. Item file format
 
@@ -287,6 +323,11 @@ Tag slugs use the same 64-character lowercase slug grammar as waiting-party
 slugs. The 64 KiB front-matter ceiling is also the hard aggregate bound for
 links and evidence; commands refuse mutations that would exceed it.
 
+Every persisted semantic timestamp ending in `_at` uses the same exact UTC
+millisecond representation as `created_at`:
+`YYYY-MM-DDTHH:MM:SS.sssZ`. Calendar fields ending in `_on` remain exact
+`YYYY-MM-DD` dates interpreted in the store timezone.
+
 The tool derives but never persists:
 
 - `revision`: SHA-256 of exact item bytes, formatted `sha256:<hex>`.
@@ -308,6 +349,7 @@ only where semantics require them.
 | `stage` | `inbox`, `backlog`, `planned`, or `in-progress` |
 | `priority` | `critical`, `high`, `normal`, or `low` |
 | `rank` | Positive sparse signed-64-bit integer |
+| `parent` | Optional same-store task ID; containment is child-owned |
 | `started_at` | Set on first entry to `in-progress`; never cleared |
 | `revisit_when` | Required/nonempty in backlog; forbidden elsewhere |
 | `reviewed_at` | Optional last acknowledged-review timestamp |
@@ -331,9 +373,19 @@ federation state; it is not a stage.
 Rank scope is `(parent task or top level, stage)`. Initial ranks are 1000,
 2000, 3000, and so on. Midpoint insertion, half-first prepend, and +1000 append
 are used while an integer gap exists. When none exists, the complete scope is
-deterministically renumbered in steps of 1000 under the store lock. Users move
-items with `--first`, `--last`, `--before`, or `--after`; generic update never
-sets rank or parent.
+deterministically renumbered in steps of 1000 under the store lock without
+changing relative order. Rank decreases are written first-to-last; increases
+are then written last-to-first; unchanged ranks are skipped. This keeps ranks
+unique and strictly ordered after every individual replacement, so interruption
+never reorders the scope.
+
+Rebalance is a semantically neutral phase completed before a requested move or
+transition. Only after that phase is durable does one atomic replacement of the
+primary task change its `parent`, `stage`, and/or final rank. If rebalance is
+interrupted, the task remains in its original parent/stage and the caller
+rereads the item/store revisions before retrying. Users move items with
+`--first`, `--last`, `--before`, or `--after`; generic update never sets rank
+or parent.
 
 Global ordering is priority, ancestor rank vector, own rank, then ID.
 
@@ -424,29 +476,51 @@ Each predecessor has at most one successor; one successor may consolidate
 several predecessors. Decisions remain under `decisions/` rather than moving to
 an archive. A multi-predecessor `decision supersede` supplies every predecessor
 ID and current revision; all predecessors and the successor are same-store.
-Pinned decision IDs must resolve to active local decisions.
+Pinned decision IDs are ordered, unique, and resolve to active local decisions.
+When several pinned predecessors collapse, the successor occupies the earliest
+predecessor position; later predecessor/successor duplicates are removed while
+all unrelated pin order is preserved.
+
+Allowed decision mutations by derived state:
+
+| Command | Active | Superseded/retired |
+|---|---|---|
+| `decision update` (title/body/tags clarification only) | Allowed | Allowed |
+| `curate acknowledge` / `curate snooze` | Allowed | Refused; inactive `review_on` is historical only |
+| `evidence add` | Allowed | Allowed |
+| `evidence remove`, generic link add/remove | Allowed | Refused |
+| `decision supersede` / `decision retire` | Allowed | Refused |
+
+Supersede retry with the same predecessor set and ruling content reuses one
+already-written exact successor before finishing pin maintenance; a divergent
+incoming successor refuses recovery. Retire retry accepts the same already
+written retirement fields only to finish pin removal.
 
 ## 7. Relations and graph safety
 
-Each link has `relation`, `target_store_id`, and `target`.
+Containment is persisted once, as the child's optional `parent` field. The CLI
+derives parent-to-child traversal from those child-owned values; it never stores
+reciprocal containment links. Every persisted link has `relation`,
+`target_store_id`, and `target`.
 
 | Relation | Direction/kinds | Locality | Semantics |
 |---|---|---|---|
-| `parent-of` | task parent → child | Same store | Forest; child has one parent |
 | `depends-on` | task dependent → prerequisite | Same store | Readiness DAG |
 | `governed-by` | task → decision | Cross-store allowed | Policy navigation |
 | `supersedes` | successor → same-kind predecessor | Same store | Lifecycle-owned |
 | `follow-up-to` | newer task → active/archive task | Cross-store allowed | Navigation only |
 
-`task move` exclusively owns `parent-of`; typed supersede/close flows own
+`task move` exclusively owns `parent`; typed supersede/close flows own
 `supersedes`; generic link commands handle only dependency, governance, and
-follow-up relations. Cross-store structural relations are forbidden because
-atomic invariant maintenance cannot span independent repositories.
+follow-up relations. Parent and dependency targets are same-store. Cross-store
+structural relations are forbidden because invariant maintenance cannot span
+independent repositories.
 
-Validation builds containment, dependency, and per-kind supersession graphs,
-plus a combined completion-precedence graph where prerequisites precede
-dependents and children precede parents. Any individual or combined cycle is
-an error.
+An active task's parent, when present, must be active; archived tasks preserve
+their historical parent ID. Validation builds the child-owned containment
+forest, dependency and per-kind supersession graphs, plus a combined
+completion-precedence graph where prerequisites precede dependents and children
+precede parents. Any individual or combined cycle is an error.
 
 A `governed-by` link to a superseded or retired decision remains valid
 historical navigation, but `check` warns and `brief` identifies the inactive
@@ -513,12 +587,13 @@ timeout makes the affected store explicitly incomplete.
 --store PATH
 --local
 --format table|json|pipe|raw
---columns FIELD,...
+--columns FIELD  # repeatable; -c alias
 --limit N
 --debug
 ```
 
-V1 intentionally omits cursors. Default query limit is 50 and maximum is 200.
+V1 intentionally omits cursors. Query limits are positive; default is 50 and
+maximum is 200.
 Results use deterministic ordering and report truncation; callers narrow
 filters or raise the limit. Cursor pagination may be added compatibly only when
 real store sizes justify it.
@@ -558,31 +633,44 @@ store import
 check
 fmt --check|--write
 render --check|--write
-repair frontmatter
+repair frontmatter PATH
 repair duplicate ID
 ```
 
 There is no generic item update. Every canonical mutation requires the current
-primary item revision; structural moves also assert the current parent,
-including explicit `none`. Registry writes require the registry revision.
-Batch import/format requires the store revision. Agents always pass guards and
-the packaged skill forbids `--force-current`; a human may explicitly use it.
+primary item revision. Move and transition additionally require the store
+revision and assert the current child-owned parent, including explicit `none`,
+so every rank scope and relative anchor is guarded. A superseded task close
+guards predecessor and successor revisions; multi-predecessor decision
+supersede guards every predecessor. Decision supersede/retire also require the
+store revision because they may rewrite pins. Registry writes require the
+registry revision. Batch import/format requires the store revision.
+Agents always pass guards and the packaged skill forbids `--force-current`; a
+human may explicitly use it.
 Mutations are noninteractive, with required notes, outcomes, dates, revisions,
 and confirmations provided as flags. Repair and import default to dry-run and
 write only with `--apply`.
 
-Field ownership:
+Typed ownership:
 
-- create/import: identity and creation time;
+- create/import: full-record initialization, including identity/creation time;
 - `task update`: title, body, priority, tags, and `waiting_on`;
 - transition: stage, transition timestamps, and `revisit_when`;
-- move: parent/rank;
+- move: parent;
+- shared placement protocol invoked only by transition/move: rank;
 - close: archive fields and, for superseded outcome, the successor link;
 - decision update: title, body, and tags for non-ruling clarifications;
 - decision supersede/retire: lifecycle fields and pin maintenance;
 - link/evidence/curation commands: only their named fields;
 - renderer: views only;
 - revisions/readiness/activity/due state: derived only.
+
+Create/import initialize complete records and explicit repair may replace
+invalid bytes, so those are controlled exceptions rather than competing normal
+mutation paths. Hand edits are supported, but `check` proves only the resulting
+state, not the historical transition that produced it. Content/config edits
+remain ordinary; direct lifecycle/relation edits are an emergency recovery
+path that requires explicit Git review and a clean `check`/`fmt --check`.
 
 ### 10.4 Structured output deviation
 
@@ -603,10 +691,18 @@ row/object JSON:
 This deliberate deviation is required because federation completeness,
 truncation, and diagnostics are part of safe machine interpretation, not human
 stderr decoration. YAML is intentionally omitted in v1 so there is one
-structured agent contract. Table/raw commands use stderr diagnostics. Pipe is
-NDJSON with `orchestration.store`, `.task`, `.decision`, `.evidence`, and
-`.diagnostic` kinds. Raw output defaults its first field to stable ID;
-`--columns` controls additions.
+structured agent contract. Table/raw commands use stderr diagnostics. Pipe
+preserves the SDK Pipe v1 envelope exactly, one NDJSON object per line:
+
+```json
+{"untaped":"1","kind":"orchestration.task","record":{"id":"tsk_..."}}
+```
+
+Kinds are `orchestration.store`, `.task`, `.decision`, `.evidence`, and
+`.diagnostic`; `record` contains command data or the structured diagnostic.
+Pipe ignores columns. Raw output defaults its first field to stable ID;
+repeatable `--columns FIELD`/`-c FIELD` controls additions and supports the
+SDK's dotted paths.
 
 Expected domain failures remain structured JSON on stdout under JSON mode.
 Unexpected traces appear only with `--debug`.
@@ -671,16 +767,20 @@ errors.
 
 ### 12.1 `fmt`
 
-`fmt --check` parses/validates metadata, serializes canonically in memory,
+`fmt --check` covers `store.toml`, `registry.toml`, and every item. It
+parses/validates metadata, serializes canonically in memory,
 reparses/revalidates it, and compares expected full bytes. `fmt --write`
-requires revision guards, refuses invalid metadata, rewrites front matter only,
-preserves body bytes, and never renames files or guesses semantic repairs.
+requires item/store/registry revision guards as applicable, refuses invalid
+metadata, rewrites administrative TOML as a complete atomic file and item front
+matter as a bounded region, preserves item body bytes, and never renames files
+or guesses semantic repairs.
 
 ### 12.2 Atomic writes and multi-file interruption
 
 Every individual file replacement uses a sibling temporary file, flush/fsync,
-and atomic rename under one store lock. Multi-file operations validate their
-complete intended result before the first write and use recoverable ordering:
+atomic rename, and parent-directory fsync under one store lock. Multi-file
+operations validate their complete intended result before the first write and
+use the fault-state protocol below.
 
 - Close writes the complete archive destination before deleting the active
   source. Superseded close writes the successor link first. An interruption
@@ -689,22 +789,41 @@ complete intended result before the first write and use recoverable ordering:
   retirement writes the retirement fields before removing a pin. Retry accepts
   an already-applied exact phase only when it matches the provided guarded
   intent, then completes the remaining phase.
-- Rank rebalance and view rendering are deterministic and retryable.
+- Rank rebalance uses the order-preserving protocol in section 5.2, finishes
+  before the primary move/transition replacement, and is retryable from every
+  replacement boundary with freshly read guards.
 - Import accepts already-written byte-identical manifest records on retry and
   refuses divergent or unexpected files.
 
+| Operation | Only accepted intermediate state | Detection and recovery |
+|---|---|---|
+| Move or stage transition | Optional same-order rebalance is partly/fully applied; primary task still has its old parent/stage/rank until its one final replacement | Store remains graph-valid and order-equivalent; inspect diff, reread item/store revisions, rerun. Final target state is an idempotent success. |
+| Ordinary close | Complete archive exists while semantically matching active source remains | `check` reports the pair; guarded retry or `repair duplicate` removes only the matched active source. |
+| Superseded close | Exact successor link may exist before the close pair | `check` reports a successor pointing at an active predecessor; reread both revisions and retry the same successor/outcome. |
+| Decision supersede | One exact linked successor may exist before pin replacement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement. |
+| Decision retire | Retirement fields may exist before pin removal | Inactive pin is reported; same-note retry finishes removal. |
+| Import | Exact subset of the external manifest may exist | Generic `check` cannot infer intent; rerun the same manifest/`--if-clean`, which reconstructs the guarded base and writes the remainder. |
+| View render | Any subset of derived views may be stale after canonical success | `canonical_applied=true`, `views_current=false`; `render --write` replaces all applicable views deterministically. |
+
+Multi-file commands and their errors include intended/changed relative paths
+and current revisions in structured output whenever the process survives to
+report them. Recovery never treats a syntactically valid but divergent file as
+an accepted phase.
+
 `check` reports duplicate active/archive copies, incomplete lifecycle phases,
-inactive pins, rank drift, partial import sets, orphan temporaries, and stale
-views. `repair duplicate
+inactive pins, invalid/duplicate ranks, orphan temporaries, and stale views.
+It cannot infer an incomplete external import manifest from otherwise valid
+records. `repair duplicate
 ID --if-active-revision HASH --if-archive-revision HASH --apply` removes only
 an active copy whose semantic source projection exactly matches a valid archive
 copy: identical preserved fields/body, archive `closed_from` equal to the
 active stage, and valid close-only fields. The dry run shows the comparison.
 Other divergence is never auto-resolved.
 
-The documented recovery procedure is: inspect `check` and `git diff`; rerun an
-idempotent operation when files match its intended values; otherwise use Git to
-restore `.untaped/orchestration/` and retry, or repair one file explicitly.
+The documented recovery procedure is: inspect `check` and `git diff`; reread
+reported revisions; rerun an operation when files match an accepted state;
+otherwise use Git to restore only the affected paths after preserving unrelated
+work, or repair one file explicitly. A broad store restore is never the default.
 This documentation is not a Git dependency in the tool.
 
 ### 12.3 Raw front-matter recovery
@@ -712,9 +831,16 @@ This documentation is not a Git dependency in the tool.
 - `show ID --raw` finds a safe filename prefix and returns exact bytes/path and
   raw revision despite invalid TOML.
 - `inspect PATH --raw` handles broken IDs/filenames.
+- Raw inspect/repair paths must be regular nonsymlink files under the selected
+  store's `tasks/`, `decisions/`, or `archive/tasks/` roots.
 - `repair frontmatter PATH --frontmatter-file FILE --if-revision HASH` parses
-  and validates replacement TOML, preserves body bytes, shows dry-run diff,
-  writes only with `--apply`, and never defaults missing semantic fields.
+  and validates replacement TOML, preserves body bytes when the existing
+  delimiter split is provable, shows a dry-run diff, writes only with
+  `--apply`, and never defaults missing semantic fields.
+- If opening/closing delimiters or UTF-8 encoding make the body boundary
+  unprovable, repair refuses without `--body-file FILE`. With that explicit
+  file, it validates the replacement body as UTF-8/within bounds and writes its
+  bytes exactly; it never guesses which raw bytes were body content.
 
 ### 12.4 Views
 
@@ -747,23 +873,33 @@ destinations, stages/outcomes, evidence, and links; validates normal schema,
 policy, graph, filename, collision, and visibility rules; reports exact
 destination/hash; defaults to dry-run; and writes with `--apply`.
 
-An interrupted import is resumed only when every existing destination is an
-exact byte-identical record from the same manifest and there are no unexpected
-items. `expected_store_revision` always names the original pre-import state;
-on retry the tool virtually removes exact manifest destinations already
-present and requires the reconstructed revision to match it. Remaining records
-are written atomically. Any changed base file, divergent destination, or
-unexpected item refuses recovery. Task import into a decision-only store is
-forbidden; public task import needs `--confirm-public-task`.
+Fleet manifests set `require_empty_items = true`; apply then also requires the
+explicit `store import MANIFEST --if-clean --apply` guard. On the first attempt,
+`--if-clean` requires zero item files, current views, and no orphan temporary
+files. It is not a journal: the manifest remains external.
+
+An interrupted import is resumed only by supplying that same manifest. Every
+existing destination must be its exact byte-identical record and there may be
+no item outside the reconstructed pre-import base plus manifest destinations.
+`expected_store_revision` always names the original pre-import state; on retry
+the tool virtually removes exact manifest destinations already present and
+requires the reconstructed revision to match it. The already-written exact
+subset is the sole retry exception to `--if-clean`; each remaining record uses
+an atomic replacement. Any changed base file, divergent destination, or
+unexpected item refuses recovery. Generic `check` cannot declare the external
+manifest complete; import dry-run reports the subset, and coverage/count
+acceptance gates prove migration completeness. Task import into a decision-only
+or public store is forbidden.
 
 Legacy conversion into this manifest is a reviewed one-off preparation step,
 not permanent product code.
 
 ## 14. Privacy and agent workflow
 
-Public fleet stores are decision-only. Unfinished tasks stay in the private
-hub. Intentional public tasks are exceptional and require explicit confirmation;
-there is no silent private-to-public relocation.
+Public stores are decision-only in v1. Unfinished tasks stay in the private
+hub, and changing a populated private store's declaration to public makes
+`check` fail. There is no public-task exception or silent private-to-public
+relocation.
 
 The packaged skill instructs agents to:
 
@@ -775,7 +911,7 @@ The packaged skill instructs agents to:
 6. Never read/edit generated views.
 7. Run `check` after hand edits/recovery.
 8. Verify external evidence before recording it.
-9. Treat public task confirmation as exceptional.
+9. Never place tasks in a public store.
 10. Stop readiness/delivery work on incomplete federation.
 
 ## 15. Packaging and repository contract
@@ -807,9 +943,9 @@ ToolSpec(
 
 Settings are empty/extra-ignoring in v1; there is no SDK state model. The wheel
 includes `py.typed` and the packaged skill, excludes repository `.untaped/`
-state, and proves installed-wheel `--version`. Version output is exactly
-`untaped-orchestration <distribution-version>` with exit 0 and requires no
-store or profile. Release templates use reviewed core checker commit
+state, and proves installed-wheel `--version`. Version stdout is exactly
+`<distribution-version>\n` with exit 0 and requires no store or profile.
+Release templates use reviewed core checker commit
 `80bb8411cd0017f3e0cde818656aaf6fd0233368`.
 
 Implementation CI may use the local source until `0.1.0` exists. After an
@@ -831,8 +967,9 @@ Market requires PR #6 content on verified main. Apple Health bases from verified
 GitHub HTTPS `FETCH_HEAD`. `pypi-rollout/` is outside this program and is not a
 store; relevant results may be linked as evidence only.
 
-The hub registry ultimately contains ten children: the eight workspace-manifest
-repositories, Apple Health, and this tool. The hub is the eleventh store.
+The hub registry ultimately contains ten children: the eight pre-existing
+workspace-manifest repositories, Apple Health, and this tool. The hub is the
+eleventh store.
 Apple Health remains intentionally absent from `untaped.yml` because it is not
 part of the reconstructed workspace set; explicit federation registration is
 independent of that workspace manifest.
@@ -845,10 +982,20 @@ with `check --local`, `fmt --check --local`, and `render --check --local`.
 The workflow invokes the released distribution directly:
 
 ```sh
-uvx --from 'untaped-orchestration==0.1.0' untaped-orchestration check --local
-uvx --from 'untaped-orchestration==0.1.0' untaped-orchestration fmt --check --local
-uvx --from 'untaped-orchestration==0.1.0' untaped-orchestration render --check --local
+uvx --python 3.14 --from 'untaped-orchestration==0.1.0' \
+  untaped-orchestration check --local
+uvx --python 3.14 --from 'untaped-orchestration==0.1.0' \
+  untaped-orchestration fmt --check --local
+uvx --python 3.14 --from 'untaped-orchestration==0.1.0' \
+  untaped-orchestration render --check --local
 ```
+
+Every dedicated `.github/workflows/orchestration.yml` uses full-commit-SHA
+pinned checkout/setup actions, top-level `contents: read`, concurrency
+cancellation for superseded branch runs, and no project dependency sync. It
+triggers on the store, this workflow, and relevant root instructions/human
+pointer files. The exact released package pin is the enforcement boundary; any
+pre-commit snippet is convenience only.
 
 Exact `0.1.0` pins are deliberate during v1 rollout for reproducibility. A
 compatible range may be considered only after the schema and CLI stabilize.
@@ -886,6 +1033,21 @@ Expected counts, destinations, references, views, and public-task privacy must
 all validate before deletion. Source evidence is retained in import
 `source_ref`.
 
+### 16.3 Hub-specific final adoption
+
+The whitelist-based hub adopts last. Its `.gitignore` must explicitly unignore
+`.untaped/`, `.untaped/orchestration/**`, `.github/`, `.github/workflows/`, and
+`.github/workflows/orchestration.yml`, while ignoring `.lock`, atomic-write
+temporaries, and editor artifacts and continuing to track generated views.
+Verify the exact tracked/ignored set with `git check-ignore` and
+`git diff --name-only`.
+
+Final hub validation runs local checks plus recursive
+`check --require-children`; proves ten unique child stores, no public tasks or
+recursive view data, complete migration coverage, and no stale legacy-path
+references. Only then may legacy orchestration files and frozen inputs be
+removed through a separately reviewed change.
+
 ## 17. Verification and acceptance
 
 ### 17.1 Schema/domain tests
@@ -894,12 +1056,15 @@ all validate before deletion. Source evidence is retained in import
 - Byte preservation through format and repair.
 - Tag/link/evidence ordering and canonicalization.
 - Rank operations/rebalance and signed-64-bit boundaries.
+- Child-owned parent forest and move/transition placement guards.
 - All task transitions, close outcomes, decision supersede/retire, pin updates.
+- Decision state-by-command mutation matrix and consolidated-pin ordering.
 - Waiting-party blocking and `--waiting-on` queries.
 - Curation formulae with injected clocks/timezones.
 - Relation locality/cardinality and all individual/combined graph cycles.
 - Readiness for every archived dependency outcome.
 - Diagnostic codes/paths/order and every output format golden contract.
+- Exact SDK Pipe v1 envelope, repeatable columns, and version-only stdout.
 - Brief and query limits/truncation.
 - Public/private capability enforcement.
 
@@ -910,9 +1075,11 @@ all validate before deletion. Source evidence is retained in import
 - Registry cycles, lock contention/timeouts, header-only scans.
 - Raw lookup with invalid TOML/ID mismatch and lazy empty directories.
 - Atomic-write fault injection at file replacement boundaries.
+- Interrupted order-preserving rebalance before move/transition final replace.
 - Interrupted close duplicate detection/safe repair.
 - Interrupted supersede/pin repair by retry or Git restoration.
 - Interrupted import exact-subset resume and divergent refusal.
+- Delimiter-corruption repair requiring an explicit body file.
 - View-render failure after canonical success.
 
 ### 17.3 Performance bounds
@@ -959,14 +1126,17 @@ baseline measurement rather than inventing them in this specification.
 | Market/Apple special gates | 16 |
 | No unapproved external actions | 1, 15–16 |
 
-Every persisted field has one producer: store policy by init/admin edit;
-registry by child commands; identity/time by create/import; mutable content and
-priority/waiting state by typed update; stage/start/revisit trigger by
-transition; parent/rank by move; outcome by close; decision lifecycle by
-supersede/retire; review by curation; evidence by evidence commands; views by
-renderer. Revisions, readiness, activity, due state, and completeness are
-derived only. No generic mutation path may manufacture a lifecycle-owned
-field.
+Within normal typed mutations after initialization, every field has one domain
+owner: store policy by explicit admin edit; registry by child commands;
+content/priority/waiting state by update; stage/start/revisit trigger by
+transition; parent by move; rank by the shared placement protocol; outcome by
+close; decision lifecycle by supersede/retire; review by curation; evidence by
+evidence commands; views by renderer. Create/import initialization and explicit
+repair are controlled exceptions. Valid hand edits are supported escape hatches
+whose provenance cannot be proven; `check` validates the resulting invariants
+and Git review validates semantic intent. Revisions, readiness, activity, due
+state, and completeness are derived only. No generic CLI mutation may
+manufacture a lifecycle-owned field.
 
 ## 19. Stop conditions and next gate
 
