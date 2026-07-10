@@ -59,7 +59,37 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
         raw_index: list[RawReference] = []
         file_revisions = {}
         for relative_path in relative_paths:
-            raw = location.real_root.joinpath(*relative_path.parts).read_bytes()
+            absolute = location.real_root.joinpath(*relative_path.parts)
+            if _is_item_path(relative_path):
+                with absolute.open("rb") as stream:
+                    streamed = self._items.parse_stream(
+                        stream,
+                        relative_path=relative_path,
+                        headers_only=headers_only,
+                    )
+                file_revisions[relative_path] = streamed.revision
+                raw_index.append(
+                    RawReference(
+                        path=relative_path,
+                        revision=streamed.revision,
+                        size=streamed.size,
+                    )
+                )
+                if streamed.diagnostic is not None:
+                    diagnostics.append(streamed.diagnostic)
+                    continue
+                assert streamed.metadata is not None
+                records.append(
+                    LoadedRecord(
+                        path=relative_path,
+                        revision=streamed.revision,
+                        metadata=streamed.metadata,
+                        body=streamed.body,
+                    )
+                )
+                continue
+
+            raw = absolute.read_bytes()
             revision = file_revision(raw)
             file_revisions[relative_path] = revision
             if relative_path == PurePosixPath("store.toml"):
@@ -75,22 +105,7 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
                 except CodecError as error:
                     diagnostics.append(error.diagnostic)
                 continue
-            if not _is_item_path(relative_path):
-                continue
-            raw_index.append(RawReference(path=relative_path, revision=revision, size=len(raw)))
-            try:
-                document = self._items.parse(raw, relative_path=relative_path)
-            except CodecError as error:
-                diagnostics.append(error.diagnostic)
-                continue
-            records.append(
-                LoadedRecord(
-                    path=relative_path,
-                    revision=revision,
-                    metadata=document.metadata,
-                    body=None if headers_only else document.body,
-                )
-            )
+            continue
 
         if store is not None and registry is not None and store.id != registry.store_id:
             diagnostics.append(
@@ -134,7 +149,7 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
 
     def replace(self, location: StoreLocation, change: FileReplacement) -> None:
         target = safe_write_path(location, change.path)
-        self._atomic.replace_bytes(target, change.content)
+        self._atomic.replace_bytes(target, change.content, root=location.real_root)
 
     def delete(self, location: StoreLocation, change: FileDeletion) -> None:
         target = safe_delete_path(location, change.path)

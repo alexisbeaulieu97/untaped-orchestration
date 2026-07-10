@@ -5,7 +5,6 @@ import os
 import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Literal
 
 from untaped_orchestration.application.ports import RawReference, StoreLocation
 from untaped_orchestration.domain.models import Revision
@@ -205,6 +204,11 @@ def canonical_input_paths(location: StoreLocation) -> tuple[PurePosixPath, ...]:
         paths.extend(_item_paths(location, root))
 
     paths.sort(key=lambda value: value.as_posix())
+    reject_casefold_path_aliases(paths)
+    return tuple(paths)
+
+
+def reject_casefold_path_aliases(paths: Iterable[PurePosixPath]) -> None:
     aliases: dict[str, PurePosixPath] = {}
     for path in paths:
         key = path.as_posix().casefold()
@@ -215,7 +219,6 @@ def canonical_input_paths(location: StoreLocation) -> tuple[PurePosixPath, ...]:
                 f"case-folding path alias conflicts with {prior.as_posix()}",
             )
         aliases[key] = path
-    return tuple(paths)
 
 
 def _is_exact_item_path(relative_path: PurePosixPath) -> bool:
@@ -252,13 +255,6 @@ def safe_write_path(location: StoreLocation, relative_path: PurePosixPath) -> Pa
     if absolute.exists() and (absolute.is_symlink() or not absolute.is_file()):
         raise PathSafetyError(relative_path, "write destination must be a regular file or absent")
 
-    current = location.real_root
-    for part in relative_path.parts[:-1]:
-        current = current / part
-        if not current.exists():
-            current.mkdir()
-        elif current.is_symlink() or not current.is_dir():
-            raise PathSafetyError(relative_path, "write parent must be a real directory")
     return absolute
 
 
@@ -312,14 +308,7 @@ def raw_reference_by_prefix(
     return matches[0]
 
 
-type AtomicEvent = Literal[
-    "open-temp",
-    "flush",
-    "fsync-temp",
-    "replace",
-    "fsync-parent",
-    "before-ack",
-]
+type AtomicEvent = str
 
 
 class AtomicFilesystem:
@@ -340,10 +329,33 @@ class AtomicFilesystem:
         finally:
             os.close(descriptor)
 
-    def replace_bytes(self, target: Path, content: bytes) -> None:
+    def _ensure_parent_directories(self, *, root: Path, parent: Path) -> None:
+        try:
+            relative = parent.relative_to(root)
+        except ValueError as error:
+            raise PathSafetyError(parent, "write parent escapes the selected store root") from error
+
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current.exists() or current.is_symlink():
+                if current.is_symlink() or not current.is_dir():
+                    raise PathSafetyError(current, "write parent must be a real directory")
+            else:
+                current.mkdir()
+                self._event(f"mkdir:{current.relative_to(root).as_posix()}")
+
+            containing = current.parent
+            self._fsync_parent(containing)
+            containing_relative = containing.relative_to(root)
+            label = containing_relative.as_posix() if containing_relative.parts else "."
+            self._event(f"fsync-dir-parent:{label}")
+
+    def replace_bytes(self, target: Path, content: bytes, *, root: Path) -> None:
         temporary: Path | None = None
         replaced = False
         try:
+            self._ensure_parent_directories(root=root, parent=target.parent)
             with tempfile.NamedTemporaryFile(
                 mode="w+b",
                 prefix=f".{target.name}.untaped-tmp-",

@@ -1,8 +1,11 @@
+import codecs
+import hashlib
 import re
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import cast
+from typing import BinaryIO, cast
 
 import tomli_w
 from pydantic import TypeAdapter, ValidationError
@@ -21,11 +24,14 @@ from untaped_orchestration.domain.models import (
     Decision,
     ItemRecord,
     Registry,
+    Revision,
     StoreConfig,
 )
 
 FRONTMATTER_LIMIT = 64 * 1024
 BODY_LIMIT = 1024 * 1024
+STREAM_CHUNK_SIZE = 64 * 1024
+ENVELOPE_LIMIT = 4 + FRONTMATTER_LIMIT + 4
 UTF8_BOM = b"\xef\xbb\xbf"
 ITEM_FILENAME_RE = re.compile(r"(?P<id>(?:tsk|dec)_[0-9a-f]{32})-(?P<slug>.*)\.md")
 ITEM_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -43,6 +49,15 @@ class ItemDocument:
     metadata: ActiveTask | ArchivedTask | Decision
     body: bytes
     original: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class StreamedItem:
+    metadata: CanonicalItem | None
+    body: bytes | None
+    revision: Revision
+    size: int
+    diagnostic: Diagnostic | None
 
 
 def _error(
@@ -296,6 +311,158 @@ def _split_item(raw: bytes, *, relative_path: PurePosixPath) -> tuple[bytes, byt
     return metadata, body
 
 
+def _closing_delimiter_end(raw: bytearray, *, final: bool = False) -> int | None:
+    marker = raw.find(b"\n+++\n", 3)
+    if marker >= 0:
+        return marker + 5
+    if final and raw.endswith(b"\n+++"):
+        return len(raw)
+    return None
+
+
+def _stream_utf8_error(path: str) -> Diagnostic:
+    return _error(
+        "ORC001",
+        path=path,
+        field="",
+        message="content is not valid UTF-8",
+        hint="Encode the complete item as UTF-8 without a byte-order mark.",
+    ).diagnostic
+
+
+def _body_limit_error(path: str) -> Diagnostic:
+    return _error(
+        "ORC001",
+        path=path,
+        field="body",
+        message="item Markdown body exceeds the 1 MiB limit",
+        hint="Reduce the body to at most 1 MiB.",
+    ).diagnostic
+
+
+class _ItemStreamParser:
+    def __init__(
+        self,
+        *,
+        relative_path: PurePosixPath,
+        headers_only: bool,
+        parse_header: Callable[[bytes], ItemDocument],
+    ) -> None:
+        self._relative_path = relative_path
+        self._path = relative_path.as_posix()
+        self._parse_header_document = parse_header
+        self._digest = hashlib.sha256()
+        self._decoder: codecs.IncrementalDecoder | None = codecs.getincrementaldecoder("utf-8")(
+            "strict"
+        )
+        self._utf8_diagnostic: Diagnostic | None = None
+        self._header_diagnostic: Diagnostic | None = None
+        self._header = bytearray()
+        self._body = None if headers_only else bytearray()
+        self._metadata: CanonicalItem | None = None
+        self._closing_end: int | None = None
+        self._body_size = 0
+        self._size = 0
+        self._header_overflow = False
+
+    def consume(self, chunk: bytes) -> None:
+        self._digest.update(chunk)
+        self._size += len(chunk)
+        self._consume_utf8(chunk)
+        if self._closing_end is not None:
+            self._consume_body(chunk)
+        elif not self._header_overflow:
+            self._consume_header(chunk)
+
+    def _consume_utf8(self, chunk: bytes) -> None:
+        if self._decoder is None:
+            return
+        try:
+            self._decoder.decode(chunk, final=False)
+        except UnicodeDecodeError:
+            self._utf8_diagnostic = _stream_utf8_error(self._path)
+            self._decoder = None
+
+    def _consume_header(self, chunk: bytes) -> None:
+        available = ENVELOPE_LIMIT - len(self._header)
+        prefix = chunk[:available]
+        self._header.extend(prefix)
+        found = _closing_delimiter_end(self._header)
+        if found is None:
+            self._header_overflow = len(self._header) == ENVELOPE_LIMIT
+            return
+        self._closing_end = found
+        self._parse_header(found)
+        self._consume_body(bytes(self._header[found:]) + chunk[len(prefix) :])
+
+    def _consume_body(self, chunk: bytes) -> None:
+        self._body_size += len(chunk)
+        if self._body is None:
+            return
+        if self._body_size <= BODY_LIMIT:
+            self._body.extend(chunk)
+        else:
+            self._body = None
+
+    def _parse_header(self, closing_end: int) -> None:
+        try:
+            document = self._parse_header_document(bytes(self._header[:closing_end]))
+        except CodecError as error:
+            self._header_diagnostic = error.diagnostic
+        else:
+            self._metadata = document.metadata
+
+    def _finish_utf8(self) -> None:
+        if self._decoder is None:
+            return
+        try:
+            self._decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            self._utf8_diagnostic = _stream_utf8_error(self._path)
+
+    def _finish_header(self) -> None:
+        if not self._header_overflow:
+            found = _closing_delimiter_end(self._header, final=True)
+            if found is not None:
+                self._closing_end = found
+                self._parse_header(found)
+                return
+            try:
+                _split_item(bytes(self._header), relative_path=self._relative_path)
+            except CodecError as error:
+                self._header_diagnostic = error.diagnostic
+        if self._header_diagnostic is None:
+            self._header_diagnostic = _error(
+                "ORC001",
+                path=self._path,
+                field="",
+                message="item front matter exceeds the 64 KiB limit",
+                hint="Reduce metadata before parsing or formatting the item.",
+            ).diagnostic
+
+    def _result_diagnostic(self) -> Diagnostic | None:
+        if self._closing_end is None:
+            return self._header_diagnostic
+        if self._body_size > BODY_LIMIT:
+            return _body_limit_error(self._path)
+        return self._utf8_diagnostic or self._header_diagnostic
+
+    def finish(self) -> StreamedItem:
+        self._finish_utf8()
+        if self._closing_end is None:
+            self._finish_header()
+        diagnostic = self._result_diagnostic()
+        metadata = None if diagnostic is not None else self._metadata
+        body = None if diagnostic is not None or self._body is None else bytes(self._body)
+        return StreamedItem(
+            metadata=metadata,
+            body=body,
+            revision=Revision(f"sha256:{self._digest.hexdigest()}"),
+            size=self._size,
+            diagnostic=diagnostic,
+        )
+
+
 def _dump_with_array_tables(table: CanonicalTable, *array_table_keys: str) -> bytes:
     root = dict(table)
     array_tables: list[tuple[str, list[dict[str, object]]]] = []
@@ -319,6 +486,23 @@ class ItemCodec:
         )
         _validate_item_path(metadata, relative_path=relative_path)
         return ItemDocument(metadata=metadata, body=body, original=raw)
+
+    def parse_stream(
+        self,
+        stream: BinaryIO,
+        *,
+        relative_path: PurePosixPath,
+        headers_only: bool,
+    ) -> StreamedItem:
+        """Parse one item with bounded reads and without retaining header-only bodies."""
+        parser = _ItemStreamParser(
+            relative_path=relative_path,
+            headers_only=headers_only,
+            parse_header=lambda raw: self.parse(raw, relative_path=relative_path),
+        )
+        while chunk := stream.read(STREAM_CHUNK_SIZE):
+            parser.consume(chunk)
+        return parser.finish()
 
     def canonical_bytes(self, document: ItemDocument) -> bytes:
         if len(document.body) > BODY_LIMIT:

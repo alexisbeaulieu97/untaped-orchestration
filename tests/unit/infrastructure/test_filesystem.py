@@ -18,6 +18,7 @@ from untaped_orchestration.infrastructure.filesystem import (
     normalized_real_path_key,
     raw_reference_by_prefix,
     registry_location,
+    reject_casefold_path_aliases,
     safe_raw_path,
     store_revision,
     store_revision_from_file_revisions,
@@ -130,6 +131,16 @@ def test_canonical_inputs_allow_lazy_missing_item_directories(local_store: Path)
         "registry.toml",
         "store.toml",
     ]
+
+
+def test_canonical_inputs_reject_casefold_item_path_aliases() -> None:
+    with pytest.raises(PathSafetyError, match="case-folding path alias"):
+        reject_casefold_path_aliases(
+            (
+                PurePosixPath(f"tasks/{TASK_ID}-choice.md"),
+                PurePosixPath(f"tasks/{TASK_ID}-Choice.md"),
+            )
+        )
 
 
 @pytest.mark.parametrize(

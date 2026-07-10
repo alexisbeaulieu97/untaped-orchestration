@@ -1,3 +1,5 @@
+import hashlib
+import io
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -9,6 +11,7 @@ from tests.builders import (
     task_bytes,
 )
 from untaped_orchestration.application.results import FileDeletion, FileReplacement
+from untaped_orchestration.infrastructure.codec import ItemCodec
 from untaped_orchestration.infrastructure.filesystem import (
     AtomicFilesystem,
     PathSafetyError,
@@ -35,6 +38,37 @@ class FaultInjectingFilesystem(AtomicFilesystem):
         self.events.append(event)
         if event == self.fail_at:
             raise InjectedBoundaryError(event)
+
+
+STANDARD_REPLACE_EVENTS = [
+    "open-temp",
+    "flush",
+    "fsync-temp",
+    "replace",
+    "fsync-parent",
+    "before-ack",
+]
+
+
+class BoundedReader(io.BytesIO):
+    def __init__(self, raw: bytes) -> None:
+        super().__init__(raw)
+        self.max_request = 0
+        self.unbounded_reads = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            self.unbounded_reads += 1
+            raise AssertionError("streaming item reads must always be bounded")
+        self.max_request = max(self.max_request, size)
+        return super().read(size)
+
+    def readline(self, size: int = -1) -> bytes:
+        if size < 0:
+            self.unbounded_reads += 1
+            raise AssertionError("streaming item line reads must always be bounded")
+        self.max_request = max(self.max_request, size)
+        return super().readline(size)
 
 
 def test_load_local_aggregates_valid_records_and_three_malformed_raw_references(
@@ -83,6 +117,69 @@ def test_headers_only_discards_bodies_but_preserves_exact_item_revisions(local_s
 
     assert snapshot.records[0].body is None
     assert snapshot.records[0].revision == file_revision(raw)
+
+
+def test_headers_only_repository_never_materializes_an_item_with_read_bytes(
+    local_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = local_store / "decisions" / f"{DECISION_ID}-choice.md"
+    item.parent.mkdir()
+    item.write_bytes(decision_bytes())
+    original = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path.parent == item.parent:
+            raise AssertionError("header-only item load used Path.read_bytes")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    snapshot = FilesystemStoreRepository().load_local(
+        location_from_root(local_store), headers_only=True
+    )
+
+    assert snapshot.records[0].body is None
+
+
+def test_streaming_header_read_is_bounded_and_hashes_an_oversized_body_exactly() -> None:
+    canonical = decision_bytes()
+    closing_end = canonical.index(b"+++\n", 4) + 4
+    raw = canonical[:closing_end] + b"x" * (1024 * 1024 + 1)
+    stream = BoundedReader(raw)
+
+    result = ItemCodec().parse_stream(
+        stream,
+        relative_path=PurePosixPath(f"decisions/{DECISION_ID}-choice.md"),
+        headers_only=True,
+    )
+
+    assert result.metadata is None
+    assert result.body is None
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "ORC001"
+    assert result.diagnostic.field == "body"
+    assert result.revision.root == f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    assert result.size == len(raw)
+    assert stream.unbounded_reads == 0
+    assert stream.max_request <= 64 * 1024
+
+
+def test_streaming_full_body_mode_retains_only_a_valid_bounded_body() -> None:
+    raw = decision_bytes()
+    stream = BoundedReader(raw)
+
+    result = ItemCodec().parse_stream(
+        stream,
+        relative_path=PurePosixPath(f"decisions/{DECISION_ID}-choice.md"),
+        headers_only=False,
+    )
+
+    assert result.diagnostic is None
+    assert result.metadata is not None
+    assert result.body == b"The envelope is machine-owned.\n"
+    assert result.revision == file_revision(raw)
+    assert stream.max_request <= 64 * 1024
 
 
 def test_malformed_store_keeps_registry_and_item_diagnostics(local_store: Path) -> None:
@@ -196,14 +293,7 @@ def test_atomic_replacement_event_order_and_sibling_temp_cleanup(local_store: Pa
         FileReplacement(PurePosixPath("AGENTS.md"), b"new\n"),
     )
 
-    assert filesystem.events == [
-        "open-temp",
-        "flush",
-        "fsync-temp",
-        "replace",
-        "fsync-parent",
-        "before-ack",
-    ]
+    assert filesystem.events == STANDARD_REPLACE_EVENTS
     assert local_store.joinpath("AGENTS.md").read_bytes() == b"new\n"
     assert list(local_store.glob(".AGENTS.md.untaped-tmp-*")) == []
 
@@ -244,3 +334,98 @@ def test_writer_rejects_traversal_and_symlinked_destination_parents(
             location,
             FileReplacement(PurePosixPath(f"tasks/{TASK_ID}-unsafe.md"), task_bytes()),
         )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "created_events"),
+    [
+        (
+            PurePosixPath(f"tasks/{TASK_ID}-first.md"),
+            ["mkdir:tasks", "fsync-dir-parent:."],
+        ),
+        (
+            PurePosixPath(f"decisions/{DECISION_ID}-first.md"),
+            ["mkdir:decisions", "fsync-dir-parent:."],
+        ),
+        (
+            PurePosixPath(f"archive/tasks/{TASK_ID}-first.md"),
+            [
+                "mkdir:archive",
+                "fsync-dir-parent:.",
+                "mkdir:archive/tasks",
+                "fsync-dir-parent:archive",
+            ],
+        ),
+        (
+            PurePosixPath("views/roadmap.md"),
+            ["mkdir:views", "fsync-dir-parent:."],
+        ),
+    ],
+)
+def test_first_write_fsyncs_each_new_directory_entry_before_file_acknowledgement(
+    local_store: Path,
+    relative_path: PurePosixPath,
+    created_events: list[str],
+) -> None:
+    filesystem = FaultInjectingFilesystem()
+
+    FilesystemStoreRepository(atomic=filesystem).replace(
+        location_from_root(local_store),
+        FileReplacement(relative_path, b"durable\n"),
+    )
+
+    assert filesystem.events == created_events + STANDARD_REPLACE_EVENTS
+    assert local_store.joinpath(*relative_path.parts).read_bytes() == b"durable\n"
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "mkdir:archive",
+        "fsync-dir-parent:.",
+        "mkdir:archive/tasks",
+        "fsync-dir-parent:archive",
+    ],
+)
+def test_archive_parent_creation_can_stop_and_retry_at_every_durable_boundary(
+    local_store: Path,
+    boundary: str,
+) -> None:
+    relative = PurePosixPath(f"archive/tasks/{TASK_ID}-closed.md")
+    filesystem = FaultInjectingFilesystem(fail_at=boundary)
+    repository = FilesystemStoreRepository(atomic=filesystem)
+
+    with pytest.raises(InjectedBoundaryError) as captured:
+        repository.replace(location_from_root(local_store), FileReplacement(relative, b"archive"))
+    assert captured.value.boundary == boundary
+    assert not local_store.joinpath(*relative.parts).exists()
+
+    filesystem.fail_at = None
+    filesystem.events.clear()
+    repository.replace(location_from_root(local_store), FileReplacement(relative, b"archive"))
+    assert local_store.joinpath(*relative.parts).read_bytes() == b"archive"
+    assert filesystem.events[-6:] == STANDARD_REPLACE_EVENTS
+
+
+def test_archive_destination_is_fully_durable_before_active_source_deletion(
+    local_store: Path,
+) -> None:
+    active_relative = PurePosixPath(f"tasks/{TASK_ID}-close.md")
+    archive_relative = PurePosixPath(f"archive/tasks/{TASK_ID}-close.md")
+    active = local_store.joinpath(*active_relative.parts)
+    active.parent.mkdir()
+    active.write_bytes(b"active")
+    filesystem = FaultInjectingFilesystem()
+    repository = FilesystemStoreRepository(atomic=filesystem)
+
+    repository.replace(
+        location_from_root(local_store),
+        FileReplacement(archive_relative, b"archive"),
+    )
+    archive_ack = len(filesystem.events) - 1
+    repository.delete(location_from_root(local_store), FileDeletion(active_relative))
+
+    assert filesystem.events[archive_ack] == "before-ack"
+    assert filesystem.events[archive_ack - 1] == "fsync-parent"
+    assert not active.exists()
+    assert local_store.joinpath(*archive_relative.parts).read_bytes() == b"archive"

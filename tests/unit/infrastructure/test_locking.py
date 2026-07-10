@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,37 @@ def test_lock_timeout_releases_already_acquired_locks_and_names_conflicting_stor
         probe.release()
     finally:
         held.release()
+
+
+def test_multiple_lock_acquisitions_share_one_total_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = location_from_root(write_store(tmp_path / "a-store"))
+    second = location_from_root(write_store(tmp_path / "b-store"))
+    observed_timeouts: list[float] = []
+    monotonic_values = iter((100.0, 100.2, 100.7))
+
+    class RecordingLock:
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def acquire(self, *, timeout: float) -> None:
+            observed_timeouts.append(timeout)
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(
+        "untaped_orchestration.infrastructure.locking.FileLock",
+        RecordingLock,
+    )
+
+    with FileLockManager().acquire((first, second), timeout=1.0):
+        pass
+
+    assert observed_timeouts == pytest.approx([0.8, 0.3])
 
 
 def test_rejects_casefold_store_aliases_before_acquiring_any_lock(tmp_path: Path) -> None:
