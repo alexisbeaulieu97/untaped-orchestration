@@ -11,6 +11,7 @@ OTHER_TASK_ID = "tsk_019f0000000070008000000000000011"
 DECISION_ID = "dec_019f0000000070008000000000000001"
 OTHER_DECISION_ID = "dec_019f0000000070008000000000000002"
 TIMESTAMP = "2026-07-10T01:02:03.004Z"
+UTF8_BOM = b"\xef\xbb\xbf"
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "codec"
 
 
@@ -174,18 +175,101 @@ def test_rejects_unknown_fields_and_schema_kind_mismatches(
 
 
 @pytest.mark.parametrize(
-    "path",
+    ("path", "field"),
     [
-        PurePosixPath(f"tasks/{OTHER_TASK_ID}-land-specification.md"),
-        PurePosixPath(f"tasks/{TASK_ID}-Bad_Slug.md"),
-        PurePosixPath(f"tasks/{TASK_ID}-{'a' * 65}.md"),
+        (PurePosixPath(f"tasks/{OTHER_TASK_ID}-land-specification.md"), "id"),
+        (PurePosixPath(f"tasks/{TASK_ID}-Bad_Slug.md"), "slug"),
+        (PurePosixPath(f"tasks/{TASK_ID}-{'a' * 65}.md"), "slug"),
+        (PurePosixPath("tasks/not-a-canonical-item.md"), "filename"),
     ],
 )
-def test_rejects_filename_and_metadata_identity_mismatches(path: PurePosixPath) -> None:
+def test_filename_diagnostics_distinguish_grammar_slug_and_identity(
+    path: PurePosixPath,
+    field: str,
+) -> None:
     error = diagnostic_for(envelope(task_metadata()), path=path)
 
     assert error.diagnostic.code == "ORC003"
-    assert error.diagnostic.field == "id"
+    assert error.diagnostic.field == field
+
+
+def test_accepts_only_the_exact_placement_for_each_item_shape() -> None:
+    codec = ItemCodec()
+
+    active = codec.parse(
+        envelope(task_metadata()),
+        relative_path=PurePosixPath(f"tasks/{TASK_ID}-land-specification.md"),
+    )
+    archived = codec.parse(
+        envelope(task_metadata(archived=True)),
+        relative_path=PurePosixPath(f"archive/tasks/{TASK_ID}-land-specification.md"),
+    )
+    decision = codec.parse(
+        envelope(decision_metadata()),
+        relative_path=PurePosixPath(f"decisions/{DECISION_ID}-toml-envelope.md"),
+    )
+
+    assert isinstance(active.metadata, ActiveTask)
+    assert isinstance(archived.metadata, ArchivedTask)
+    assert isinstance(decision.metadata, Decision)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "path"),
+    [
+        (
+            task_metadata(),
+            PurePosixPath(f"archive/tasks/{TASK_ID}-land-specification.md"),
+        ),
+        (task_metadata(), PurePosixPath(f"decisions/{TASK_ID}-land-specification.md")),
+        (task_metadata(archived=True), PurePosixPath(f"tasks/{TASK_ID}-land-specification.md")),
+        (decision_metadata(), PurePosixPath(f"tasks/{DECISION_ID}-toml-envelope.md")),
+        (task_metadata(), PurePosixPath(f"tasks/nested/{TASK_ID}-land-specification.md")),
+        (task_metadata(), PurePosixPath(f"/tasks/{TASK_ID}-land-specification.md")),
+        (task_metadata(), PurePosixPath(f"tasks/../tasks/{TASK_ID}-land-specification.md")),
+    ],
+)
+def test_rejects_unsafe_or_nonexact_item_placement(metadata: bytes, path: PurePosixPath) -> None:
+    error = diagnostic_for(envelope(metadata), path=path)
+
+    assert error.diagnostic.code == "ORC003"
+    assert error.diagnostic.field == "path"
+
+
+def test_replacement_frontmatter_applies_the_same_exact_placement_validation() -> None:
+    with pytest.raises(CodecError) as captured:
+        ItemCodec().parse_replacement_frontmatter(
+            task_metadata(),
+            relative_path=PurePosixPath(f"archive/tasks/{TASK_ID}-land-specification.md"),
+        )
+
+    assert captured.value.diagnostic.code == "ORC003"
+    assert captured.value.diagnostic.field == "path"
+
+
+def test_enveloped_metadata_leading_ufeff_reports_full_file_location() -> None:
+    path = PurePosixPath(f"decisions/{DECISION_ID}-toml-envelope.md")
+
+    error = diagnostic_for(envelope(UTF8_BOM + decision_metadata()), path=path)
+
+    assert error.diagnostic.code == "ORC001"
+    assert error.diagnostic.line == 2
+    assert error.diagnostic.column == 1
+    assert error.diagnostic.byte_offset == 4
+
+
+def test_replacement_metadata_leading_ufeff_reports_raw_toml_location() -> None:
+    path = PurePosixPath(f"decisions/{DECISION_ID}-toml-envelope.md")
+
+    with pytest.raises(CodecError) as captured:
+        ItemCodec().parse_replacement_frontmatter(
+            UTF8_BOM + decision_metadata(),
+            relative_path=path,
+        )
+
+    assert captured.value.diagnostic.line == 1
+    assert captured.value.diagnostic.column == 1
+    assert captured.value.diagnostic.byte_offset == 0
 
 
 def test_canonicalization_preserves_every_body_byte_and_treats_later_delimiters_as_body() -> None:

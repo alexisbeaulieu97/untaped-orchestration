@@ -27,9 +27,8 @@ from untaped_orchestration.domain.models import (
 FRONTMATTER_LIMIT = 64 * 1024
 BODY_LIMIT = 1024 * 1024
 UTF8_BOM = b"\xef\xbb\xbf"
-ITEM_FILENAME_RE = re.compile(
-    r"(?P<id>(?:tsk|dec)_[0-9a-f]{32})-(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)\.md"
-)
+ITEM_FILENAME_RE = re.compile(r"(?P<id>(?:tsk|dec)_[0-9a-f]{32})-(?P<slug>.*)\.md")
+ITEM_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ITEM_ADAPTER: TypeAdapter[ItemRecord] = TypeAdapter(ItemRecord)
 
 
@@ -77,6 +76,7 @@ def _decode_utf8(
     *,
     path: str,
     byte_offset_base: int = 0,
+    line_offset: int = 0,
     reject_bom: bool = True,
 ) -> str:
     if reject_bom and raw.startswith(UTF8_BOM):
@@ -84,7 +84,7 @@ def _decode_utf8(
             "ORC001",
             path=path,
             field="",
-            line=1,
+            line=1 + line_offset,
             column=1,
             byte_offset=byte_offset_base,
             message="TOML must not contain a UTF-8 byte-order mark",
@@ -94,7 +94,7 @@ def _decode_utf8(
         return raw.decode("utf-8")
     except UnicodeDecodeError as error:
         prefix = raw[: error.start]
-        line = prefix.count(b"\n") + 1
+        line = prefix.count(b"\n") + 1 + line_offset
         line_prefix = prefix.rsplit(b"\n", maxsplit=1)[-1]
         column = len(line_prefix.decode("utf-8")) + 1
         raise _error(
@@ -110,7 +110,12 @@ def _decode_utf8(
 
 
 def _toml_mapping(raw: bytes, *, path: str, line_offset: int = 0) -> dict[str, object]:
-    text = _decode_utf8(raw, path=path, byte_offset_base=4 if line_offset else 0)
+    text = _decode_utf8(
+        raw,
+        path=path,
+        byte_offset_base=4 if line_offset else 0,
+        line_offset=line_offset,
+    )
     try:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
@@ -156,15 +161,56 @@ def _parse_item_metadata(
         raise _validation_error(error, path=path) from error
 
 
-def _validate_filename(metadata: CanonicalItem, *, relative_path: PurePosixPath) -> None:
+def _validate_item_path(metadata: CanonicalItem, *, relative_path: PurePosixPath) -> None:
+    expected_parent: tuple[str, ...]
+    if isinstance(metadata, ActiveTask):
+        expected_parent = ("tasks",)
+    elif isinstance(metadata, ArchivedTask):
+        expected_parent = ("archive", "tasks")
+    else:
+        expected_parent = ("decisions",)
+
+    if (
+        relative_path.is_absolute()
+        or ".." in relative_path.parts
+        or relative_path.parts[:-1] != expected_parent
+    ):
+        raise _error(
+            "ORC003",
+            path=relative_path.as_posix(),
+            field="path",
+            message="item path is unsafe or does not match its canonical record placement",
+            hint=(
+                "Place active tasks under tasks/, archived tasks under archive/tasks/, "
+                "and decisions under decisions/."
+            ),
+        )
+
     match = ITEM_FILENAME_RE.fullmatch(relative_path.name)
-    if match is None or len(match.group("slug")) > 64 or match.group("id") != metadata.id.root:
+    if match is None:
+        raise _error(
+            "ORC003",
+            path=relative_path.as_posix(),
+            field="filename",
+            message="item filename does not have the canonical typed-ID and Markdown form",
+            hint="Use <typed-id>-<creation-slug>.md with a lowercase typed ID.",
+        )
+    slug = match.group("slug")
+    if len(slug) > 64 or ITEM_SLUG_RE.fullmatch(slug) is None:
+        raise _error(
+            "ORC003",
+            path=relative_path.as_posix(),
+            field="slug",
+            message="item filename has a noncanonical creation slug",
+            hint="Use a lowercase slug of at most 64 characters.",
+        )
+    if match.group("id") != metadata.id.root:
         raise _error(
             "ORC003",
             path=relative_path.as_posix(),
             field="id",
             message="filename identity does not match validated item metadata",
-            hint="Use a canonical typed-ID filename whose ID equals the metadata ID.",
+            hint="Use a filename whose typed ID equals the metadata ID.",
         )
 
 
@@ -271,7 +317,7 @@ class ItemCodec:
             path=relative_path.as_posix(),
             line_offset=1,
         )
-        _validate_filename(metadata, relative_path=relative_path)
+        _validate_item_path(metadata, relative_path=relative_path)
         return ItemDocument(metadata=metadata, body=body, original=raw)
 
     def canonical_bytes(self, document: ItemDocument) -> bytes:
@@ -323,7 +369,7 @@ class ItemCodec:
                 hint="Reduce metadata before attempting repair.",
             )
         metadata = _parse_item_metadata(raw_toml, path=relative_path.as_posix())
-        _validate_filename(metadata, relative_path=relative_path)
+        _validate_item_path(metadata, relative_path=relative_path)
         return metadata
 
 
