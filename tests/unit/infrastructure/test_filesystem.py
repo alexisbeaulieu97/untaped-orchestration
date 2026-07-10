@@ -7,6 +7,7 @@ import pytest
 
 from tests.builders import DECISION_ID, TASK_ID, decision_bytes, task_bytes, write_store
 from untaped_orchestration.application.results import RawReference, StoreLocation
+from untaped_orchestration.infrastructure import filesystem
 from untaped_orchestration.infrastructure.filesystem import (
     AmbiguousRawPrefixError,
     PathSafetyError,
@@ -18,7 +19,6 @@ from untaped_orchestration.infrastructure.filesystem import (
     normalized_real_path_key,
     raw_reference_by_prefix,
     registry_location,
-    reject_casefold_path_aliases,
     safe_raw_path,
     store_revision,
     store_revision_from_file_revisions,
@@ -133,14 +133,22 @@ def test_canonical_inputs_allow_lazy_missing_item_directories(local_store: Path)
     ]
 
 
-def test_canonical_inputs_reject_casefold_item_path_aliases() -> None:
+def test_canonical_inputs_reject_casefold_item_path_aliases(
+    local_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    aliases = [
+        PurePosixPath(f"tasks/{TASK_ID}-choice.md"),
+        PurePosixPath(f"tasks/{TASK_ID}-Choice.md"),
+    ]
+    monkeypatch.setattr(
+        filesystem,
+        "_item_paths",
+        lambda _location, root: aliases if root == PurePosixPath("tasks") else [],
+    )
+
     with pytest.raises(PathSafetyError, match="case-folding path alias"):
-        reject_casefold_path_aliases(
-            (
-                PurePosixPath(f"tasks/{TASK_ID}-choice.md"),
-                PurePosixPath(f"tasks/{TASK_ID}-Choice.md"),
-            )
-        )
+        canonical_input_paths(location_from_root(local_store))
 
 
 @pytest.mark.parametrize(

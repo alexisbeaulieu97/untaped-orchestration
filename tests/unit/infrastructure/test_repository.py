@@ -11,7 +11,7 @@ from tests.builders import (
     task_bytes,
 )
 from untaped_orchestration.application.results import FileDeletion, FileReplacement
-from untaped_orchestration.infrastructure.codec import ItemCodec
+from untaped_orchestration.infrastructure.codec import CodecError, ItemCodec
 from untaped_orchestration.infrastructure.filesystem import (
     AtomicFilesystem,
     PathSafetyError,
@@ -180,6 +180,69 @@ def test_streaming_full_body_mode_retains_only_a_valid_bounded_body() -> None:
     assert result.body == b"The envelope is machine-owned.\n"
     assert result.revision == file_revision(raw)
     assert stream.max_request <= 64 * 1024
+
+
+def _direct_diagnostic(raw: bytes, relative_path: PurePosixPath):
+    try:
+        ItemCodec().parse(raw, relative_path=relative_path)
+    except CodecError as error:
+        return error.diagnostic
+    return None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"\xef\xbb\xbf" + decision_bytes(),
+        decision_bytes().removeprefix(b"+++") + b"x" * (1024 * 1024 + 1),
+        decision_bytes()[:20],
+        decision_bytes().replace(b'title = "Choice"', b'title = "\xffChoice"'),
+        decision_bytes() + b"\xff",
+        decision_bytes().replace(b'title = "Choice"', b"title ="),
+        decision_bytes().replace(
+            DECISION_ID.encode(),
+            f"{DECISION_ID[:-1]}2".encode(),
+            1,
+        ),
+        decision_bytes().replace(b'title = "Choice"', b"title =") + b"x" * (1024 * 1024 + 1),
+    ],
+    ids=[
+        "byte-zero-bom",
+        "missing-opener-plus-oversized",
+        "missing-closing",
+        "invalid-utf8-header",
+        "invalid-utf8-body",
+        "invalid-toml",
+        "filename-id-mismatch",
+        "invalid-toml-plus-oversized",
+    ],
+)
+def test_streaming_diagnostics_match_direct_codec_exactly(raw: bytes) -> None:
+    relative = PurePosixPath(f"decisions/{DECISION_ID}-choice.md")
+
+    streamed = ItemCodec().parse_stream(
+        BoundedReader(raw),
+        relative_path=relative,
+        headers_only=True,
+    )
+
+    assert streamed.diagnostic == _direct_diagnostic(raw, relative)
+
+
+def test_streaming_diagnostic_location_matches_across_a_chunk_boundary() -> None:
+    canonical = decision_bytes()
+    closing_end = canonical.index(b"+++\n", 4) + 4
+    header = canonical[:closing_end]
+    raw = header + b"x" * (64 * 1024 - len(header)) + b"\xff"
+    relative = PurePosixPath(f"decisions/{DECISION_ID}-choice.md")
+
+    streamed = ItemCodec().parse_stream(
+        BoundedReader(raw),
+        relative_path=relative,
+        headers_only=True,
+    )
+
+    assert streamed.diagnostic == _direct_diagnostic(raw, relative)
 
 
 def test_malformed_store_keeps_registry_and_item_diagnostics(local_store: Path) -> None:

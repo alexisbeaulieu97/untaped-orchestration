@@ -1,4 +1,3 @@
-import codecs
 import hashlib
 import re
 import tomllib
@@ -320,16 +319,6 @@ def _closing_delimiter_end(raw: bytearray, *, final: bool = False) -> int | None
     return None
 
 
-def _stream_utf8_error(path: str) -> Diagnostic:
-    return _error(
-        "ORC001",
-        path=path,
-        field="",
-        message="content is not valid UTF-8",
-        hint="Encode the complete item as UTF-8 without a byte-order mark.",
-    ).diagnostic
-
-
 def _body_limit_error(path: str) -> Diagnostic:
     return _error(
         "ORC001",
@@ -338,6 +327,58 @@ def _body_limit_error(path: str) -> Diagnostic:
         message="item Markdown body exceeds the 1 MiB limit",
         hint="Reduce the body to at most 1 MiB.",
     ).diagnostic
+
+
+class _StreamingUtf8Validator:
+    def __init__(self, *, path: str) -> None:
+        self._path = path
+        self._pending = b""
+        self._byte_offset = 0
+        self._line = 1
+        self._column = 1
+        self.diagnostic: Diagnostic | None = None
+
+    def consume(self, chunk: bytes) -> None:
+        if self.diagnostic is not None:
+            return
+        data = self._pending + chunk
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            valid = data[: error.start].decode("utf-8")
+            self._advance(valid)
+            if error.reason == "unexpected end of data" and error.end == len(data):
+                self._byte_offset += error.start
+                self._pending = data[error.start :]
+                return
+            self.diagnostic = self._diagnostic(self._byte_offset + error.start)
+            return
+        self._advance(text)
+        self._byte_offset += len(data)
+        self._pending = b""
+
+    def finish(self) -> None:
+        if self.diagnostic is None and self._pending:
+            self.diagnostic = self._diagnostic(self._byte_offset)
+
+    def _advance(self, text: str) -> None:
+        if "\n" not in text:
+            self._column += len(text)
+            return
+        self._line += text.count("\n")
+        self._column = len(text.rsplit("\n", maxsplit=1)[-1]) + 1
+
+    def _diagnostic(self, byte_offset: int) -> Diagnostic:
+        return _error(
+            "ORC001",
+            path=self._path,
+            field="",
+            line=self._line,
+            column=self._column,
+            byte_offset=byte_offset,
+            message="content is not valid UTF-8",
+            hint="Encode the complete item as UTF-8 without a byte-order mark.",
+        ).diagnostic
 
 
 class _ItemStreamParser:
@@ -352,10 +393,8 @@ class _ItemStreamParser:
         self._path = relative_path.as_posix()
         self._parse_header_document = parse_header
         self._digest = hashlib.sha256()
-        self._decoder: codecs.IncrementalDecoder | None = codecs.getincrementaldecoder("utf-8")(
-            "strict"
-        )
-        self._utf8_diagnostic: Diagnostic | None = None
+        self._utf8 = _StreamingUtf8Validator(path=self._path)
+        self._early_diagnostic: Diagnostic | None = None
         self._header_diagnostic: Diagnostic | None = None
         self._header = bytearray()
         self._body = None if headers_only else bytearray()
@@ -375,18 +414,19 @@ class _ItemStreamParser:
             self._consume_header(chunk)
 
     def _consume_utf8(self, chunk: bytes) -> None:
-        if self._decoder is None:
-            return
-        try:
-            self._decoder.decode(chunk, final=False)
-        except UnicodeDecodeError:
-            self._utf8_diagnostic = _stream_utf8_error(self._path)
-            self._decoder = None
+        self._utf8.consume(chunk)
 
     def _consume_header(self, chunk: bytes) -> None:
         available = ENVELOPE_LIMIT - len(self._header)
         prefix = chunk[:available]
         self._header.extend(prefix)
+        if len(self._header) >= 4 and not self._header.startswith(b"+++\n"):
+            try:
+                _split_item(bytes(self._header[:4]), relative_path=self._relative_path)
+            except CodecError as error:
+                self._early_diagnostic = error.diagnostic
+            self._header_overflow = True
+            return
         found = _closing_delimiter_end(self._header)
         if found is None:
             self._header_overflow = len(self._header) == ENVELOPE_LIMIT
@@ -413,12 +453,7 @@ class _ItemStreamParser:
             self._metadata = document.metadata
 
     def _finish_utf8(self) -> None:
-        if self._decoder is None:
-            return
-        try:
-            self._decoder.decode(b"", final=True)
-        except UnicodeDecodeError:
-            self._utf8_diagnostic = _stream_utf8_error(self._path)
+        self._utf8.finish()
 
     def _finish_header(self) -> None:
         if not self._header_overflow:
@@ -441,15 +476,17 @@ class _ItemStreamParser:
             ).diagnostic
 
     def _result_diagnostic(self) -> Diagnostic | None:
+        if self._early_diagnostic is not None:
+            return self._early_diagnostic
         if self._closing_end is None:
             return self._header_diagnostic
         if self._body_size > BODY_LIMIT:
             return _body_limit_error(self._path)
-        return self._utf8_diagnostic or self._header_diagnostic
+        return self._utf8.diagnostic or self._header_diagnostic
 
     def finish(self) -> StreamedItem:
         self._finish_utf8()
-        if self._closing_end is None:
+        if self._closing_end is None and self._early_diagnostic is None:
             self._finish_header()
         diagnostic = self._result_diagnostic()
         metadata = None if diagnostic is not None else self._metadata
