@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from untaped_orchestration.application.ports import LockManager, StoreReader
+from untaped_orchestration.application.ports import LockManager, StoreLockTimeout, StoreReader
 from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
@@ -16,6 +16,7 @@ from untaped_orchestration.application.results import (
 from untaped_orchestration.domain.diagnostics import (
     Diagnostic,
     DiagnosticCode,
+    DiagnosticSeverity,
     diagnostic_sort_key,
 )
 from untaped_orchestration.domain.ids import StoreId
@@ -35,6 +36,7 @@ class UnidentifiedStoreError(ValueError):
 class _Participant:
     expected_store_id: StoreId
     snapshot: StoreSnapshot
+    exposed: bool
 
 
 @dataclass(slots=True)
@@ -70,6 +72,7 @@ def _incomplete(
     *,
     reason: IncompletenessReason,
     code: DiagnosticCode,
+    severity: DiagnosticSeverity,
     path: str,
     field: str,
     message: str,
@@ -80,7 +83,7 @@ def _incomplete(
         reason=reason,
         diagnostic=Diagnostic(
             code=code,
-            severity="warning",
+            severity=severity,
             path=path,
             field=field,
             message=message,
@@ -139,7 +142,7 @@ class FederationService:
         if selected_id is None:
             raise UnidentifiedStoreError(location)
 
-        participant = _Participant(selected_id, selected)
+        participant = _Participant(selected_id, selected, exposed=True)
         key = _path_key(location.real_root)
         resolution = _Resolution(
             participants={key: participant},
@@ -166,13 +169,17 @@ class FederationService:
                     resolution,
                     headers_only=headers_only,
                 )
-        except TimeoutError as error:
+        except StoreLockTimeout as error:
             self._record_timeout(error, resolution)
 
         snapshots = tuple(
             participant.snapshot
             for participant in sorted(
-                resolution.participants.values(),
+                (
+                    participant
+                    for participant in resolution.participants.values()
+                    if participant.exposed
+                ),
                 key=lambda value: _location_sort_key(value.snapshot.location),
             )
         )
@@ -198,6 +205,7 @@ class FederationService:
                     participant.expected_store_id,
                     reason="invalid",
                     code="ORC005",
+                    severity="error",
                     path=_registry_path(snapshot),
                     field="registry",
                     message="registered store registry is missing or invalid",
@@ -211,6 +219,7 @@ class FederationService:
                     participant.expected_store_id,
                     reason="identity-mismatch",
                     code="ORC005",
+                    severity="error",
                     path=_registry_path(snapshot),
                     field="store_id",
                     message="registry store identity does not match the expected store ID",
@@ -226,6 +235,7 @@ class FederationService:
                     participant.expected_store_id,
                     reason="invalid",
                     code="ORC005",
+                    severity="error",
                     path=(snapshot.location.root / "store.toml").as_posix(),
                     field="store",
                     message="registered child store anchor is invalid",
@@ -254,6 +264,7 @@ class FederationService:
                         child.id,
                         reason="cycle" if is_cycle else "duplicate",
                         code="ORC005",
+                        severity="error",
                         path=_registry_path(parent.snapshot),
                         field=field,
                         message=(
@@ -268,16 +279,32 @@ class FederationService:
             candidate = parent.snapshot.location.root.joinpath(*PurePosixPath(child.path).parts)
             try:
                 location = self._reader.discover(parent.snapshot.location.root, override=candidate)
-            except (OSError, ValueError) as error:
+            except OSError as error:
                 resolution.entries.append(
                     _incomplete(
                         child.id,
                         reason="missing",
                         code="ORC005",
+                        severity="warning",
                         path=_registry_path(parent.snapshot),
                         field=field,
                         message=f"registered child store is missing or inaccessible: {error}",
                         hint="Restore the child store at its registered path or remove the entry.",
+                    )
+                )
+                resolution.declared_ids.add(child.id.root)
+                continue
+            except ValueError as error:
+                resolution.entries.append(
+                    _incomplete(
+                        child.id,
+                        reason="invalid",
+                        code="ORC005",
+                        severity="error",
+                        path=_registry_path(parent.snapshot),
+                        field=field,
+                        message=f"registered child store path is invalid: {error}",
+                        hint="Repair the child registry path before retrying.",
                     )
                 )
                 resolution.declared_ids.add(child.id.root)
@@ -330,6 +357,7 @@ class FederationService:
                 expected_store_id,
                 reason=reason,
                 code="ORC005",
+                severity="error",
                 path=_registry_path(parent.snapshot),
                 field=f"children.{expected_store_id.root}",
                 message=message,
@@ -351,12 +379,27 @@ class FederationService:
     ) -> None:
         try:
             snapshot = self._reader.load_local(location, headers_only=headers_only)
-        except (OSError, ValueError) as error:
+        except OSError as error:
+            resolution.entries.append(
+                _incomplete(
+                    expected_store_id,
+                    reason="missing",
+                    code="ORC005",
+                    severity="warning",
+                    path=_registry_path(parent.snapshot),
+                    field=f"children.{expected_store_id.root}",
+                    message=f"registered child store became inaccessible while loading: {error}",
+                    hint="Restore the child store and retry federation resolution.",
+                )
+            )
+            return
+        except ValueError as error:
             resolution.entries.append(
                 _incomplete(
                     expected_store_id,
                     reason="invalid",
                     code="ORC005",
+                    severity="error",
                     path=_registry_path(parent.snapshot),
                     field=f"children.{expected_store_id.root}",
                     message=f"registered child store could not be loaded: {error}",
@@ -365,7 +408,7 @@ class FederationService:
             )
             return
 
-        participant = _Participant(expected_store_id, snapshot)
+        participant = _Participant(expected_store_id, snapshot, exposed=False)
         key = _path_key(location.real_root)
         resolution.participants[key] = participant
         if snapshot.store is not None and snapshot.store.id != expected_store_id:
@@ -374,6 +417,7 @@ class FederationService:
                     expected_store_id,
                     reason="identity-mismatch",
                     code="ORC005",
+                    severity="error",
                     path=(location.root / "store.toml").as_posix(),
                     field="id",
                     message=(
@@ -384,6 +428,7 @@ class FederationService:
             )
             return
         if self._registry_is_traversable(participant, resolution, selected=False):
+            participant.exposed = parent.exposed and snapshot.store is not None
             self._resolve_children(
                 participant,
                 resolution,
@@ -432,21 +477,21 @@ class FederationService:
                     f"store anchor or registry changed during federation resolution: {error}",
                 )
                 continue
-            participant.snapshot = current
             if self._anchors_changed(optimistic, current):
                 self._record_change(
                     participant,
                     resolution,
                     "store anchor or registry changed during federation resolution",
                 )
+                continue
+            participant.snapshot = current
 
     @staticmethod
     def _anchors_changed(optimistic: StoreSnapshot, current: StoreSnapshot) -> bool:
-        if optimistic.store_config_revision is None or current.store_config_revision is None:
-            store_changed = optimistic.store != current.store
-        else:
-            store_changed = optimistic.store_config_revision != current.store_config_revision
-        return store_changed or optimistic.registry_revision != current.registry_revision
+        return (
+            optimistic.store_config_revision != current.store_config_revision
+            or optimistic.registry_revision != current.registry_revision
+        )
 
     @staticmethod
     def _record_change(
@@ -459,6 +504,7 @@ class FederationService:
                 participant.expected_store_id,
                 reason="changed",
                 code="ORC007",
+                severity="error",
                 path=_registry_path(participant.snapshot),
                 field="revision",
                 message=message,
@@ -467,11 +513,8 @@ class FederationService:
         )
 
     @staticmethod
-    def _record_timeout(error: TimeoutError, resolution: _Resolution) -> None:
-        location = getattr(error, "location", None)
-        if not isinstance(location, StoreLocation):
-            raise error
-        participant = resolution.participants.get(_path_key(location.real_root))
+    def _record_timeout(error: StoreLockTimeout, resolution: _Resolution) -> None:
+        participant = resolution.participants.get(_path_key(error.location.real_root))
         if participant is None:
             raise error
         resolution.entries.append(
@@ -479,7 +522,8 @@ class FederationService:
                 participant.expected_store_id,
                 reason="timeout",
                 code="ORC007",
-                path=(location.root / ".lock").as_posix(),
+                severity="error",
+                path=(error.location.root / ".lock").as_posix(),
                 field="lock",
                 message="timed out acquiring the registered store lock",
                 hint="Retry after the conflicting store operation completes.",

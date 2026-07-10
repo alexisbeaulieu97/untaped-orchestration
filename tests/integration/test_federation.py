@@ -8,7 +8,15 @@ from pathlib import Path
 import pytest
 from filelock import FileLock
 
-from tests.builders import CHILD_STORE_ID, STORE_ID, store_bytes, store_root, write_store
+from tests.builders import (
+    CHILD_STORE_ID,
+    DECISION_ID,
+    STORE_ID,
+    decision_bytes,
+    store_bytes,
+    store_root,
+    write_store,
+)
 from untaped_orchestration.application.federation import FederationService
 from untaped_orchestration.application.results import StoreLocation
 from untaped_orchestration.infrastructure.filesystem import location_from_root
@@ -107,6 +115,9 @@ def test_missing_invalid_and_wrong_id_siblings_all_name_their_expected_store_ids
     invalid = write_store(tmp_path / "invalid", store_id=INVALID_STORE_ID)
     wrong = write_store(tmp_path / "wrong", store_id=WRONG_STORE_ID)
     invalid.joinpath("store.toml").write_bytes(b"schema =")
+    leaked_record = wrong / "decisions" / f"{DECISION_ID}-must-not-leak.md"
+    leaked_record.parent.mkdir()
+    leaked_record.write_bytes(decision_bytes())
     _write_registry(
         selected,
         STORE_ID,
@@ -129,8 +140,18 @@ def test_missing_invalid_and_wrong_id_siblings_all_name_their_expected_store_ids
     }
     assert all(entry.expected_store_id.root for entry in result.completeness.entries)
     assert {entry.diagnostic.code for entry in result.completeness.entries} == {"ORC005"}
-    assert len(result.stores) == 3
-    assert sum(snapshot.store is None for snapshot in result.stores) == 1
+    assert len(result.stores) == 1
+    assert result.stores == (result.selected,)
+    assert all(snapshot.location.real_root != wrong.resolve() for snapshot in result.stores)
+    by_expected_id = {entry.expected_store_id.root: entry for entry in result.completeness.entries}
+    assert by_expected_id[MISSING_STORE_ID].diagnostic.severity == "warning"
+    assert by_expected_id[INVALID_STORE_ID].diagnostic.severity == "error"
+    assert by_expected_id[SECOND_CHILD_ID].diagnostic.severity == "error"
+    assert [entry.diagnostic.severity for entry in result.completeness.entries] == [
+        "error",
+        "error",
+        "warning",
+    ]
 
 
 @pytest.mark.integration
@@ -166,6 +187,7 @@ def test_self_ancestor_and_normalized_path_cycles_are_incomplete_without_duplica
     assert any(
         message_fragment in entry.diagnostic.message for entry in result.completeness.entries
     )
+    assert all(entry.diagnostic.severity == "error" for entry in result.completeness.entries)
 
 
 @pytest.mark.integration
@@ -226,6 +248,7 @@ def test_duplicate_ids_and_normalized_paths_across_sibling_subtrees_are_deduped(
     messages = [entry.diagnostic.message for entry in result.completeness.entries]
     assert any("duplicate store ID" in message for message in messages)
     assert any("duplicate normalized store path" in message for message in messages)
+    assert all(entry.diagnostic.severity == "error" for entry in result.completeness.entries)
 
 
 @pytest.mark.integration
@@ -267,6 +290,7 @@ def test_exact_anchor_byte_change_under_lock_is_a_conflict_even_when_typed_confi
     assert result.completeness.missing_store_ids == (STORE_ID,)
     assert result.completeness.entries[0].reason == "changed"
     assert result.completeness.entries[0].diagnostic.code == "ORC007"
+    assert result.completeness.entries[0].diagnostic.severity == "error"
 
 
 @pytest.mark.integration
@@ -295,3 +319,41 @@ def test_real_child_lock_timeout_names_only_the_registry_expected_child_id(
     assert result.completeness.missing_store_ids == (CHILD_STORE_ID,)
     assert result.completeness.entries[0].reason == "timeout"
     assert result.completeness.entries[0].diagnostic.code == "ORC007"
+
+
+@pytest.mark.integration
+def test_wrong_id_duplicate_of_valid_subtree_id_cannot_leak_or_poison_valid_store(
+    tmp_path: Path,
+) -> None:
+    selected = write_store(tmp_path / "hub", store_id=STORE_ID)
+    valid = write_store(tmp_path / "valid", store_id=CHILD_STORE_ID)
+    wrong = write_store(tmp_path / "wrong", store_id=CHILD_STORE_ID)
+    leaked = wrong / "decisions" / f"{DECISION_ID}-wrong-duplicate.md"
+    leaked.parent.mkdir()
+    leaked.write_bytes(decision_bytes())
+    _write_registry(
+        selected,
+        STORE_ID,
+        (CHILD_STORE_ID, _relative(selected, valid)),
+        (SECOND_CHILD_ID, _relative(selected, wrong)),
+    )
+
+    result = _service().load(
+        location_from_root(selected),
+        local=False,
+        headers_only=False,
+    )
+
+    assert not result.completeness.complete
+    assert [snapshot.store.id.root for snapshot in result.stores if snapshot.store is not None] == [
+        STORE_ID,
+        CHILD_STORE_ID,
+    ]
+    assert all(snapshot.location.real_root != wrong.resolve() for snapshot in result.stores)
+    valid_snapshot = next(
+        snapshot
+        for snapshot in result.stores
+        if snapshot.store is not None and snapshot.store.id.root == CHILD_STORE_ID
+    )
+    assert valid_snapshot.location.real_root == valid.resolve()
+    assert valid_snapshot.records == ()

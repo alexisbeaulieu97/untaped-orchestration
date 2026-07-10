@@ -23,6 +23,9 @@ from untaped_orchestration.application.results import (
     StoreLocation as StoreLocation,
 )
 from untaped_orchestration.application.results import (
+    StoreLockTimeout as StoreLockTimeout,
+)
+from untaped_orchestration.application.results import (
     StoreSnapshot as StoreSnapshot,
 )
 
@@ -36,6 +39,7 @@ __all__ = [
     "RawRecord",
     "RawReference",
     "StoreLocation",
+    "StoreLockTimeout",
     "StoreReader",
     "StoreSnapshot",
     "StoreWriter",

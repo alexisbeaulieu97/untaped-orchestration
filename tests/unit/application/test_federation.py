@@ -3,13 +3,16 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import MISSING, fields, replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from tests.builders import CHILD_STORE_ID, STORE_ID
 from untaped_orchestration.application.federation import FederationService, UnidentifiedStoreError
-from untaped_orchestration.application.results import StoreLocation, StoreSnapshot
+from untaped_orchestration.application.ports import StoreLockTimeout
+from untaped_orchestration.application.results import LoadedRecord, StoreLocation, StoreSnapshot
 from untaped_orchestration.domain.models import Registry, Revision, StoreConfig
 from untaped_orchestration.infrastructure.codec import RegistryCodec, StoreConfigCodec
 
@@ -133,9 +136,7 @@ class RecordingLocks:
         ordered = tuple(locations)
         self.calls.append((ordered, timeout))
         if self.timeout_location is not None:
-            error = TimeoutError("busy")
-            error.location = self.timeout_location  # type: ignore[attr-defined]
-            raise error
+            raise StoreLockTimeout(self.timeout_location)
         if self.on_enter is not None:
             self.on_enter()
         yield
@@ -227,6 +228,7 @@ def test_casefold_path_alias_is_incomplete_and_never_added_to_the_lock_set() -> 
     assert result.completeness.missing_store_ids == (SECOND_CHILD_ID,)
     assert result.completeness.entries[0].expected_store_id.root == SECOND_CHILD_ID
     assert "case-fold" in result.completeness.entries[0].diagnostic.message
+    assert result.completeness.entries[0].diagnostic.severity == "error"
     assert [location.real_root for location in locks.calls[0][0]] == [upper, root]
 
 
@@ -247,6 +249,7 @@ def test_timeout_uses_expected_id_for_the_affected_store_and_returns_partial_dat
     assert not result.completeness.complete
     assert result.completeness.missing_store_ids == (CHILD_STORE_ID,)
     assert result.completeness.entries[0].diagnostic.code == "ORC007"
+    assert result.completeness.entries[0].diagnostic.severity == "error"
     assert result.stores == (child_snapshot, selected)
     assert locks.calls[0][1] == 0.25
 
@@ -275,6 +278,7 @@ def test_changed_anchor_or_registry_during_lock_acquisition_is_never_accepted_co
     assert not result.completeness.complete
     assert result.completeness.missing_store_ids == (STORE_ID,)
     assert result.completeness.entries[0].diagnostic.code == "ORC007"
+    assert result.completeness.entries[0].diagnostic.severity == "error"
     assert "changed" in result.completeness.entries[0].diagnostic.message
 
 
@@ -300,6 +304,40 @@ def test_symlink_retarget_between_resolution_and_locked_reread_is_incomplete() -
     assert not result.completeness.complete
     assert result.completeness.missing_store_ids == (STORE_ID,)
     assert "path changed" in result.completeness.entries[0].diagnostic.message
+    assert result.selected == selected
+    assert result.stores == (selected,)
+
+
+def test_child_symlink_retarget_retains_only_the_optimistically_resolved_edge_and_records() -> None:
+    root = Path("/work/root")
+    child_link = Path("/work/child-link")
+    first_real = Path("/real/first-child")
+    second_real = Path("/real/second-child")
+    record = cast(LoadedRecord, object())
+    selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child-link"))
+    child = replace(
+        _snapshot(child_link, CHILD_STORE_ID, real_root=first_real),
+        records=(record,),
+    )
+    reader = ScriptedReader((selected, child))
+    locks = RecordingLocks(
+        on_enter=lambda: reader.set_discovery(
+            child_link,
+            StoreLocation(root=child_link, real_root=second_real),
+        )
+    )
+
+    result = FederationService(reader, locks).load(
+        selected.location,
+        local=False,
+        headers_only=True,
+    )
+
+    assert not result.completeness.complete
+    assert result.completeness.missing_store_ids == (CHILD_STORE_ID,)
+    assert result.selected.registry == selected.registry
+    assert result.stores == (child, selected)
+    assert result.stores[0].records == (record,)
 
 
 def test_selected_store_without_recoverable_anchor_or_registry_identity_fails_explicitly() -> None:
@@ -325,3 +363,131 @@ def test_selected_store_without_recoverable_anchor_or_registry_identity_fails_ex
         )
 
     assert captured.value.location == unidentified.location
+
+
+@pytest.mark.parametrize("change", ["add-child", "remove-child"])
+def test_changed_registry_never_exposes_unresolved_under_lock_graph_or_records(
+    change: str,
+) -> None:
+    root = Path("/work/root")
+    child = Path("/work/child")
+    unresolved = cast(LoadedRecord, object())
+    if change == "add-child":
+        optimistic = _snapshot(root, STORE_ID)
+        changed = replace(
+            _snapshot(
+                root,
+                STORE_ID,
+                (CHILD_STORE_ID, "../child"),
+                registry_revision_seed="d",
+            ),
+            records=(unresolved,),
+        )
+        snapshots = (optimistic, _snapshot(child, CHILD_STORE_ID))
+        expected_stores = (optimistic,)
+    else:
+        optimistic = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
+        child_snapshot = _snapshot(child, CHILD_STORE_ID)
+        changed = replace(
+            _snapshot(root, STORE_ID, registry_revision_seed="d"),
+            records=(unresolved,),
+        )
+        snapshots = (optimistic, child_snapshot)
+        expected_stores = (child_snapshot, optimistic)
+    reader = ScriptedReader(snapshots)
+    locks = RecordingLocks(on_enter=lambda: reader.set_snapshot(changed))
+
+    result = FederationService(reader, locks).load(
+        optimistic.location,
+        local=False,
+        headers_only=True,
+    )
+
+    assert not result.completeness.complete
+    assert result.selected == optimistic
+    assert result.selected.registry == optimistic.registry
+    assert result.selected.records == ()
+    assert result.stores == expected_stores
+
+
+def test_store_config_revision_is_a_required_snapshot_invariant() -> None:
+    revision_field = next(
+        field for field in fields(StoreSnapshot) if field.name == "store_config_revision"
+    )
+
+    assert revision_field.default is MISSING
+
+
+@pytest.mark.parametrize("registry_state", ["missing", "wrong-id"])
+def test_invalid_selected_registry_is_error_severity_in_recursive_mode(
+    registry_state: str,
+) -> None:
+    root = Path("/work/root")
+    selected = _snapshot(root, STORE_ID)
+    registry = None if registry_state == "missing" else _registry(CHILD_STORE_ID)
+    selected = replace(selected, registry=registry)
+
+    result = FederationService(ScriptedReader((selected,)), RecordingLocks()).load(
+        selected.location,
+        local=False,
+        headers_only=True,
+    )
+
+    assert not result.completeness.complete
+    assert result.completeness.entries[0].diagnostic.severity == "error"
+
+
+def test_generic_timeout_with_a_location_shape_is_not_mistaken_for_port_timeout() -> None:
+    root = Path("/work/root")
+    selected = _snapshot(root, STORE_ID)
+    reader = ScriptedReader((selected,))
+
+    class ShapedTimeout(TimeoutError):
+        def __init__(self, location: StoreLocation) -> None:
+            self.location = location
+            super().__init__("not the application lock timeout")
+
+    class ShapedTimeoutLocks:
+        @contextmanager
+        def acquire(
+            self,
+            locations: Sequence[StoreLocation],
+            *,
+            timeout: float,
+        ) -> Iterator[None]:
+            del timeout
+            raise ShapedTimeout(locations[0])
+            yield
+
+    with pytest.raises(ShapedTimeout):
+        FederationService(reader, ShapedTimeoutLocks()).load(
+            selected.location,
+            local=False,
+            headers_only=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("discovery_error", "expected_severity"),
+    [
+        (FileNotFoundError("unavailable"), "warning"),
+        (ValueError("invalid registered path"), "error"),
+    ],
+)
+def test_child_discovery_severity_distinguishes_availability_from_invalidity(
+    discovery_error: Exception,
+    expected_severity: str,
+) -> None:
+    root = Path("/work/root")
+    candidate = Path("/work/child")
+    selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
+    reader = ScriptedReader((selected,))
+    reader.set_discovery(candidate, discovery_error)
+
+    result = FederationService(reader, RecordingLocks()).load(
+        selected.location,
+        local=False,
+        headers_only=True,
+    )
+
+    assert result.completeness.entries[0].diagnostic.severity == expected_severity

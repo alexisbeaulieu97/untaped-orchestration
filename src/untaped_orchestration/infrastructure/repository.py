@@ -22,6 +22,7 @@ from untaped_orchestration.infrastructure.codec import (
 )
 from untaped_orchestration.infrastructure.filesystem import (
     AtomicFilesystem,
+    StoreNotFoundError,
     canonical_input_paths,
     discover_location,
     file_revision,
@@ -108,6 +109,9 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
                     diagnostics.append(error.diagnostic)
                 continue
             continue
+
+        if store_config_revision is None:
+            raise StoreNotFoundError(f"no regular store.toml anchor at store root: {location.root}")
 
         if store is not None and registry is not None and store.id != registry.store_id:
             diagnostics.append(

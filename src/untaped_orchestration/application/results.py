@@ -18,6 +18,12 @@ class StoreLocation:
     real_root: Path
 
 
+class StoreLockTimeout(TimeoutError):
+    def __init__(self, location: StoreLocation) -> None:
+        self.location = location
+        super().__init__(f"timed out acquiring orchestration store lock: {location.real_root}")
+
+
 @dataclass(frozen=True, slots=True)
 class RawReference:
     path: PurePosixPath
@@ -51,7 +57,7 @@ class StoreSnapshot:
     raw_index: tuple[RawReference, ...]
     store_revision: Revision
     registry_revision: Revision | None
-    store_config_revision: Revision | None = None
+    store_config_revision: Revision
 
 
 type IncompletenessReason = Literal[

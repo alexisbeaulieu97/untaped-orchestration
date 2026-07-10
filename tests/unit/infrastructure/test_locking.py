@@ -7,9 +7,14 @@ import pytest
 from filelock import FileLock
 
 from tests.builders import write_store
+from untaped_orchestration.application.ports import StoreLockTimeout as ApplicationStoreLockTimeout
 from untaped_orchestration.application.results import StoreLocation
 from untaped_orchestration.infrastructure.filesystem import PathSafetyError, location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager, StoreLockTimeout
+
+
+def test_lock_timeout_is_the_application_owned_port_exception() -> None:
+    assert StoreLockTimeout is ApplicationStoreLockTimeout
 
 
 def test_acquires_multiple_store_locks_in_deterministic_real_path_order(tmp_path: Path) -> None:

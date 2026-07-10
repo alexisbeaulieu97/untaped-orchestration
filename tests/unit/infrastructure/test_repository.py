@@ -15,6 +15,7 @@ from untaped_orchestration.infrastructure.codec import CodecError, ItemCodec
 from untaped_orchestration.infrastructure.filesystem import (
     AtomicFilesystem,
     PathSafetyError,
+    StoreNotFoundError,
     file_revision,
     location_from_root,
     store_revision,
@@ -300,6 +301,14 @@ def test_malformed_store_keeps_registry_and_item_diagnostics(local_store: Path) 
         f"decisions/{DECISION_ID}-broken.md",
         "store.toml",
     ]
+
+
+def test_load_local_refuses_a_location_whose_exact_anchor_disappeared(local_store: Path) -> None:
+    location = location_from_root(local_store)
+    local_store.joinpath("store.toml").unlink()
+
+    with pytest.raises(StoreNotFoundError):
+        FilesystemStoreRepository().load_local(location, headers_only=True)
 
 
 def test_registry_revision_hashes_exact_bytes_and_store_revision_excludes_views_and_noise(

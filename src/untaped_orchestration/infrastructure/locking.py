@@ -6,17 +6,11 @@ from contextlib import ExitStack, contextmanager
 
 from filelock import FileLock, Timeout
 
-from untaped_orchestration.application.ports import LockManager, StoreLocation
+from untaped_orchestration.application.ports import LockManager, StoreLocation, StoreLockTimeout
 from untaped_orchestration.infrastructure.filesystem import (
     PathSafetyError,
     normalized_real_path_key,
 )
-
-
-class StoreLockTimeout(TimeoutError):
-    def __init__(self, location: StoreLocation) -> None:
-        self.location = location
-        super().__init__(f"timed out acquiring orchestration store lock: {location.real_root}")
 
 
 class FileLockManager(LockManager):
