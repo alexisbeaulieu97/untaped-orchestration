@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
-from untaped_orchestration.domain.ids import TaskId
+from untaped_orchestration.domain.ids import StoreId, TaskId
 from untaped_orchestration.domain.models import ActiveTask, TaskPriority, TaskStage
 
 MAX_RANK = 2**63 - 1
@@ -22,6 +22,12 @@ class RankReplacement:
 class PlacementPlan:
     rebalance: tuple[RankReplacement, ...]
     primary: ActiveTask
+
+
+@dataclass(frozen=True, slots=True)
+class TaskOrderItem:
+    store_id: StoreId
+    task: ActiveTask
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,34 +165,35 @@ _PRIORITY_ORDER = {
 }
 
 
-def sort_tasks(tasks: Sequence[ActiveTask]) -> tuple[ActiveTask, ...]:
-    by_id = {value.id: value for value in tasks}
+def sort_tasks(tasks: Sequence[TaskOrderItem]) -> tuple[TaskOrderItem, ...]:
+    by_id = {(value.store_id, value.task.id): value for value in tasks}
     if len(by_id) != len(tasks):
-        raise ValueError("task identities must be unique")
+        raise ValueError("store-qualified task identities must be unique")
 
-    def ancestor_ranks(task: ActiveTask) -> tuple[int, ...]:
+    def ancestor_ranks(item: TaskOrderItem) -> tuple[int, ...]:
         result: list[int] = []
-        seen = {task.id}
-        parent = task.parent
+        seen = {item.task.id}
+        parent = item.task.parent
         while parent is not None:
             if parent in seen:
                 raise ValueError("cannot globally order a containment cycle")
             seen.add(parent)
-            parent_task = by_id.get(parent)
-            if parent_task is None:
+            parent_item = by_id.get((item.store_id, parent))
+            if parent_item is None:
                 raise ValueError("cannot globally order a task with a missing parent")
-            result.append(parent_task.rank)
-            parent = parent_task.parent
+            result.append(parent_item.task.rank)
+            parent = parent_item.task.parent
         return tuple(reversed(result))
 
     return tuple(
         sorted(
             tasks,
             key=lambda value: (
-                _PRIORITY_ORDER[value.priority],
+                _PRIORITY_ORDER[value.task.priority],
                 ancestor_ranks(value),
-                value.rank,
-                value.id.root,
+                value.task.rank,
+                value.task.id.root,
+                value.store_id.root,
             ),
         )
     )

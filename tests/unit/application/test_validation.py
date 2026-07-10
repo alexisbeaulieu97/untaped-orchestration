@@ -17,6 +17,7 @@ from untaped_orchestration.domain.diagnostics import Diagnostic, sort_diagnostic
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import (
     ActiveTask,
+    ArchivedTask,
     BriefConfig,
     CurationConfig,
     Decision,
@@ -25,6 +26,7 @@ from untaped_orchestration.domain.models import (
     Revision,
     StoreCapabilities,
     StoreConfig,
+    TaskOutcome,
     TaskPriority,
     TaskStage,
     Visibility,
@@ -88,6 +90,27 @@ def task(number: int, *, links: tuple[Link, ...] = ()) -> ActiveTask:
     )
 
 
+def archived(number: int, outcome: TaskOutcome) -> ArchivedTask:
+    return ArchivedTask(
+        schema="untaped.orchestration.task/v1",
+        id=tid(number),
+        kind="task",
+        title=f"Task {number}",
+        created_at=NOW,
+        tags=(),
+        links=(),
+        evidence=(),
+        priority=TaskPriority.NORMAL,
+        rank=number * 1000,
+        started_at=NOW if outcome is TaskOutcome.CANCELLED else None,
+        waiting_on=(),
+        closed_from=TaskStage.PLANNED,
+        outcome=outcome,
+        closed_at=NOW,
+        close_note="closed",
+    )
+
+
 def decision(
     number: int,
     *,
@@ -112,7 +135,7 @@ def relation(relation: LinkRelation, target: TaskId | DecisionId, store: StoreId
     return Link(relation=relation, target_store_id=store, target=target)
 
 
-def loaded(path: str, metadata: ActiveTask | Decision) -> LoadedRecord:
+def loaded(path: str, metadata: ActiveTask | ArchivedTask | Decision) -> LoadedRecord:
     return LoadedRecord(PurePosixPath(path), REVISION, metadata, None)
 
 
@@ -206,6 +229,43 @@ def test_missing_target_inside_loaded_store_is_always_invalid() -> None:
     assert any("target item" in value.message for value in diagnostics)
 
 
+@pytest.mark.parametrize(
+    ("relation_kind", "target", "target_store"),
+    [
+        (LinkRelation.DEPENDS_ON, tid(2), STORE),
+        (LinkRelation.GOVERNED_BY, did(2), OTHER),
+        (LinkRelation.FOLLOW_UP_TO, tid(2), OTHER),
+    ],
+)
+def test_loaded_target_store_wins_over_overlapping_incompleteness_metadata(
+    relation_kind: LinkRelation,
+    target: TaskId | DecisionId,
+    target_store: StoreId,
+) -> None:
+    source = task(1, links=(relation(relation_kind, target, target_store),))
+    selected = store_snapshot(STORE, (loaded("tasks/source.md", source),))
+    other = store_snapshot(OTHER, ())
+    missing = IncompleteStore(
+        expected_store_id=target_store,
+        reason="missing",
+        diagnostic=Diagnostic(
+            code="ORC005",
+            severity="warning",
+            path="registry.toml",
+            field="children",
+            message="stale missing metadata",
+            hint="reread it",
+        ),
+    )
+
+    diagnostics = validate_snapshot(
+        snapshot(selected, other, completeness=Completeness((missing,))),
+        require_children=False,
+    )
+
+    assert any("target item" in value.message for value in diagnostics)
+
+
 def test_public_or_decision_only_store_rejects_active_tasks() -> None:
     value = loaded("tasks/source.md", task(1))
     public_config = config(STORE, visibility=Visibility.PUBLIC, active_tasks=False)
@@ -221,8 +281,27 @@ def test_public_or_decision_only_store_rejects_active_tasks() -> None:
 
     assert any(value.code == "ORC009" and "public" in value.message for value in public_diagnostics)
     assert any(
-        value.code == "ORC009" and "active tasks" in value.message for value in decision_diagnostics
+        value.code == "ORC009" and "task records" in value.message for value in decision_diagnostics
     )
+
+
+@pytest.mark.parametrize("outcome", list(TaskOutcome))
+@pytest.mark.parametrize("policy", ["public", "decision-only"])
+def test_public_or_decision_only_store_rejects_every_archived_task_outcome(
+    outcome: TaskOutcome,
+    policy: str,
+) -> None:
+    value = loaded("archive/tasks/source.md", archived(1, outcome))
+    store_config = (
+        config(STORE, visibility=Visibility.PUBLIC, active_tasks=False)
+        if policy == "public"
+        else config(STORE, active_tasks=False)
+    )
+    selected = store_snapshot(STORE, (value,), store_config=store_config)
+
+    diagnostics = validate_snapshot(snapshot(selected), require_children=False)
+
+    assert any(value.code == "ORC009" and "task records" in value.message for value in diagnostics)
 
 
 def test_pins_must_resolve_to_active_local_decisions() -> None:
@@ -256,6 +335,33 @@ def test_active_local_pin_is_not_confused_by_same_decision_id_in_another_store()
     diagnostics = validate_snapshot(snapshot(selected, other), require_children=False)
 
     assert not any(value.field.startswith("brief.pinned_decisions") for value in diagnostics)
+
+
+def test_valid_cross_store_duplicate_task_and_decision_ids_remain_distinct_and_deterministic() -> (
+    None
+):
+    selected = store_snapshot(
+        STORE,
+        (
+            loaded("tasks/local.md", task(1)),
+            loaded("decisions/local.md", decision(1)),
+        ),
+    )
+    other = store_snapshot(
+        OTHER,
+        (
+            loaded("archive/tasks/remote.md", archived(1, TaskOutcome.DELIVERED)),
+            loaded("decisions/remote.md", decision(1)),
+        ),
+    )
+    forward = FederatedSnapshot(selected, (selected, other), COMPLETE)
+    reversed_stores = FederatedSnapshot(selected, (other, selected), COMPLETE)
+
+    first = validate_snapshot(forward, require_children=False)
+    second = validate_snapshot(reversed_stores, require_children=False)
+
+    assert first == second
+    assert not any(value.code == "ORC003" for value in first)
 
 
 @pytest.mark.parametrize("inactive_kind", ["retired", "superseded"])

@@ -16,6 +16,20 @@ from untaped_orchestration.domain.models import (
 
 type TaskValue = ActiveTask | ArchivedTask
 type ItemKey = tuple[str, str]
+type TaskIndex = dict[ItemKey, tuple[TaskNode, ...]]
+type DecisionIndex = dict[ItemKey, tuple[DecisionNode, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRef:
+    store_id: StoreId
+    task_id: TaskId
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionRef:
+    store_id: StoreId
+    decision_id: DecisionId
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,11 +80,11 @@ class ReadinessBlockerKind(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ReadinessBlocker:
     kind: ReadinessBlockerKind
-    related_task_id: TaskId | None = None
+    related_task: TaskRef | None = None
     waiting_party: Slug | None = None
 
     def __post_init__(self) -> None:
-        has_task = self.related_task_id is not None
+        has_task = self.related_task is not None
         has_party = self.waiting_party is not None
         if self.kind is ReadinessBlockerKind.WAITING_PARTY:
             if not has_party or has_task:
@@ -84,7 +98,7 @@ class ReadinessBlocker:
 
 @dataclass(frozen=True, slots=True)
 class Readiness:
-    task_id: TaskId
+    task: TaskRef
     blockers: tuple[ReadinessBlocker, ...]
 
     @property
@@ -121,47 +135,68 @@ def _diagnostic(
     )
 
 
-def _task_index(graph: GraphState) -> dict[ItemKey, TaskNode]:
-    return {_task_key(node): node for node in graph.tasks}
+def _task_index(graph: GraphState) -> TaskIndex:
+    grouped: dict[ItemKey, list[TaskNode]] = {}
+    for node in graph.tasks:
+        grouped.setdefault(_task_key(node), []).append(node)
+    return {key: tuple(sorted(nodes, key=lambda node: node.path)) for key, nodes in grouped.items()}
 
 
-def _decision_index(graph: GraphState) -> dict[ItemKey, DecisionNode]:
-    return {_decision_key(node): node for node in graph.decisions}
+def _decision_index(graph: GraphState) -> DecisionIndex:
+    grouped: dict[ItemKey, list[DecisionNode]] = {}
+    for node in graph.decisions:
+        grouped.setdefault(_decision_key(node), []).append(node)
+    return {key: tuple(sorted(nodes, key=lambda node: node.path)) for key, nodes in grouped.items()}
 
 
 def _incoming_supersession(
     graph: GraphState,
 ) -> tuple[dict[ItemKey, list[TaskNode]], dict[ItemKey, list[DecisionNode]]]:
+    tasks = _task_index(graph)
+    decisions = _decision_index(graph)
     task_incoming: dict[ItemKey, list[TaskNode]] = {}
     decision_incoming: dict[ItemKey, list[DecisionNode]] = {}
     for task_node in graph.tasks:
+        if len(tasks[_task_key(task_node)]) != 1:
+            continue
         for value in task_node.task.links:
-            if value.relation is LinkRelation.SUPERSEDES and isinstance(value.target, TaskId):
-                task_incoming.setdefault(
-                    (value.target_store_id.root, value.target.root), []
-                ).append(task_node)
+            target_key = (value.target_store_id.root, value.target.root)
+            if (
+                value.relation is LinkRelation.SUPERSEDES
+                and isinstance(value.target, TaskId)
+                and value.target_store_id == task_node.store_id
+                and len(tasks.get(target_key, ())) == 1
+            ):
+                task_incoming.setdefault(target_key, []).append(task_node)
     for decision_node in graph.decisions:
+        if len(decisions[_decision_key(decision_node)]) != 1:
+            continue
         for value in decision_node.decision.links:
-            if value.relation is LinkRelation.SUPERSEDES:
-                decision_incoming.setdefault(
-                    (value.target_store_id.root, value.target.root), []
-                ).append(decision_node)
+            target_key = (value.target_store_id.root, value.target.root)
+            if (
+                value.relation is LinkRelation.SUPERSEDES
+                and value.target_store_id == decision_node.store_id
+                and len(decisions.get(target_key, ())) == 1
+            ):
+                decision_incoming.setdefault(target_key, []).append(decision_node)
+    for task_successors in task_incoming.values():
+        task_successors.sort(key=lambda node: node.path)
+    for decision_successors in decision_incoming.values():
+        decision_successors.sort(key=lambda node: node.path)
     return task_incoming, decision_incoming
 
 
-def decision_state(
-    decision_id: DecisionId,
-    graph: GraphState,
-    *,
-    store_id: StoreId | None = None,
-) -> DecisionState:
+def decision_state(decision: DecisionRef, graph: GraphState) -> DecisionState:
     matches = [
         node
         for node in graph.decisions
-        if node.decision.id == decision_id and (store_id is None or node.store_id == store_id)
+        if node.decision.id == decision.decision_id and node.store_id == decision.store_id
     ]
     if len(matches) != 1:
-        raise KeyError(f"decision does not resolve uniquely: {decision_id.root}")
+        raise ValueError(
+            "decision does not resolve uniquely: "
+            f"{decision.store_id.root}/{decision.decision_id.root}"
+        )
     node = matches[0]
     _, incoming = _incoming_supersession(graph)
     if incoming.get(_decision_key(node)):
@@ -174,7 +209,7 @@ def decision_state(
 def _descendants(node: TaskNode, graph: GraphState) -> tuple[TaskNode, ...]:
     descendants: list[TaskNode] = []
     pending = [node.task.id]
-    seen = {node.task.id.root}
+    seen = {(node.task.id.root, node.path)}
     while pending:
         parent = pending.pop()
         children = sorted(
@@ -183,21 +218,22 @@ def _descendants(node: TaskNode, graph: GraphState) -> tuple[TaskNode, ...]:
                 for candidate in graph.tasks
                 if candidate.store_id == node.store_id and candidate.task.parent == parent
             ),
-            key=lambda candidate: candidate.task.id.root,
+            key=lambda candidate: (candidate.task.id.root, candidate.path),
         )
         for child in children:
-            if child.task.id.root in seen:
+            identity = (child.task.id.root, child.path)
+            if identity in seen:
                 continue
-            seen.add(child.task.id.root)
+            seen.add(identity)
             descendants.append(child)
             pending.append(child.task.id)
-    return tuple(sorted(descendants, key=lambda value: value.task.id.root))
+    return tuple(sorted(descendants, key=lambda value: (value.task.id.root, value.path)))
 
 
 def _blocker_sort_key(value: ReadinessBlocker) -> tuple[str, str]:
     identity = (
-        value.related_task_id.root
-        if value.related_task_id is not None
+        f"{value.related_task.store_id.root}/{value.related_task.task_id.root}"
+        if value.related_task is not None
         else value.waiting_party.root
         if value.waiting_party is not None
         else ""
@@ -205,11 +241,8 @@ def _blocker_sort_key(value: ReadinessBlocker) -> tuple[str, str]:
     return (value.kind.value, identity)
 
 
-def readiness(task_id: TaskId, graph: GraphState) -> Readiness:
-    matches = [node for node in graph.tasks if node.task.id == task_id]
-    if len(matches) != 1:
-        raise KeyError(f"task does not resolve uniquely: {task_id.root}")
-    node = matches[0]
+def _readiness_for_node(node: TaskNode, graph: GraphState) -> Readiness:
+    task = TaskRef(node.store_id, node.task.id)
     tasks = _task_index(graph)
     known_store_ids = {value.root for value in graph.completeness.known_store_ids}
     known_store_ids.update(value.store_id.root for value in graph.tasks)
@@ -220,8 +253,8 @@ def readiness(task_id: TaskId, graph: GraphState) -> Readiness:
     for value in node.task.links:
         if value.relation is not LinkRelation.DEPENDS_ON or not isinstance(value.target, TaskId):
             continue
-        target = tasks.get((value.target_store_id.root, value.target.root))
-        if target is None:
+        targets = tasks.get((value.target_store_id.root, value.target.root), ())
+        if len(targets) != 1:
             blockers.append(
                 ReadinessBlocker(
                     (
@@ -230,21 +263,23 @@ def readiness(task_id: TaskId, graph: GraphState) -> Readiness:
                         and value.target_store_id.root not in known_store_ids
                         else ReadinessBlockerKind.DEPENDENCY_INVALID
                     ),
-                    related_task_id=value.target,
+                    related_task=TaskRef(value.target_store_id, value.target),
                 )
             )
-        elif isinstance(target.task, ActiveTask):
+        elif isinstance(targets[0].task, ActiveTask):
+            target = targets[0]
             blockers.append(
                 ReadinessBlocker(
                     ReadinessBlockerKind.DEPENDENCY_ACTIVE,
-                    related_task_id=target.task.id,
+                    related_task=TaskRef(target.store_id, target.task.id),
                 )
             )
-        elif target.task.outcome is not TaskOutcome.DELIVERED:
+        elif targets[0].task.outcome is not TaskOutcome.DELIVERED:
+            target = targets[0]
             blockers.append(
                 ReadinessBlocker(
                     ReadinessBlockerKind.DEPENDENCY_UNSATISFIED,
-                    related_task_id=target.task.id,
+                    related_task=TaskRef(target.store_id, target.task.id),
                 )
             )
     for descendant in _descendants(node, graph):
@@ -252,55 +287,89 @@ def readiness(task_id: TaskId, graph: GraphState) -> Readiness:
             blockers.append(
                 ReadinessBlocker(
                     ReadinessBlockerKind.DESCENDANT_ACTIVE,
-                    related_task_id=descendant.task.id,
+                    related_task=TaskRef(descendant.store_id, descendant.task.id),
                 )
             )
         elif descendant.task.outcome is not TaskOutcome.DELIVERED:
             blockers.append(
                 ReadinessBlocker(
                     ReadinessBlockerKind.DESCENDANT_UNDELIVERED,
-                    related_task_id=descendant.task.id,
+                    related_task=TaskRef(descendant.store_id, descendant.task.id),
                 )
             )
     if not graph.completeness.complete:
         blockers.append(ReadinessBlocker(ReadinessBlockerKind.FEDERATION_INCOMPLETE))
-    unique = {(value.kind, value.related_task_id, value.waiting_party): value for value in blockers}
-    return Readiness(task_id, tuple(sorted(unique.values(), key=_blocker_sort_key)))
+    unique = {(value.kind, value.related_task, value.waiting_party): value for value in blockers}
+    return Readiness(task, tuple(sorted(unique.values(), key=_blocker_sort_key)))
 
 
-def _cycle_nodes(edges: dict[ItemKey, set[ItemKey]]) -> set[ItemKey]:
-    visiting: set[ItemKey] = set()
-    visited: set[ItemKey] = set()
-    cyclic: set[ItemKey] = set()
+def readiness(task: TaskRef, graph: GraphState) -> Readiness:
+    matches = [
+        node
+        for node in graph.tasks
+        if node.store_id == task.store_id and node.task.id == task.task_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"task does not resolve uniquely: {task.store_id.root}/{task.task_id.root}"
+        )
+    return _readiness_for_node(matches[0], graph)
 
-    def visit(key: ItemKey, trail: list[ItemKey]) -> None:
-        if key in visiting:
-            start = trail.index(key)
-            cyclic.update(trail[start:])
-            return
-        if key in visited:
-            return
-        visiting.add(key)
-        trail.append(key)
+
+def _cyclic_components(edges: dict[ItemKey, set[ItemKey]]) -> tuple[frozenset[ItemKey], ...]:
+    next_index = 0
+    indices: dict[ItemKey, int] = {}
+    lowlinks: dict[ItemKey, int] = {}
+    stack: list[ItemKey] = []
+    on_stack: set[ItemKey] = set()
+    components: list[frozenset[ItemKey]] = []
+
+    def connect(key: ItemKey) -> None:
+        nonlocal next_index
+        indices[key] = next_index
+        lowlinks[key] = next_index
+        next_index += 1
+        stack.append(key)
+        on_stack.add(key)
+
         for target in sorted(edges.get(key, ())):
-            visit(target, trail)
-        trail.pop()
-        visiting.remove(key)
-        visited.add(key)
+            if target not in indices:
+                connect(target)
+                lowlinks[key] = min(lowlinks[key], lowlinks[target])
+            elif target in on_stack:
+                lowlinks[key] = min(lowlinks[key], indices[target])
 
-    for key in sorted(edges):
-        visit(key, [])
-    return cyclic
+        if lowlinks[key] != indices[key]:
+            return
+        component: set[ItemKey] = set()
+        while True:
+            member = stack.pop()
+            on_stack.remove(member)
+            component.add(member)
+            if member == key:
+                break
+        if len(component) > 1 or key in edges.get(key, ()):
+            components.append(frozenset(component))
+
+    nodes = set(edges)
+    nodes.update(target for targets in edges.values() for target in targets)
+    for key in sorted(nodes):
+        if key not in indices:
+            connect(key)
+    return tuple(sorted(components, key=lambda value: tuple(sorted(value))))
 
 
 def _cycle_diagnostic(
-    nodes: set[ItemKey],
-    index: Mapping[ItemKey, TaskNode | DecisionNode],
+    nodes: frozenset[ItemKey],
+    index: Mapping[ItemKey, tuple[TaskNode | DecisionNode, ...]],
     *,
     field: str,
     message: str,
 ) -> Diagnostic | None:
-    candidates = sorted((index[key] for key in nodes if key in index), key=lambda node: node.path)
+    candidates = sorted(
+        (node for key in nodes for node in index.get(key, ())),
+        key=lambda node: node.path,
+    )
     if not candidates:
         return None
     return _diagnostic(
@@ -313,42 +382,65 @@ def _cycle_diagnostic(
 
 
 def _duplicate_diagnostics(
-    graph: GraphState,
-    tasks: dict[ItemKey, TaskNode],
-    decisions: dict[ItemKey, DecisionNode],
+    tasks: TaskIndex,
+    decisions: DecisionIndex,
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
-    if len(tasks) != len(graph.tasks):
-        for task_node in graph.tasks:
-            if sum(_task_key(value) == _task_key(task_node) for value in graph.tasks) > 1:
-                diagnostics.append(
-                    _diagnostic(
-                        task_node,
-                        code="ORC003",
-                        field="id",
-                        message="task identity is duplicated within its store",
-                        hint="Keep exactly one canonical item for each immutable ID.",
-                    )
+    for task_nodes in tasks.values():
+        if len(task_nodes) > 1:
+            diagnostics.extend(
+                _diagnostic(
+                    task_node,
+                    code="ORC003",
+                    field="id",
+                    message="task identity is duplicated within its store",
+                    hint="Keep exactly one canonical item for each immutable ID.",
                 )
-    if len(decisions) != len(graph.decisions):
-        for decision_node in graph.decisions:
-            if (
-                sum(
-                    _decision_key(value) == _decision_key(decision_node)
-                    for value in graph.decisions
+                for task_node in task_nodes
+            )
+    for decision_nodes in decisions.values():
+        if len(decision_nodes) > 1:
+            diagnostics.extend(
+                _diagnostic(
+                    decision_node,
+                    code="ORC003",
+                    field="id",
+                    message="decision identity is duplicated within its store",
+                    hint="Keep exactly one canonical item for each immutable ID.",
                 )
-                > 1
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        decision_node,
-                        code="ORC003",
-                        field="id",
-                        message="decision identity is duplicated within its store",
-                        hint="Keep exactly one canonical item for each immutable ID.",
-                    )
-                )
+                for decision_node in decision_nodes
+            )
 
+    return diagnostics
+
+
+def _rank_diagnostics(graph: GraphState) -> list[Diagnostic]:
+    scopes: dict[tuple[str, str, str], dict[int, list[TaskNode]]] = {}
+    for node in graph.tasks:
+        if not isinstance(node.task, ActiveTask):
+            continue
+        scope = (
+            node.store_id.root,
+            node.task.parent.root if node.task.parent is not None else "",
+            node.task.stage.value,
+        )
+        scopes.setdefault(scope, {}).setdefault(node.task.rank, []).append(node)
+
+    diagnostics: list[Diagnostic] = []
+    for scope in sorted(scopes):
+        for rank in sorted(scopes[scope]):
+            nodes = scopes[scope][rank]
+            if len(nodes) > 1:
+                diagnostics.extend(
+                    _diagnostic(
+                        node,
+                        code="ORC004",
+                        field="rank",
+                        message="duplicate rank within task scope",
+                        hint="Rebalance the exact parent and stage scope.",
+                    )
+                    for node in sorted(nodes, key=lambda value: value.path)
+                )
     return diagnostics
 
 
@@ -371,11 +463,10 @@ def _missing_target_diagnostic(
     field: str,
     target_store_id: StoreId,
     known_stores: set[str],
-    missing_stores: set[str],
     complete: bool,
 ) -> Diagnostic | None:
     target_store_unknown = target_store_id.root not in known_stores
-    if not complete and (target_store_unknown or target_store_id.root in missing_stores):
+    if not complete and target_store_unknown:
         return None
     return _diagnostic(
         node,
@@ -390,89 +481,188 @@ def _missing_target_diagnostic(
     )
 
 
-def _task_relation_diagnostics(
-    graph: GraphState,
-    tasks: dict[ItemKey, TaskNode],
-    decisions: dict[ItemKey, DecisionNode],
+def _task_parent_diagnostics(
+    task_node: TaskNode,
+    tasks: TaskIndex,
     edges: _Edges,
+    *,
+    source_unique: bool,
+) -> list[Diagnostic]:
+    parent_id = task_node.task.parent
+    if parent_id is None:
+        return []
+    source = _task_key(task_node)
+    parent_key = (task_node.store_id.root, parent_id.root)
+    parents = tasks.get(parent_key, ())
+    if source_unique and len(parents) == 1:
+        edges.containment[source].add(parent_key)
+        edges.precedence[source].add(parent_key)
+    diagnostics: list[Diagnostic] = []
+    if len(parents) > 1:
+        diagnostics.append(
+            _diagnostic(
+                task_node,
+                code="ORC004",
+                field="parent",
+                message="parent target is ambiguous within its store",
+                hint="Keep one canonical parent item for the referenced ID.",
+            )
+        )
+    if isinstance(task_node.task, ActiveTask) and (
+        len(parents) != 1 or not isinstance(parents[0].task, ActiveTask)
+    ):
+        diagnostics.append(
+            _diagnostic(
+                task_node,
+                code="ORC004",
+                field="parent",
+                message="an active task parent must resolve to an active same-store task",
+                hint="Move the task below an active local parent or clear its parent.",
+            )
+        )
+    return diagnostics
+
+
+def _task_link_targets(
+    relation: LinkRelation,
+    target_key: ItemKey,
+    tasks: TaskIndex,
+    decisions: DecisionIndex,
+) -> tuple[TaskNode | DecisionNode, ...]:
+    if relation is LinkRelation.GOVERNED_BY:
+        return decisions.get(target_key, ())
+    return tasks.get(target_key, ())
+
+
+def _task_link_diagnostics(
+    task_node: TaskNode,
+    tasks: TaskIndex,
+    decisions: DecisionIndex,
+    edges: _Edges,
+    *,
+    source_unique: bool,
+    known_stores: set[str],
+    complete: bool,
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
+    source = _task_key(task_node)
+    for position, link in enumerate(task_node.task.links):
+        field = f"links.{position}"
+        target_key = (link.target_store_id.root, link.target.root)
+        if (
+            link.relation in {LinkRelation.DEPENDS_ON, LinkRelation.SUPERSEDES}
+            and link.target_store_id != task_node.store_id
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    task_node,
+                    code="ORC004",
+                    field=field,
+                    message=f"{link.relation.value} is a same-store relation",
+                    hint="Point the structural relation at an item in the source store.",
+                )
+            )
+            continue
+        targets = _task_link_targets(link.relation, target_key, tasks, decisions)
+        if not targets:
+            diagnostic = _missing_target_diagnostic(
+                task_node,
+                field=field,
+                target_store_id=link.target_store_id,
+                known_stores=known_stores,
+                complete=complete,
+            )
+            if diagnostic is not None:
+                diagnostics.append(diagnostic)
+            continue
+        if len(targets) > 1:
+            diagnostics.append(
+                _diagnostic(
+                    task_node,
+                    code="ORC004",
+                    field=field,
+                    message="relation target is ambiguous within its store",
+                    hint="Keep one canonical target item for the referenced ID.",
+                )
+            )
+            continue
+        if link.relation is LinkRelation.DEPENDS_ON and source_unique:
+            edges.dependencies[source].add(target_key)
+            edges.precedence.setdefault(target_key, set()).add(source)
+        elif link.relation is LinkRelation.SUPERSEDES:
+            target = targets[0]
+            if not isinstance(target, TaskNode):
+                raise AssertionError("task relation resolved to a non-task node")
+            if not isinstance(target.task, ArchivedTask) or (
+                target.task.outcome is not TaskOutcome.SUPERSEDED
+            ):
+                diagnostics.append(
+                    _diagnostic(
+                        task_node,
+                        code="ORC006",
+                        field=field,
+                        message=(
+                            "task supersedes predecessor must be archived with outcome superseded"
+                        ),
+                        hint="Archive the predecessor through the guarded superseded flow.",
+                    )
+                )
+            if source_unique:
+                edges.task_supersession[source].add(target_key)
+    return diagnostics
+
+
+def _task_relation_diagnostics(
+    graph: GraphState,
+    tasks: TaskIndex,
+    decisions: DecisionIndex,
+    edges: _Edges,
+) -> list[Diagnostic]:
     known_stores = {value.root for value in graph.completeness.known_store_ids}
     known_stores.update(task_node.store_id.root for task_node in graph.tasks)
     known_stores.update(decision_node.store_id.root for decision_node in graph.decisions)
-    missing_stores = {value.root for value in graph.completeness.missing_store_ids}
+    diagnostics: list[Diagnostic] = []
     for task_node in graph.tasks:
         source = _task_key(task_node)
-        edges.containment.setdefault(source, set())
-        edges.dependencies.setdefault(source, set())
-        edges.task_supersession.setdefault(source, set())
-        edges.precedence.setdefault(source, set())
-        if task_node.task.parent is not None:
-            parent_key = (task_node.store_id.root, task_node.task.parent.root)
-            edges.containment[source].add(parent_key)
-            edges.precedence[source].add(parent_key)
-            parent = tasks.get(parent_key)
-            if isinstance(task_node.task, ActiveTask) and (
-                parent is None or not isinstance(parent.task, ActiveTask)
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        task_node,
-                        code="ORC004",
-                        field="parent",
-                        message="an active task parent must resolve to an active same-store task",
-                        hint="Move the task below an active local parent or clear its parent.",
-                    )
-                )
-        for position, link in enumerate(task_node.task.links):
-            field = f"links.{position}"
-            target_key = (link.target_store_id.root, link.target.root)
-            if (
-                link.relation in {LinkRelation.DEPENDS_ON, LinkRelation.SUPERSEDES}
-                and link.target_store_id != task_node.store_id
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        task_node,
-                        code="ORC004",
-                        field=field,
-                        message=f"{link.relation.value} is a same-store relation",
-                        hint="Point the structural relation at an item in the source store.",
-                    )
-                )
-                continue
-            expected: Mapping[ItemKey, TaskNode | DecisionNode]
-            expected = decisions if link.relation is LinkRelation.GOVERNED_BY else tasks
-            target = expected.get(target_key)
-            if target is None:
-                diagnostic = _missing_target_diagnostic(
-                    task_node,
-                    field=field,
-                    target_store_id=link.target_store_id,
-                    known_stores=known_stores,
-                    missing_stores=missing_stores,
-                    complete=graph.completeness.complete,
-                )
-                if diagnostic is not None:
-                    diagnostics.append(diagnostic)
-                continue
-            if link.relation is LinkRelation.DEPENDS_ON:
-                edges.dependencies[source].add(target_key)
-                edges.precedence.setdefault(target_key, set()).add(source)
-            elif link.relation is LinkRelation.SUPERSEDES:
-                edges.task_supersession[source].add(target_key)
+        source_unique = len(tasks[source]) == 1
+        if source_unique:
+            edges.containment.setdefault(source, set())
+            edges.dependencies.setdefault(source, set())
+            edges.task_supersession.setdefault(source, set())
+            edges.precedence.setdefault(source, set())
+        diagnostics.extend(
+            _task_parent_diagnostics(
+                task_node,
+                tasks,
+                edges,
+                source_unique=source_unique,
+            )
+        )
+        diagnostics.extend(
+            _task_link_diagnostics(
+                task_node,
+                tasks,
+                decisions,
+                edges,
+                source_unique=source_unique,
+                known_stores=known_stores,
+                complete=graph.completeness.complete,
+            )
+        )
     return diagnostics
 
 
 def _decision_relation_diagnostics(
     graph: GraphState,
-    decisions: dict[ItemKey, DecisionNode],
+    decisions: DecisionIndex,
     edges: _Edges,
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     for decision_node in graph.decisions:
         source = _decision_key(decision_node)
-        edges.decision_supersession.setdefault(source, set())
+        source_unique = len(decisions[source]) == 1
+        if source_unique:
+            edges.decision_supersession.setdefault(source, set())
         for position, link in enumerate(decision_node.decision.links):
             field = f"links.{position}"
             target_key = (link.target_store_id.root, link.target.root)
@@ -487,7 +677,8 @@ def _decision_relation_diagnostics(
                     )
                 )
                 continue
-            if target_key not in decisions:
+            targets = decisions.get(target_key, ())
+            if not targets:
                 diagnostics.append(
                     _diagnostic(
                         decision_node,
@@ -498,7 +689,19 @@ def _decision_relation_diagnostics(
                     )
                 )
                 continue
-            edges.decision_supersession[source].add(target_key)
+            if len(targets) > 1:
+                diagnostics.append(
+                    _diagnostic(
+                        decision_node,
+                        code="ORC004",
+                        field=field,
+                        message="relation target is ambiguous within its store",
+                        hint="Keep one canonical target item for the referenced ID.",
+                    )
+                )
+                continue
+            if source_unique:
+                edges.decision_supersession[source].add(target_key)
     return diagnostics
 
 
@@ -534,12 +737,17 @@ def _cardinality_diagnostics(graph: GraphState) -> list[Diagnostic]:
 
 def _cycle_diagnostics(
     edges: _Edges,
-    tasks: dict[ItemKey, TaskNode],
-    decisions: dict[ItemKey, DecisionNode],
+    tasks: TaskIndex,
+    decisions: DecisionIndex,
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     specs: tuple[
-        tuple[dict[ItemKey, set[ItemKey]], str, str, Mapping[ItemKey, TaskNode | DecisionNode]],
+        tuple[
+            dict[ItemKey, set[ItemKey]],
+            str,
+            str,
+            Mapping[ItemKey, tuple[TaskNode | DecisionNode, ...]],
+        ],
         ...,
     ] = (
         (edges.containment, "parent", "containment cycle detected", tasks),
@@ -554,14 +762,19 @@ def _cycle_diagnostics(
         (edges.precedence, "links", "completion-precedence cycle detected", tasks),
     )
     for relation_edges, field, message, index in specs:
-        diagnostic = _cycle_diagnostic(
-            _cycle_nodes(relation_edges),
-            index,
-            field=field,
-            message=message,
+        diagnostics.extend(
+            diagnostic
+            for component in _cyclic_components(relation_edges)
+            if (
+                diagnostic := _cycle_diagnostic(
+                    component,
+                    index,
+                    field=field,
+                    message=message,
+                )
+            )
+            is not None
         )
-        if diagnostic is not None:
-            diagnostics.append(diagnostic)
     return diagnostics
 
 
@@ -590,7 +803,7 @@ def _delivered_diagnostics(
     undelivered: list[TaskNode],
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
-    result = readiness(node.task.id, graph)
+    result = _readiness_for_node(node, graph)
     dependency_blockers = {
         ReadinessBlockerKind.DEPENDENCY_ACTIVE,
         ReadinessBlockerKind.DEPENDENCY_UNSATISFIED,
@@ -658,15 +871,14 @@ def _archive_lifecycle_diagnostics(graph: GraphState) -> list[Diagnostic]:
                     hint="Archive every descendant before using this close outcome.",
                 )
             )
-        if task_node.task.outcome is TaskOutcome.SUPERSEDED and not task_incoming.get(
-            _task_key(task_node)
-        ):
+        incoming = task_incoming.get(_task_key(task_node), ())
+        if task_node.task.outcome is TaskOutcome.SUPERSEDED and len(incoming) != 1:
             diagnostics.append(
                 _diagnostic(
                     task_node,
                     code="ORC006",
                     field="outcome",
-                    message="superseded task has no successor",
+                    message="superseded task requires exactly one valid successor",
                     hint="Use the guarded superseded-close flow with an active successor.",
                 )
             )
@@ -677,7 +889,8 @@ def validate_graph(graph: GraphState) -> tuple[Diagnostic, ...]:
     tasks = _task_index(graph)
     decisions = _decision_index(graph)
     edges = _empty_edges()
-    diagnostics = _duplicate_diagnostics(graph, tasks, decisions)
+    diagnostics = _duplicate_diagnostics(tasks, decisions)
+    diagnostics.extend(_rank_diagnostics(graph))
     diagnostics.extend(_task_relation_diagnostics(graph, tasks, decisions, edges))
     diagnostics.extend(_decision_relation_diagnostics(graph, decisions, edges))
     diagnostics.extend(_cardinality_diagnostics(graph))

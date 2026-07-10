@@ -4,11 +4,13 @@ import pytest
 
 from untaped_orchestration.domain.graph import (
     DecisionNode,
+    DecisionRef,
     DecisionState,
     GraphCompleteness,
     GraphState,
     ReadinessBlockerKind,
     TaskNode,
+    TaskRef,
     decision_state,
     readiness,
     validate_graph,
@@ -193,6 +195,19 @@ def test_dependency_and_combined_completion_precedence_cycles_are_rejected() -> 
     assert any("completion-precedence cycle" in value.message for value in combined_diagnostics)
 
 
+def test_every_disjoint_cycle_component_gets_its_own_diagnostic() -> None:
+    value = graph(
+        active(1, links=(link(LinkRelation.DEPENDS_ON, tid(2)),)),
+        active(2, links=(link(LinkRelation.DEPENDS_ON, tid(1)),)),
+        active(3, links=(link(LinkRelation.DEPENDS_ON, tid(4)),)),
+        active(4, links=(link(LinkRelation.DEPENDS_ON, tid(3)),)),
+    )
+
+    diagnostics = validate_graph(value)
+
+    assert sum(value.message == "dependency cycle detected" for value in diagnostics) == 2
+
+
 def test_supersession_enforces_kind_locality_cardinality_and_per_kind_cycles() -> None:
     task_cycle = graph(
         active(1, links=(link(LinkRelation.SUPERSEDES, tid(2)),)),
@@ -226,6 +241,76 @@ def test_supersession_enforces_kind_locality_cardinality_and_per_kind_cycles() -
 
 
 @pytest.mark.parametrize(
+    "predecessor",
+    [
+        active(1),
+        archived(1, TaskOutcome.DELIVERED),
+        archived(1, TaskOutcome.DECLINED),
+        archived(1, TaskOutcome.CANCELLED, started=True),
+    ],
+)
+def test_task_successor_link_requires_an_archived_superseded_predecessor(
+    predecessor: ActiveTask | ArchivedTask,
+) -> None:
+    successor = active(2, links=(link(LinkRelation.SUPERSEDES, tid(1)),))
+
+    diagnostics = validate_graph(graph(predecessor, successor))
+
+    assert any(
+        "predecessor must be archived with outcome superseded" in value.message
+        for value in diagnostics
+    )
+
+
+def test_archived_superseded_task_requires_exactly_one_valid_successor() -> None:
+    predecessor = archived(1, TaskOutcome.SUPERSEDED)
+    one = active(2, links=(link(LinkRelation.SUPERSEDES, tid(1)),))
+    two = active(3, links=(link(LinkRelation.SUPERSEDES, tid(1)),))
+
+    valid = validate_graph(graph(predecessor, one))
+    multiple = validate_graph(graph(predecessor, one, two))
+
+    assert not any("requires exactly one valid successor" in value.message for value in valid)
+    assert sum("at most one successor" in value.message for value in multiple) == 2
+    assert any("requires exactly one valid successor" in value.message for value in multiple)
+
+
+def test_duplicate_rank_groups_are_reported_per_exact_scope_and_permutation_stable() -> None:
+    values = (
+        active(1, rank=1000),
+        active(2, rank=1000),
+        active(3, rank=2000),
+        active(4, rank=2000),
+    )
+
+    first = validate_graph(graph(*values))
+    second = validate_graph(graph(*reversed(values)))
+
+    assert first == second
+    assert sum(value.field == "rank" and "duplicate" in value.message for value in first) == 4
+
+
+def test_rank_uniqueness_is_scoped_by_store_parent_and_stage() -> None:
+    top = active(1, rank=1000)
+    planned = active(2, rank=1000).model_copy(update={"stage": TaskStage.PLANNED})
+    child = active(3, rank=1000, parent=tid(4))
+    parent = active(4, rank=2000)
+    remote = task_node(active(5, rank=1000), store=OTHER_STORE)
+    value = GraphState(
+        tasks=(*graph(top, planned, child, parent).tasks, remote),
+        decisions=(),
+        completeness=GraphCompleteness(
+            complete=True,
+            known_store_ids=(STORE, OTHER_STORE),
+        ),
+    )
+
+    diagnostics = validate_graph(value)
+
+    assert not any(value.field == "rank" for value in diagnostics)
+
+
+@pytest.mark.parametrize(
     ("outcome", "expected_kind"),
     [
         (None, ReadinessBlockerKind.DEPENDENCY_ACTIVE),
@@ -246,7 +331,7 @@ def test_readiness_covers_every_dependency_outcome(
         else archived(2, outcome, started=outcome is TaskOutcome.CANCELLED)
     )
 
-    result = readiness(tid(1), graph(dependent, prerequisite))
+    result = readiness(TaskRef(STORE, tid(1)), graph(dependent, prerequisite))
 
     if expected_kind is not None:
         assert expected_kind in {value.kind for value in result.blockers}
@@ -256,8 +341,8 @@ def test_readiness_covers_every_dependency_outcome(
 def test_readiness_keeps_missing_local_dependency_invalid_when_federation_is_incomplete() -> None:
     dependent = active(1, links=(link(LinkRelation.DEPENDS_ON, tid(2)),))
 
-    complete = readiness(tid(1), graph(dependent))
-    incomplete = readiness(tid(1), graph(dependent, complete=False))
+    complete = readiness(TaskRef(STORE, tid(1)), graph(dependent))
+    incomplete = readiness(TaskRef(STORE, tid(1)), graph(dependent, complete=False))
 
     assert {value.kind for value in complete.blockers} == {ReadinessBlockerKind.DEPENDENCY_INVALID}
     assert {value.kind for value in incomplete.blockers} == {
@@ -271,7 +356,7 @@ def test_readiness_includes_waiting_parties_and_all_descendant_states() -> None:
     child = active(2, parent=tid(1))
     grandchild = archived(3, TaskOutcome.DECLINED, parent=tid(2))
 
-    result = readiness(tid(1), graph(parent, child, grandchild))
+    result = readiness(TaskRef(STORE, tid(1)), graph(parent, child, grandchild))
 
     assert {value.kind for value in result.blockers} == {
         ReadinessBlockerKind.WAITING_PARTY,
@@ -286,9 +371,39 @@ def test_decision_state_derives_active_superseded_and_retired_without_persisted_
     retired_value = decision(3, retired=True)
     state = graph(decisions=(active_value, successor, retired_value))
 
-    assert decision_state(did(1), state) is DecisionState.SUPERSEDED
-    assert decision_state(did(2), state) is DecisionState.ACTIVE
-    assert decision_state(did(3), state) is DecisionState.RETIRED
+    assert decision_state(DecisionRef(STORE, did(1)), state) is DecisionState.SUPERSEDED
+    assert decision_state(DecisionRef(STORE, did(2)), state) is DecisionState.ACTIVE
+    assert decision_state(DecisionRef(STORE, did(3)), state) is DecisionState.RETIRED
+
+
+def test_readiness_is_store_qualified_when_task_ids_repeat_across_stores() -> None:
+    local_dependent = active(1, links=(link(LinkRelation.DEPENDS_ON, tid(2)),))
+    local_prerequisite = active(2)
+    remote_dependent = active(
+        1,
+        links=(link(LinkRelation.DEPENDS_ON, tid(2), OTHER_STORE),),
+    )
+    remote_prerequisite = archived(2, TaskOutcome.DELIVERED)
+    state = GraphState(
+        tasks=(
+            task_node(local_dependent),
+            task_node(local_prerequisite),
+            task_node(remote_dependent, store=OTHER_STORE),
+            task_node(remote_prerequisite, store=OTHER_STORE),
+        ),
+        decisions=(),
+        completeness=GraphCompleteness(
+            complete=True,
+            known_store_ids=(STORE, OTHER_STORE),
+        ),
+    )
+
+    local = readiness(TaskRef(STORE, tid(1)), state)
+    remote = readiness(TaskRef(OTHER_STORE, tid(1)), state)
+
+    assert local.ready is False
+    assert local.blockers[0].related_task == TaskRef(STORE, tid(2))
+    assert remote.ready is True
 
 
 def test_decision_cannot_be_both_retired_and_superseded() -> None:
@@ -333,7 +448,7 @@ def test_lifecycle_matrix_reports_archive_outcome_blockers() -> None:
     messages = "\n".join(value.message for value in diagnostics)
     assert "delivered task has unsatisfied dependencies" in messages
     assert "declined task has active descendants" in messages
-    assert "superseded task has no successor" in messages
+    assert "superseded task requires exactly one valid successor" in messages
 
 
 def test_graph_diagnostics_are_deterministic_under_input_permutation() -> None:
@@ -341,3 +456,25 @@ def test_graph_diagnostics_are_deterministic_under_input_permutation() -> None:
     second = active(2, parent=tid(97))
 
     assert validate_graph(graph(first, second)) == validate_graph(graph(second, first))
+
+
+def test_active_archive_identity_ambiguity_is_explicit_complete_and_permutation_stable() -> None:
+    active_duplicate = task_node(active(1))
+    archived_duplicate = task_node(archived(1, TaskOutcome.DELIVERED))
+    child = task_node(active(2, parent=tid(1)))
+
+    def validate(nodes: tuple[TaskNode, ...]) -> tuple:
+        return validate_graph(
+            GraphState(
+                tasks=nodes,
+                decisions=(),
+                completeness=GraphCompleteness(complete=True, known_store_ids=(STORE,)),
+            )
+        )
+
+    first = validate((active_duplicate, archived_duplicate, child))
+    second = validate((archived_duplicate, active_duplicate, child))
+
+    assert first == second
+    assert sum(value.field == "id" for value in first) == 2
+    assert any("parent target is ambiguous" in value.message for value in first)

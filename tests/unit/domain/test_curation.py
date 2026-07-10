@@ -220,6 +220,30 @@ def test_decision_curation_qualifies_derived_state_by_store() -> None:
     assert [entry.item_id for entry in queue] == [did(1)]
 
 
+def test_duplicate_active_decision_ids_are_curated_distinctly_by_store() -> None:
+    local = decision(1, review_on="2026-07-01", title="Same")
+    remote = local.model_copy()
+    other_store = StoreId("sto_019f0000000070008000000000000001")
+    local_node = DecisionNode(STORE, "decisions/local.md", local)
+    remote_node = DecisionNode(other_store, "decisions/remote.md", remote)
+
+    def queue(nodes: tuple[DecisionNode, ...]) -> tuple[StoreId, ...]:
+        result = curation_queue(
+            GraphState(
+                tasks=(),
+                decisions=nodes,
+                completeness=GraphCompleteness(complete=True),
+            ),
+            now=UtcTimestamp("2026-07-10T00:00:00.000Z"),
+            timezone=IanaTimezone("UTC"),
+            config=CONFIG,
+        )
+        return tuple(entry.store_id for entry in result)
+
+    assert queue((remote_node, local_node)) == (STORE, other_store)
+    assert queue((local_node, remote_node)) == (STORE, other_store)
+
+
 def test_due_sort_is_date_task_before_decision_then_task_priority_rank_or_decision_title() -> None:
     tasks = (
         task(1, TaskStage.PLANNED, review_on="2026-07-10", priority=TaskPriority.LOW),
@@ -257,3 +281,44 @@ def test_due_sort_is_date_task_before_decision_then_task_priority_rank_or_decisi
         (CurationKind.DECISION, did(2).root),
         (CurationKind.DECISION, did(1).root),
     ]
+
+
+def test_curation_keeps_duplicate_item_ids_distinct_by_store_and_is_permutation_stable() -> None:
+    local = task(1, TaskStage.PLANNED, review_on="2026-07-10")
+    remote = local.model_copy()
+    local_node = TaskNode(STORE, "tasks/local.md", local)
+    other_store = StoreId("sto_019f0000000070008000000000000001")
+    remote_node = TaskNode(other_store, "tasks/remote.md", remote)
+
+    def queue(nodes: tuple[TaskNode, ...]) -> tuple[tuple[StoreId, TaskId], ...]:
+        result = curation_queue(
+            GraphState(
+                tasks=nodes,
+                decisions=(),
+                completeness=GraphCompleteness(complete=True),
+            ),
+            now=UtcTimestamp("2026-07-10T23:59:59.000Z"),
+            timezone=IanaTimezone("UTC"),
+            config=CONFIG,
+        )
+        return tuple((entry.store_id, entry.item_id) for entry in result)
+
+    expected = ((STORE, tid(1)), (other_store, tid(1)))
+    assert queue((remote_node, local_node)) == expected
+    assert queue((local_node, remote_node)) == expected
+
+
+def test_decision_title_sort_uses_exact_value_before_id() -> None:
+    values = (
+        decision(1, review_on="2026-07-10", title="apple"),
+        decision(2, review_on="2026-07-10", title="Zulu"),
+    )
+
+    queue = curation_queue(
+        state(decisions=values),
+        now=UtcTimestamp("2026-07-10T23:59:59.000Z"),
+        timezone=IanaTimezone("UTC"),
+        config=CONFIG,
+    )
+
+    assert [entry.item_id for entry in queue] == [did(2), did(1)]

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from untaped_orchestration.domain.ids import TaskId
+from untaped_orchestration.domain.ids import StoreId, TaskId
 from untaped_orchestration.domain.models import ActiveTask, TaskPriority, TaskStage
 from untaped_orchestration.domain.ordering import (
     PlacementAnchor,
     PlacementAnchorKind,
     RankScope,
+    TaskOrderItem,
     plan_placement,
     sort_tasks,
 )
@@ -15,6 +16,8 @@ from untaped_orchestration.domain.time import UtcTimestamp
 
 NOW = UtcTimestamp("2026-07-10T01:02:03.004Z")
 MAX_RANK = 2**63 - 1
+STORE = StoreId("sto_019f0000000070008000000000000000")
+OTHER_STORE = StoreId("sto_019f0000000070008000000000000001")
 
 
 def tid(number: int) -> TaskId:
@@ -171,6 +174,51 @@ def test_every_rebalance_interruption_preserves_unique_ranks_and_relative_order(
         assert len(set(ranks.values())) == len(ranks)
 
 
+def test_mixed_direction_rebalance_is_safe_after_every_replacement() -> None:
+    original = [task(1, 1500), task(2, 1501), task(3, 3500)]
+    primary = task(4, 9000, stage=TaskStage.PLANNED)
+    plan = plan_placement(
+        (*original, primary),
+        primary,
+        scope(),
+        PlacementAnchor(PlacementAnchorKind.BEFORE, tid(2)),
+    )
+
+    assert [(value.task_id, value.new_rank) for value in plan.rebalance] == [
+        (tid(1), 1000),
+        (tid(3), 3000),
+        (tid(2), 2000),
+    ]
+    for stop in range(len(plan.rebalance) + 1):
+        ranks = {value.id: value.rank for value in original}
+        for replacement in plan.rebalance[:stop]:
+            ranks[replacement.task_id] = replacement.new_rank
+        ordered = sorted(original, key=lambda value: ranks[value.id])
+        assert [value.id for value in ordered] == [value.id for value in original]
+        assert len(set(ranks.values())) == len(ranks)
+
+
+def test_same_scope_primary_participates_neutrally_across_every_interruption_prefix() -> None:
+    original = [task(1, 1500), task(2, 1501), task(3, 3500)]
+    primary = original[2]
+    plan = plan_placement(
+        original,
+        primary,
+        scope(),
+        PlacementAnchor(PlacementAnchorKind.BEFORE, tid(2)),
+    )
+
+    assert any(value.task_id == primary.id for value in plan.rebalance)
+    assert plan.primary.rank == 1500
+    for stop in range(len(plan.rebalance) + 1):
+        ranks = {value.id: value.rank for value in original}
+        for replacement in plan.rebalance[:stop]:
+            ranks[replacement.task_id] = replacement.new_rank
+        ordered = sorted(original, key=lambda value: ranks[value.id])
+        assert [value.id for value in ordered] == [value.id for value in original]
+        assert len(set(ranks.values())) == len(ranks)
+
+
 def test_anchor_must_be_in_target_scope_and_primary_cannot_anchor_itself() -> None:
     primary = task(1, 1000)
     other = task(2, 1000, stage=TaskStage.PLANNED)
@@ -200,10 +248,20 @@ def test_global_order_is_priority_ancestor_vector_own_rank_then_id() -> None:
     normal = task(6, 1, priority=TaskPriority.NORMAL)
 
     ordered = sort_tasks(
-        (normal, child_late, child_early_b, parent_early, parent_late, child_early_a)
+        tuple(
+            TaskOrderItem(STORE, value)
+            for value in (
+                normal,
+                child_late,
+                child_early_b,
+                parent_early,
+                parent_late,
+                child_early_a,
+            )
+        )
     )
 
-    assert [value.id for value in ordered] == [
+    assert [value.task.id for value in ordered] == [
         tid(1),
         tid(4),
         tid(5),
@@ -211,3 +269,22 @@ def test_global_order_is_priority_ancestor_vector_own_rank_then_id() -> None:
         tid(6),
         tid(3),
     ]
+
+
+def test_global_order_qualifies_duplicate_task_and_parent_ids_by_store() -> None:
+    local_parent = TaskOrderItem(STORE, task(1, 1000))
+    local_child = TaskOrderItem(STORE, task(2, 1000, parent=tid(1)))
+    remote_parent = TaskOrderItem(OTHER_STORE, task(1, 2000))
+    remote_child = TaskOrderItem(OTHER_STORE, task(2, 1000, parent=tid(1)))
+
+    first = sort_tasks((remote_child, local_child, remote_parent, local_parent))
+    second = sort_tasks(tuple(reversed((remote_child, local_child, remote_parent, local_parent))))
+
+    expected = [
+        (STORE, tid(1)),
+        (OTHER_STORE, tid(1)),
+        (STORE, tid(2)),
+        (OTHER_STORE, tid(2)),
+    ]
+    assert [(value.store_id, value.task.id) for value in first] == expected
+    assert [(value.store_id, value.task.id) for value in second] == expected

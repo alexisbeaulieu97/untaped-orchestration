@@ -4,8 +4,13 @@ from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 
-from untaped_orchestration.domain.graph import DecisionState, GraphState, decision_state
-from untaped_orchestration.domain.ids import DecisionId, TaskId
+from untaped_orchestration.domain.graph import (
+    DecisionRef,
+    DecisionState,
+    GraphState,
+    decision_state,
+)
+from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import ActiveTask, CurationConfig, TaskPriority, TaskStage
 from untaped_orchestration.domain.time import (
     CalendarDate,
@@ -22,6 +27,7 @@ class CurationKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CurationEntry:
+    store_id: StoreId
     kind: CurationKind
     item_id: TaskId | DecisionId
     due_on: CalendarDate
@@ -71,7 +77,7 @@ def curation_queue(
         due_on = _task_due_on(task_node.task, timezone=timezone, config=config)
         if due_on is None or due_on.as_date() > today:
             continue
-        entry = CurationEntry(CurationKind.TASK, task_node.task.id, due_on)
+        entry = CurationEntry(task_node.store_id, CurationKind.TASK, task_node.task.id, due_on)
         sortable.append(
             (
                 (
@@ -80,31 +86,34 @@ def curation_queue(
                     _PRIORITY_ORDER[task_node.task.priority],
                     task_node.task.rank,
                     task_node.task.id.root,
+                    task_node.store_id.root,
                 ),
                 entry,
             )
         )
     for decision_node in graph.decisions:
         if (
-            decision_state(
-                decision_node.decision.id,
-                graph,
-                store_id=decision_node.store_id,
-            )
+            decision_state(DecisionRef(decision_node.store_id, decision_node.decision.id), graph)
             is not DecisionState.ACTIVE
         ):
             continue
         due_on = decision_node.decision.review_on
         if due_on is None or due_on.as_date() > today:
             continue
-        entry = CurationEntry(CurationKind.DECISION, decision_node.decision.id, due_on)
+        entry = CurationEntry(
+            decision_node.store_id,
+            CurationKind.DECISION,
+            decision_node.decision.id,
+            due_on,
+        )
         sortable.append(
             (
                 (
                     due_on.root,
                     1,
-                    decision_node.decision.title.casefold(),
+                    decision_node.decision.title,
                     decision_node.decision.id.root,
+                    decision_node.store_id.root,
                 ),
                 entry,
             )
