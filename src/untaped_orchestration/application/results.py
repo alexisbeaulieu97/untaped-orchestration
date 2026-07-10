@@ -111,3 +111,81 @@ class FileReplacement:
 @dataclass(frozen=True, slots=True)
 class FileDeletion:
     path: PurePosixPath
+
+
+@dataclass(frozen=True, slots=True)
+class ItemRevision:
+    path: PurePosixPath
+    revision: Revision
+
+
+@dataclass(frozen=True, slots=True)
+class PathComparison:
+    path: PurePosixPath
+    matches: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MutationReceipt:
+    applied: bool
+    replayed: bool
+    canonical_applied: bool
+    views_current: bool
+    intended_paths: tuple[PurePosixPath, ...]
+    changed_paths: tuple[PurePosixPath, ...]
+    item_revisions: tuple[ItemRevision, ...]
+    store_revision: Revision
+    registry_revision: Revision | None
+
+
+@dataclass(frozen=True, slots=True)
+class CheckResult:
+    store_id: str
+    store_revision: Revision
+    registry_revision: Revision | None
+    valid: bool
+    views_current: bool
+    diagnostics: tuple[Diagnostic, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceResult:
+    receipt: MutationReceipt
+    comparisons: tuple[PathComparison, ...]
+    diagnostics: tuple[Diagnostic, ...] = ()
+
+    @property
+    def matches(self) -> bool:
+        return all(value.matches for value in self.comparisons)
+
+    @property
+    def applied(self) -> bool:
+        return self.receipt.applied
+
+    @property
+    def replayed(self) -> bool:
+        return self.receipt.replayed
+
+    @property
+    def canonical_applied(self) -> bool:
+        return self.receipt.canonical_applied
+
+    @property
+    def views_current(self) -> bool:
+        return self.receipt.views_current
+
+    @property
+    def intended_paths(self) -> tuple[PurePosixPath, ...]:
+        return self.receipt.intended_paths
+
+    @property
+    def changed_paths(self) -> tuple[PurePosixPath, ...]:
+        return self.receipt.changed_paths
+
+    @property
+    def store_revision(self) -> Revision:
+        return self.receipt.store_revision
+
+    @property
+    def registry_revision(self) -> Revision | None:
+        return self.receipt.registry_revision

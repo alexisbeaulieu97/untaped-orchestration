@@ -82,6 +82,38 @@ def location_from_root(root: Path) -> StoreLocation:
     return StoreLocation(root=absolute, real_root=real_root)
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def prepare_store_root(root: Path) -> StoreLocation:
+    """Safely create only ``.untaped/orchestration`` below an existing target."""
+    absolute = _absolute_without_resolving(root)
+    if absolute.name != "orchestration" or absolute.parent.name != ".untaped":
+        raise PathSafetyError(absolute, "init root must end in .untaped/orchestration")
+    repository = absolute.parent.parent
+    try:
+        repository.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise StoreNotFoundError(f"init target does not exist: {repository}") from error
+    if not repository.is_dir():
+        raise PathSafetyError(repository, "init target must be a directory")
+
+    for directory in (absolute.parent, absolute):
+        if directory.exists() or directory.is_symlink():
+            if directory.is_symlink() or not directory.is_dir():
+                raise PathSafetyError(directory, "store root chain must contain real directories")
+        else:
+            directory.mkdir()
+            _fsync_directory(directory.parent)
+    return location_from_root(absolute)
+
+
 def _validate_location(location: StoreLocation) -> None:
     try:
         resolved = location.root.resolve(strict=True)
@@ -255,6 +287,41 @@ def safe_raw_path(location: StoreLocation, relative_path: PurePosixPath) -> Path
     if not _is_regular_nonsymlink(absolute):
         raise PathSafetyError(relative_path, "raw recovery requires a regular nonsymlink file")
     return absolute
+
+
+def safe_read_path(location: StoreLocation, relative_path: PurePosixPath) -> Path:
+    _validate_location(location)
+    _assert_relative(relative_path)
+    absolute = _walk_existing_components(location.real_root, relative_path)
+    if not _is_regular_nonsymlink(absolute):
+        raise FileNotFoundError(relative_path.as_posix())
+    return absolute
+
+
+def store_file_paths(location: StoreLocation) -> tuple[PurePosixPath, ...]:
+    _validate_location(location)
+    paths: list[PurePosixPath] = []
+    pending = [location.real_root]
+    while pending:
+        directory = pending.pop()
+        for entry in sorted(
+            directory.iterdir(), key=lambda value: (value.name.casefold(), value.name)
+        ):
+            relative = PurePosixPath(entry.relative_to(location.real_root).as_posix())
+            if entry.is_symlink():
+                raise PathSafetyError(
+                    relative, "symlinks below the resolved store root are forbidden"
+                )
+            if entry.is_dir():
+                pending.append(entry)
+            elif entry.is_file():
+                paths.append(relative)
+            else:
+                raise PathSafetyError(
+                    relative, "store entries must be regular files or directories"
+                )
+    reject_casefold_path_aliases(paths)
+    return tuple(sorted(paths, key=lambda value: value.as_posix()))
 
 
 def _is_writable_canonical_path(relative_path: PurePosixPath) -> bool:

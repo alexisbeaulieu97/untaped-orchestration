@@ -28,8 +28,11 @@ from untaped_orchestration.application.results import (
 from untaped_orchestration.application.results import (
     StoreSnapshot as StoreSnapshot,
 )
+from untaped_orchestration.domain.canonical import CanonicalItem
+from untaped_orchestration.domain.models import Registry, StoreConfig
 
 __all__ = [
+    "CanonicalFormatter",
     "Clock",
     "FileDeletion",
     "FileReplacement",
@@ -62,8 +65,14 @@ class StoreReader(Protocol):
 
     def read_raw(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord: ...
 
+    def read_file(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord: ...
+
+    def list_files(self, location: StoreLocation) -> tuple[PurePosixPath, ...]: ...
+
 
 class StoreWriter(Protocol):
+    def prepare(self, root: Path) -> StoreLocation: ...
+
     def replace(self, location: StoreLocation, change: FileReplacement) -> None: ...
 
     def delete(self, location: StoreLocation, change: FileDeletion) -> None: ...
@@ -80,3 +89,11 @@ class LockManager(Protocol):
 
 class ViewRenderer(Protocol):
     def expected(self, snapshot: StoreSnapshot) -> Mapping[PurePosixPath, bytes]: ...
+
+
+class CanonicalFormatter(Protocol):
+    def store_bytes(self, config: StoreConfig) -> bytes: ...
+
+    def registry_bytes(self, registry: Registry) -> bytes: ...
+
+    def item_bytes(self, metadata: CanonicalItem, body: bytes) -> bytes: ...

@@ -9,6 +9,7 @@ from typing import BinaryIO, cast
 import tomli_w
 from pydantic import TypeAdapter, ValidationError
 
+from untaped_orchestration.application.ports import CanonicalFormatter
 from untaped_orchestration.domain.canonical import (
     CanonicalItem,
     CanonicalTable,
@@ -636,3 +637,25 @@ class RegistryCodec:
                 hint="Refuse the rewrite and report an internal serialization defect.",
             )
         return raw
+
+
+class CanonicalStoreFormatter(CanonicalFormatter):
+    def __init__(
+        self,
+        *,
+        items: ItemCodec | None = None,
+        stores: StoreConfigCodec | None = None,
+        registries: RegistryCodec | None = None,
+    ) -> None:
+        self._items = items or ItemCodec()
+        self._stores = stores or StoreConfigCodec()
+        self._registries = registries or RegistryCodec()
+
+    def store_bytes(self, config: StoreConfig) -> bytes:
+        return self._stores.canonical_bytes(config)
+
+    def registry_bytes(self, registry: Registry) -> bytes:
+        return self._registries.canonical_bytes(registry)
+
+    def item_bytes(self, metadata: CanonicalItem, body: bytes) -> bytes:
+        return self._items.canonical_bytes(ItemDocument(metadata=metadata, body=body, original=b""))

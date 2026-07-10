@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 
 from untaped_orchestration.application.ports import (
+    CanonicalFormatter,
     FileDeletion,
     FileReplacement,
     LoadedRecord,
@@ -13,10 +14,13 @@ from untaped_orchestration.application.ports import (
     StoreSnapshot,
     StoreWriter,
 )
+from untaped_orchestration.domain.canonical import CanonicalItem
 from untaped_orchestration.domain.diagnostics import Diagnostic, sort_diagnostics
+from untaped_orchestration.domain.models import Registry, StoreConfig
 from untaped_orchestration.infrastructure.codec import (
     CodecError,
     ItemCodec,
+    ItemDocument,
     RegistryCodec,
     StoreConfigCodec,
 )
@@ -26,14 +30,17 @@ from untaped_orchestration.infrastructure.filesystem import (
     canonical_input_paths,
     discover_location,
     file_revision,
+    prepare_store_root,
     safe_delete_path,
     safe_raw_path,
+    safe_read_path,
     safe_write_path,
+    store_file_paths,
     store_revision_from_file_revisions,
 )
 
 
-class FilesystemStoreRepository(StoreReader, StoreWriter):
+class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
     def __init__(
         self,
         *,
@@ -154,6 +161,21 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
             content=raw,
         )
 
+    def read_file(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord:
+        raw = safe_read_path(location, relative_path).read_bytes()
+        return RawRecord(
+            path=relative_path,
+            revision=file_revision(raw),
+            size=len(raw),
+            content=raw,
+        )
+
+    def list_files(self, location: StoreLocation) -> tuple[PurePosixPath, ...]:
+        return store_file_paths(location)
+
+    def prepare(self, root: Path) -> StoreLocation:
+        return prepare_store_root(root)
+
     def replace(self, location: StoreLocation, change: FileReplacement) -> None:
         target = safe_write_path(location, change.path)
         self._atomic.replace_bytes(target, change.content, root=location.real_root)
@@ -161,6 +183,15 @@ class FilesystemStoreRepository(StoreReader, StoreWriter):
     def delete(self, location: StoreLocation, change: FileDeletion) -> None:
         target = safe_delete_path(location, change.path)
         self._atomic.delete_file(target)
+
+    def store_bytes(self, config: StoreConfig) -> bytes:
+        return self._stores.canonical_bytes(config)
+
+    def registry_bytes(self, registry: Registry) -> bytes:
+        return self._registries.canonical_bytes(registry)
+
+    def item_bytes(self, metadata: CanonicalItem, body: bytes) -> bytes:
+        return self._items.canonical_bytes(ItemDocument(metadata=metadata, body=body, original=b""))
 
 
 def _is_item_path(relative_path: PurePosixPath) -> bool:
