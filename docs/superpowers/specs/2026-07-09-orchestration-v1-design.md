@@ -163,9 +163,10 @@ max_rows_per_section = 10
 max_total_bytes = 32768
 ```
 
-`init` defaults to a private task-capable store. `init --decisions-only`
-creates a private decision-only store; `init --public` implies decision-only
-and creates the fleet's normal public store. `visibility = "public"` requires
+`init --store-id ID` defaults to a private task-capable store.
+`init --store-id ID --decisions-only` creates a private decision-only store;
+`--public` implies decision-only and creates the fleet's normal public store.
+`visibility = "public"` requires
 `capabilities.active_tasks = false`. `check` rejects any active/archive task in
 a decision-only or public store, including after a hand-edited policy change.
 V1 deliberately has no public-task escape hatch: unfinished tasks remain
@@ -217,6 +218,12 @@ noncanonical and are removed by `fmt --write`, matching item metadata.
 - Store IDs: `sto_` plus 32 lowercase UUIDv7 hexadecimal characters.
 - Task IDs: `tsk_` plus 32 lowercase UUIDv7 hexadecimal characters.
 - Decision IDs: `dec_` plus 32 lowercase UUIDv7 hexadecimal characters.
+
+`id new store|task|decision` is a read-only allocator that requires no store
+and returns one typed UUIDv7 ID. `init --store-id ID`, `task create --id ID`,
+and `decision create --id ID` require that caller-stable ID; mutation commands
+never generate an unreported identity internally. Allocating another unused ID
+after acknowledgement loss is harmless, but retrying a create uses the same ID.
 
 ```text
 tsk_<id-body>-<creation-slug>.md
@@ -358,8 +365,9 @@ only where semantics require them.
 | `review_on` | Optional exact `YYYY-MM-DD` |
 | `waiting_on` | Sorted unique person/team slugs; maximum 8 |
 
-`task create` defaults to `stage = "inbox"`, `priority = "normal"`, and the
-last rank in its top-level inbox scope. `waiting_on` is an explicit manual
+`task create --id ID` defaults to `stage = "inbox"`,
+`priority = "normal"`, and the last rank in its top-level inbox scope.
+`waiting_on` is an explicit manual
 blocker: a nonempty list removes the task from `next` and makes entry into
 `in-progress` or delivered closure fail until cleared. This makes queries such
 as `list --waiting-on alexis` authoritative rather than a tag convention.
@@ -607,11 +615,12 @@ real store sizes justify it.
 
 | Command | Purpose |
 |---|---|
+| `id new store|task|decision` | Allocate one caller-stable UUIDv7 ID without a store |
 | `brief` | Bounded agent bootstrap |
 | `list` | Filter active tasks/decisions, including `--waiting-on` |
 | `show ID` | Parsed item plus revision |
-| `show ID --raw` | Filename-first raw bytes for malformed recovery |
-| `inspect PATH --raw` | Raw malformed file without usable ID |
+| `show ID --raw` | Filename-first malformed-file recovery bytes |
+| `inspect PATH --raw` | Path-targeted recovery when no usable ID exists |
 | `search QUERY` | Streaming metadata/body search |
 | `trace ID` | Link/evidence traversal |
 | `next` | Globally safe ready leaves |
@@ -642,8 +651,10 @@ repair frontmatter PATH
 repair duplicate ID
 ```
 
-There is no generic item update. Every canonical mutation requires the current
-primary item revision. Move and transition additionally require the store
+There is no generic item update. Every mutation of an existing item requires
+its current primary revision. Create requires a caller-stable absent ID plus
+the current store revision; init requires a caller-stable store ID and an empty
+or accepted partial target. Move and transition additionally require the store
 revision and assert the current child-owned parent, including explicit `none`,
 so every rank scope and relative anchor is guarded. A superseded task close
 guards predecessor and successor revisions; multi-predecessor decision
@@ -655,6 +666,17 @@ human may explicitly use it.
 Mutations are noninteractive, with required notes, outcomes, dates, revisions,
 and confirmations provided as flags. Repair and import default to dry-run and
 write only with `--apply`.
+
+Create acknowledgement recovery is ID-based. If the requested task/decision ID
+does not exist, create writes it once. If that active ID already exists and all
+caller-owned creation inputs/body match, create returns the existing item with
+`replayed=true` instead of creating a duplicate; any mismatch or archived task
+state is a conflict. Generated fields such as `created_at` and initial rank are
+reported from the existing record on replay. This exact existing-ID replay
+check is the only create path allowed to precede an otherwise-stale store
+revision conflict. For other stale-guard mutations,
+the caller rereads current state/revisions before choosing whether to retry;
+the tool never treats an unprovable stale revision as successful.
 
 Typed ownership:
 
@@ -711,6 +733,11 @@ SDK's dotted paths.
 
 Expected domain failures remain structured JSON on stdout under JSON mode.
 Unexpected traces appear only with `--debug`.
+
+Successful mutation data includes `applied`, `replayed`, affected relative
+paths, and resulting item/store revisions. `replayed=true` means the tool proved
+that the caller-stable operation had already reached its accepted final state;
+it is never inferred from a merely stale revision.
 
 ### 10.5 `brief` hard bounds
 
@@ -787,6 +814,10 @@ atomic rename, and parent-directory fsync under one store lock. Multi-file
 operations validate their complete intended result before the first write and
 use the fault-state protocol below.
 
+- Init locks the target root, writes matching `store.toml` as its first
+  canonical anchor, then `registry.toml`, instructions, and applicable views.
+  Rerunning with the same store ID/config fills only missing expected files,
+  accepts byte-identical completed files, and refuses every divergence.
 - Close writes the complete archive destination before deleting the active
   source. Superseded close writes the successor link first. An interruption
   can leave a semantically matched active/archive pair, never a missing task.
@@ -802,11 +833,13 @@ use the fault-state protocol below.
 
 | Operation | Only accepted intermediate state | Detection and recovery |
 |---|---|---|
+| Init | No anchor plus ignored lock/temp only; matching `store.toml` plus a prefix of exact scaffold; or complete scaffold before acknowledgement | Before the anchor, retry removes only its own validated temporary. `check` reports missing scaffold after the anchor; same-ID/config retry fills the exact remainder or returns complete state with `replayed=true`. Divergence refuses recovery. |
+| Task/decision create | The caller-stable ID is absent or one matching active item is fully durable | Retry with the same ID/inputs returns the existing item and `replayed=true`; mismatch or archived/inactive state conflicts. Fault injection includes final fsync before stdout. |
 | Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff, reread item/store revisions, rerun. Final target state is an idempotent success. |
-| Ordinary close | Complete archive exists while semantically matching active source remains | `check` reports the pair; guarded retry or `repair duplicate` removes only the matched active source. |
+| Ordinary close | Complete archive exists with matching active source, or the active source is gone and the archive is final but acknowledgement was lost | `check` reports a duplicate pair; guarded retry/`repair duplicate` removes only a match. Retry of the same outcome/note against the final archive returns it with `replayed=true`; divergent closure conflicts. |
 | Superseded close | Exact successor link may exist before the close pair | `check` reports a successor pointing at an active predecessor; reread both revisions and retry the same successor/outcome. |
-| Decision supersede | One exact linked successor may exist before pin replacement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement. |
-| Decision retire | Retirement fields may exist before pin removal | Inactive pin is reported; same-note retry finishes removal. |
+| Decision supersede | One exact linked successor may exist before pin replacement, or successor/pins are final before acknowledgement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement, or returns the final state with `replayed=true`. |
+| Decision retire | Retirement fields may exist before pin removal, or retirement/pins are final before acknowledgement | Inactive pin is reported; same-note retry finishes removal or returns the final state with `replayed=true`. |
 | Import | Exact subset of the external manifest may exist | Generic `check` cannot infer intent; rerun the same manifest/`--if-clean`, which reconstructs the guarded base and writes the remainder. |
 | View render | Any subset of derived views may be stale after canonical success | `canonical_applied=true`, `views_current=false`; `render --write` replaces all applicable views deterministically. |
 
@@ -815,8 +848,9 @@ and current revisions in structured output whenever the process survives to
 report them. Recovery never treats a syntactically valid but divergent file as
 an accepted phase.
 
-`check` reports duplicate active/archive copies, incomplete lifecycle phases,
-inactive pins, invalid/duplicate ranks, orphan temporaries, and stale views.
+`check` reports partial init scaffold, duplicate active/archive copies,
+incomplete lifecycle phases, inactive pins, invalid/duplicate ranks, orphan
+temporaries, and stale views.
 It cannot infer an incomplete external import manifest from otherwise valid
 records. `repair duplicate
 ID --if-active-revision HASH --if-archive-revision HASH --apply` removes only
@@ -833,11 +867,45 @@ This documentation is not a Git dependency in the tool.
 
 ### 12.3 Raw front-matter recovery
 
-- `show ID --raw` finds a safe filename prefix and returns exact bytes/path and
-  raw revision despite invalid TOML.
-- `inspect PATH --raw` handles broken IDs/filenames.
+- `show ID --raw` finds a safe filename prefix despite invalid TOML;
+  ambiguous matching filenames are an error that names paths but emits no file
+  content. `inspect PATH --raw` handles broken IDs/filenames directly.
 - Raw inspect/repair paths must be regular nonsymlink files under the selected
   store's `tasks/`, `decisions/`, or `archive/tasks/` roots.
+
+The command-specific `--raw` flag selects recovery mode and takes precedence
+over the global default table format. Its exact output matrix is:
+
+| Invocation | Stdout | Stderr |
+|---|---|---|
+| `--raw` with no explicit format, or `--raw --format raw` | Exact file bytes, with no decoding, framing, or added newline | One compact metadata JSON line, then newline |
+| `--raw --format json` | Standard orchestration JSON envelope with base64 content in `data` | Empty on success |
+| `--raw --format table|pipe` | No content; exit 2 | Usage diagnostic |
+
+`--columns` is invalid in recovery mode. Binary-mode metadata is exactly this
+key order, with a POSIX path relative to the store root:
+
+```json
+{"schema":"untaped.orchestration.raw-meta/v1","path":"tasks/tsk_...md","revision":"sha256:...","size":123}
+```
+
+JSON recovery sets `complete=true`, `truncated=false`, and uses one data object:
+
+```json
+{
+  "path": "tasks/tsk_...md",
+  "revision": "sha256:...",
+  "size": 123,
+  "encoding": "base64",
+  "content": "KysrCg=="
+}
+```
+
+`content` is RFC 4648 standard padded base64 of the exact file bytes, including
+invalid UTF-8. On a binary-mode failure stdout is empty and stderr contains the
+normal diagnostic; JSON failures use the structured stdout error contract.
+Binary recovery success suppresses unrelated nonfatal warnings so stderr is
+exactly the one metadata line; JSON diagnostics remain inside the envelope.
 - `repair frontmatter PATH --frontmatter-file FILE --if-revision HASH` parses
   and validates replacement TOML, preserves body bytes when the existing
   delimiter split is provable, shows a dry-run diff, writes only with
@@ -915,14 +983,15 @@ The packaged skill instructs agents to:
 
 1. Run `brief --format json`.
 2. Use returned IDs instead of scanning files.
-3. Load only needed bodies with `show`.
-4. Pass revisions on every mutation.
-5. Never use `--force-current`.
-6. Never read/edit generated views.
-7. Run `check` after hand edits/recovery.
-8. Verify external evidence before recording it.
-9. Never place tasks in a public store.
-10. Stop readiness/delivery work on incomplete federation.
+3. Allocate one ID before init/create and reuse it through every retry.
+4. Load only needed bodies with `show`.
+5. Pass revisions on every guarded mutation.
+6. Never use `--force-current`.
+7. Never read/edit generated views.
+8. Run `check` after hand edits/recovery.
+9. Verify external evidence before recording it.
+10. Never place tasks in a public store.
+11. Stop readiness/delivery work on incomplete federation.
 
 ## 15. Packaging and repository contract
 
@@ -1015,7 +1084,7 @@ compatible range may be considered only after the schema and CLI stabilize.
 | Repository/store | Visibility/capability | Initial decision content | Gate/source |
 |---|---|---:|---|
 | `untaped-dev` | Private, active tasks | Cross-cutting decisions plus tasks/archive | Adopt last; frozen hub sources include `5837a5258392205ba56b2e22b33fa52d04946caa` |
-| `untaped` | Public, decision-only | 6 current core decisions | SDK 3.1.0 commit `80bb8411cd0017f3e0cde818656aaf6fd0233368` |
+| `untaped` | Public, decision-only | 7 current core decisions | SDK 3.1.0 commit `80bb8411cd0017f3e0cde818656aaf6fd0233368`; includes the tool-version ruling |
 | `untaped-awx` | Public, decision-only | Empty initial store | Verified main |
 | `untaped-ansible` | Public, decision-only | Empty initial store | Verified main |
 | `untaped-github` | Public, decision-only | 5 decisions | Frozen source `045fed8bf1c240b8a93bd7a25389cfbe38f0bc8d` |
@@ -1063,6 +1132,7 @@ removed through a separately reviewed change.
 ### 17.1 Schema/domain tests
 
 - IDs, filenames, timestamps, dates, bounds, unknown fields, duplicate keys.
+- Caller-stable ID allocation and create replay/conflict behavior.
 - Byte preservation through format and repair.
 - Tag/link/evidence ordering and canonicalization.
 - Rank operations/rebalance and signed-64-bit boundaries.
@@ -1074,6 +1144,7 @@ removed through a separately reviewed change.
 - Relation locality/cardinality and all individual/combined graph cycles.
 - Readiness for every archived dependency outcome.
 - Diagnostic codes/paths/order and every output format golden contract.
+- Recovery byte mode, metadata framing, JSON base64, and invalid-UTF-8 goldens.
 - Exact SDK Pipe v1 envelope, repeatable columns, and version-only stdout.
 - Brief and query limits/truncation.
 - Public/private capability enforcement.
@@ -1085,6 +1156,8 @@ removed through a separately reviewed change.
 - Registry cycles, lock contention/timeouts, header-only scans.
 - Raw lookup with invalid TOML/ID mismatch and lazy empty directories.
 - Atomic-write fault injection at file replacement boundaries.
+- Init at every scaffold boundary and acknowledgement loss after final fsync.
+- Create acknowledgement loss and close after active deletion/before stdout.
 - Interrupted order-preserving rebalance before move/transition final replace,
   including a primary task already in the target scope.
 - Interrupted close duplicate detection/safe repair.
