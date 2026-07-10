@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
@@ -31,6 +32,13 @@ class CurationEntry:
     kind: CurationKind
     item_id: TaskId | DecisionId
     due_on: CalendarDate
+
+
+@dataclass(frozen=True, slots=True)
+class StoreCurationContext:
+    store_id: StoreId
+    timezone: IanaTimezone
+    config: CurationConfig
 
 
 _PRIORITY_ORDER = {
@@ -66,15 +74,31 @@ def curation_queue(
     graph: GraphState,
     *,
     now: UtcTimestamp,
-    timezone: IanaTimezone,
-    config: CurationConfig,
+    contexts: Sequence[StoreCurationContext],
 ) -> tuple[CurationEntry, ...]:
-    today = local_calendar_date(now, timezone).as_date()
+    grouped: dict[StoreId, list[StoreCurationContext]] = {}
+    for context in contexts:
+        grouped.setdefault(context.store_id, []).append(context)
+    duplicates = sorted(store_id.root for store_id, values in grouped.items() if len(values) > 1)
+    if duplicates:
+        raise ValueError(f"duplicate curation contexts: {', '.join(duplicates)}")
+    required_stores = {node.store_id for node in graph.tasks if isinstance(node.task, ActiveTask)}
+    required_stores.update(node.store_id for node in graph.decisions)
+    missing = sorted(store_id.root for store_id in required_stores if store_id not in grouped)
+    if missing:
+        raise ValueError(f"missing curation contexts: {', '.join(missing)}")
+    by_store = {store_id: values[0] for store_id, values in grouped.items()}
     sortable: list[tuple[tuple[object, ...], CurationEntry]] = []
     for task_node in graph.tasks:
         if not isinstance(task_node.task, ActiveTask):
             continue
-        due_on = _task_due_on(task_node.task, timezone=timezone, config=config)
+        context = by_store[task_node.store_id]
+        today = local_calendar_date(now, context.timezone).as_date()
+        due_on = _task_due_on(
+            task_node.task,
+            timezone=context.timezone,
+            config=context.config,
+        )
         if due_on is None or due_on.as_date() > today:
             continue
         entry = CurationEntry(task_node.store_id, CurationKind.TASK, task_node.task.id, due_on)
@@ -97,6 +121,8 @@ def curation_queue(
             is not DecisionState.ACTIVE
         ):
             continue
+        context = by_store[decision_node.store_id]
+        today = local_calendar_date(now, context.timezone).as_date()
         due_on = decision_node.decision.review_on
         if due_on is None or due_on.as_date() > today:
             continue

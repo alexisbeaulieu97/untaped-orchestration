@@ -77,23 +77,44 @@ class ReadinessBlockerKind(StrEnum):
     FEDERATION_INCOMPLETE = "federation-incomplete"
 
 
+_BLOCKER_ORDER = {
+    ReadinessBlockerKind.WAITING_PARTY: 0,
+    ReadinessBlockerKind.DEPENDENCY_INVALID: 1,
+    ReadinessBlockerKind.DEPENDENCY_UNKNOWN: 2,
+    ReadinessBlockerKind.DEPENDENCY_ACTIVE: 3,
+    ReadinessBlockerKind.DEPENDENCY_UNSATISFIED: 4,
+    ReadinessBlockerKind.DESCENDANT_ACTIVE: 5,
+    ReadinessBlockerKind.DESCENDANT_UNDELIVERED: 6,
+    ReadinessBlockerKind.FEDERATION_INCOMPLETE: 7,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ReadinessBlocker:
     kind: ReadinessBlockerKind
     related_task: TaskRef | None = None
     waiting_party: Slug | None = None
+    missing_store_ids: tuple[StoreId, ...] = ()
 
     def __post_init__(self) -> None:
         has_task = self.related_task is not None
         has_party = self.waiting_party is not None
+        has_missing_stores = bool(self.missing_store_ids)
         if self.kind is ReadinessBlockerKind.WAITING_PARTY:
-            if not has_party or has_task:
+            if not has_party or has_task or has_missing_stores:
                 raise ValueError("waiting-party blockers require exactly one waiting party")
         elif self.kind is ReadinessBlockerKind.FEDERATION_INCOMPLETE:
             if has_task or has_party:
                 raise ValueError("federation blockers do not identify an item")
+            if not has_missing_stores:
+                raise ValueError("federation blockers require missing store IDs")
+            roots = [value.root for value in self.missing_store_ids]
+            if roots != sorted(set(roots)):
+                raise ValueError("missing store IDs must be sorted unique values")
         elif not has_task or has_party:
-            raise ValueError("task blockers require exactly one related task ID")
+            raise ValueError("task blockers require exactly one related task reference")
+        elif has_missing_stores:
+            raise ValueError("only federation blockers carry missing store IDs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +251,7 @@ def _descendants(node: TaskNode, graph: GraphState) -> tuple[TaskNode, ...]:
     return tuple(sorted(descendants, key=lambda value: (value.task.id.root, value.path)))
 
 
-def _blocker_sort_key(value: ReadinessBlocker) -> tuple[str, str]:
+def _blocker_sort_key(value: ReadinessBlocker) -> tuple[int, str]:
     identity = (
         f"{value.related_task.store_id.root}/{value.related_task.task_id.root}"
         if value.related_task is not None
@@ -238,7 +259,7 @@ def _blocker_sort_key(value: ReadinessBlocker) -> tuple[str, str]:
         if value.waiting_party is not None
         else ""
     )
-    return (value.kind.value, identity)
+    return (_BLOCKER_ORDER[value.kind], identity)
 
 
 def _readiness_for_node(node: TaskNode, graph: GraphState) -> Readiness:
@@ -298,7 +319,15 @@ def _readiness_for_node(node: TaskNode, graph: GraphState) -> Readiness:
                 )
             )
     if not graph.completeness.complete:
-        blockers.append(ReadinessBlocker(ReadinessBlockerKind.FEDERATION_INCOMPLETE))
+        missing_store_ids = tuple(
+            sorted(set(graph.completeness.missing_store_ids), key=lambda value: value.root)
+        )
+        blockers.append(
+            ReadinessBlocker(
+                ReadinessBlockerKind.FEDERATION_INCOMPLETE,
+                missing_store_ids=missing_store_ids,
+            )
+        )
     unique = {(value.kind, value.related_task, value.waiting_party): value for value in blockers}
     return Readiness(task, tuple(sorted(unique.values(), key=_blocker_sort_key)))
 
@@ -316,47 +345,73 @@ def readiness(task: TaskRef, graph: GraphState) -> Readiness:
     return _readiness_for_node(matches[0], graph)
 
 
-def _cyclic_components(edges: dict[ItemKey, set[ItemKey]]) -> tuple[frozenset[ItemKey], ...]:
-    next_index = 0
-    indices: dict[ItemKey, int] = {}
-    lowlinks: dict[ItemKey, int] = {}
-    stack: list[ItemKey] = []
-    on_stack: set[ItemKey] = set()
+def _finish_order(edges: dict[ItemKey, set[ItemKey]], nodes: set[ItemKey]) -> list[ItemKey]:
+    visited: set[ItemKey] = set()
+    finished: list[ItemKey] = []
+    for start in sorted(nodes):
+        if start in visited:
+            continue
+        pending: list[tuple[ItemKey, bool]] = [(start, False)]
+        while pending:
+            key, expanded = pending.pop()
+            if expanded:
+                finished.append(key)
+                continue
+            if key in visited:
+                continue
+            visited.add(key)
+            pending.append((key, True))
+            pending.extend(
+                (target, False)
+                for target in reversed(sorted(edges.get(key, ())))
+                if target not in visited
+            )
+    return finished
+
+
+def _reverse_edges(
+    edges: dict[ItemKey, set[ItemKey]], nodes: set[ItemKey]
+) -> dict[ItemKey, set[ItemKey]]:
+    reverse_edges: dict[ItemKey, set[ItemKey]] = {key: set() for key in nodes}
+    for source, targets in edges.items():
+        for target in targets:
+            reverse_edges[target].add(source)
+    return reverse_edges
+
+
+def _strong_components(
+    finished: list[ItemKey], reverse_edges: dict[ItemKey, set[ItemKey]]
+) -> list[frozenset[ItemKey]]:
     components: list[frozenset[ItemKey]] = []
-
-    def connect(key: ItemKey) -> None:
-        nonlocal next_index
-        indices[key] = next_index
-        lowlinks[key] = next_index
-        next_index += 1
-        stack.append(key)
-        on_stack.add(key)
-
-        for target in sorted(edges.get(key, ())):
-            if target not in indices:
-                connect(target)
-                lowlinks[key] = min(lowlinks[key], lowlinks[target])
-            elif target in on_stack:
-                lowlinks[key] = min(lowlinks[key], indices[target])
-
-        if lowlinks[key] != indices[key]:
-            return
+    assigned: set[ItemKey] = set()
+    for start in reversed(finished):
+        if start in assigned:
+            continue
         component: set[ItemKey] = set()
-        while True:
-            member = stack.pop()
-            on_stack.remove(member)
-            component.add(member)
-            if member == key:
-                break
-        if len(component) > 1 or key in edges.get(key, ()):
-            components.append(frozenset(component))
+        pending_nodes = [start]
+        assigned.add(start)
+        while pending_nodes:
+            key = pending_nodes.pop()
+            component.add(key)
+            for source in reversed(sorted(reverse_edges[key])):
+                if source not in assigned:
+                    assigned.add(source)
+                    pending_nodes.append(source)
+        components.append(frozenset(component))
+    return components
 
+
+def _cyclic_components(edges: dict[ItemKey, set[ItemKey]]) -> tuple[frozenset[ItemKey], ...]:
     nodes = set(edges)
     nodes.update(target for targets in edges.values() for target in targets)
-    for key in sorted(nodes):
-        if key not in indices:
-            connect(key)
-    return tuple(sorted(components, key=lambda value: tuple(sorted(value))))
+    finished = _finish_order(edges, nodes)
+    components = _strong_components(finished, _reverse_edges(edges, nodes))
+    cyclic = (
+        frozenset(component)
+        for component in components
+        if len(component) > 1 or (member := next(iter(component))) in edges.get(member, ())
+    )
+    return tuple(sorted(cyclic, key=lambda value: tuple(sorted(value))))
 
 
 def _cycle_diagnostic(

@@ -288,3 +288,16 @@ def test_global_order_qualifies_duplicate_task_and_parent_ids_by_store() -> None
     ]
     assert [(value.store_id, value.task.id) for value in first] == expected
     assert [(value.store_id, value.task.id) for value in second] == expected
+
+
+def test_global_order_uses_store_id_only_after_identical_task_id_tie() -> None:
+    value = task(1, 1000)
+    local = TaskOrderItem(STORE, value)
+    remote = TaskOrderItem(OTHER_STORE, value)
+
+    ordered = sort_tasks((remote, local))
+
+    assert [(item.task.id, item.store_id) for item in ordered] == [
+        (tid(1), STORE),
+        (tid(1), OTHER_STORE),
+    ]

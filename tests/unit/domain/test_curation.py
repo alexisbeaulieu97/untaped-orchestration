@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from untaped_orchestration.domain.curation import CurationKind, curation_queue
+import pytest
+
+from untaped_orchestration.domain.curation import (
+    CurationKind,
+    StoreCurationContext,
+    curation_queue,
+)
 from untaped_orchestration.domain.graph import (
     DecisionNode,
     GraphCompleteness,
@@ -21,6 +27,15 @@ from untaped_orchestration.domain.time import CalendarDate, IanaTimezone, UtcTim
 
 STORE = StoreId("sto_019f0000000070008000000000000000")
 CONFIG = CurationConfig(inbox_review_days=7, in_progress_review_days=14)
+
+
+def context(
+    store_id: StoreId = STORE,
+    *,
+    timezone: str = "UTC",
+    config: CurationConfig = CONFIG,
+) -> StoreCurationContext:
+    return StoreCurationContext(store_id, IanaTimezone(timezone), config)
 
 
 def tid(number: int) -> TaskId:
@@ -108,14 +123,12 @@ def test_timezone_boundary_drives_implicit_inbox_due_date_from_local_creation_da
     montreal = curation_queue(
         state((value,)),
         now=UtcTimestamp("2026-07-08T03:59:59.000Z"),
-        timezone=IanaTimezone("America/Montreal"),
-        config=CONFIG,
+        contexts=(context(timezone="America/Montreal"),),
     )
     utc = curation_queue(
         state((value,)),
         now=UtcTimestamp("2026-07-08T03:59:59.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(context(),),
     )
 
     assert [entry.due_on.root for entry in montreal] == ["2026-07-07"]
@@ -129,8 +142,7 @@ def test_reviewed_at_replaces_creation_or_start_baseline_for_implicit_stages() -
     queue = curation_queue(
         state((inbox, progress)),
         now=UtcTimestamp("2026-07-15T23:00:00.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(context(),),
     )
 
     assert [(entry.item_id.root, entry.due_on.root) for entry in queue] == [
@@ -151,8 +163,7 @@ def test_backlog_planned_and_decisions_are_due_only_with_explicit_review_on() ->
     queue = curation_queue(
         state(values, decisions),
         now=UtcTimestamp("2026-07-10T23:59:59.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(context(),),
     )
 
     assert [entry.item_id.root for entry in queue] == [tid(3).root, tid(4).root, did(2).root]
@@ -163,8 +174,7 @@ def test_explicit_review_on_overrides_implicit_stage_due_date() -> None:
     queue = curation_queue(
         state((value,)),
         now=UtcTimestamp("2026-07-31T23:59:59.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(context(),),
     )
     assert queue == ()
 
@@ -182,8 +192,7 @@ def test_inactive_decisions_are_not_curated_even_with_historical_review_dates() 
     queue = curation_queue(
         state(decisions=(predecessor, successor, retired)),
         now=UtcTimestamp("2026-07-10T00:00:00.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(context(),),
     )
 
     assert queue == ()
@@ -213,8 +222,10 @@ def test_decision_curation_qualifies_derived_state_by_store() -> None:
     queue = curation_queue(
         graph,
         now=UtcTimestamp("2026-07-10T00:00:00.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(
+            context(),
+            context(StoreId("sto_019f0000000070008000000000000001")),
+        ),
     )
 
     assert [entry.item_id for entry in queue] == [did(1)]
@@ -235,8 +246,7 @@ def test_duplicate_active_decision_ids_are_curated_distinctly_by_store() -> None
                 completeness=GraphCompleteness(complete=True),
             ),
             now=UtcTimestamp("2026-07-10T00:00:00.000Z"),
-            timezone=IanaTimezone("UTC"),
-            config=CONFIG,
+            contexts=(context(), context(other_store)),
         )
         return tuple(entry.store_id for entry in result)
 
@@ -270,8 +280,7 @@ def test_due_sort_is_date_task_before_decision_then_task_priority_rank_or_decisi
     queue = curation_queue(
         state(tasks, decisions),
         now=UtcTimestamp("2026-07-10T23:59:59.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(context(),),
     )
 
     assert [(entry.kind, entry.item_id.root) for entry in queue] == [
@@ -298,8 +307,7 @@ def test_curation_keeps_duplicate_item_ids_distinct_by_store_and_is_permutation_
                 completeness=GraphCompleteness(complete=True),
             ),
             now=UtcTimestamp("2026-07-10T23:59:59.000Z"),
-            timezone=IanaTimezone("UTC"),
-            config=CONFIG,
+            contexts=(context(), context(other_store)),
         )
         return tuple((entry.store_id, entry.item_id) for entry in result)
 
@@ -317,8 +325,86 @@ def test_decision_title_sort_uses_exact_value_before_id() -> None:
     queue = curation_queue(
         state(decisions=values),
         now=UtcTimestamp("2026-07-10T23:59:59.000Z"),
-        timezone=IanaTimezone("UTC"),
-        config=CONFIG,
+        contexts=(context(),),
     )
 
     assert [entry.item_id for entry in queue] == [did(2), did(1)]
+
+
+def test_each_store_uses_its_own_timezone_and_review_interval() -> None:
+    other_store = StoreId("sto_019f0000000070008000000000000001")
+    local = task(1, TaskStage.INBOX, created="2026-07-01T03:30:00.000Z")
+    remote = local.model_copy()
+    graph = GraphState(
+        tasks=(
+            TaskNode(STORE, "tasks/local.md", local),
+            TaskNode(other_store, "tasks/remote.md", remote),
+        ),
+        decisions=(),
+        completeness=GraphCompleteness(complete=True),
+    )
+    remote_config = CurationConfig(inbox_review_days=8, in_progress_review_days=20)
+
+    queue = curation_queue(
+        graph,
+        now=UtcTimestamp("2026-07-08T03:59:59.000Z"),
+        contexts=(
+            context(other_store, timezone="UTC", config=remote_config),
+            context(timezone="America/Montreal"),
+        ),
+    )
+
+    assert [(entry.store_id, entry.item_id) for entry in queue] == [(STORE, tid(1))]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_and_missing_store_contexts_fail_deterministically(reverse: bool) -> None:
+    value = state((task(1, TaskStage.INBOX),))
+    duplicate = [context(), context(timezone="America/Montreal")]
+    if reverse:
+        duplicate.reverse()
+
+    with pytest.raises(ValueError, match=f"duplicate curation contexts: {STORE.root}"):
+        curation_queue(
+            value,
+            now=UtcTimestamp("2026-07-10T00:00:00.000Z"),
+            contexts=tuple(duplicate),
+        )
+    with pytest.raises(ValueError, match=f"missing curation contexts: {STORE.root}"):
+        curation_queue(
+            value,
+            now=UtcTimestamp("2026-07-10T00:00:00.000Z"),
+            contexts=(),
+        )
+
+
+def test_global_merge_uses_due_kind_title_and_qualified_ref_ties() -> None:
+    other_store = StoreId("sto_019f0000000070008000000000000001")
+    local_task = task(1, TaskStage.PLANNED, review_on="2026-07-10")
+    remote_task = local_task.model_copy()
+    local_decision = decision(1, review_on="2026-07-10", title="Zulu")
+    remote_decision = decision(1, review_on="2026-07-10", title="Alpha")
+    graph = GraphState(
+        tasks=(
+            TaskNode(other_store, "tasks/remote.md", remote_task),
+            TaskNode(STORE, "tasks/local.md", local_task),
+        ),
+        decisions=(
+            DecisionNode(STORE, "decisions/local.md", local_decision),
+            DecisionNode(other_store, "decisions/remote.md", remote_decision),
+        ),
+        completeness=GraphCompleteness(complete=True),
+    )
+
+    queue = curation_queue(
+        graph,
+        now=UtcTimestamp("2026-07-10T23:59:59.000Z"),
+        contexts=(context(other_store), context()),
+    )
+
+    assert [(entry.kind, entry.store_id, entry.item_id) for entry in queue] == [
+        (CurationKind.TASK, STORE, tid(1)),
+        (CurationKind.TASK, other_store, tid(1)),
+        (CurationKind.DECISION, other_store, did(1)),
+        (CurationKind.DECISION, STORE, did(1)),
+    ]

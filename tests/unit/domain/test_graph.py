@@ -8,6 +8,7 @@ from untaped_orchestration.domain.graph import (
     DecisionState,
     GraphCompleteness,
     GraphState,
+    ReadinessBlocker,
     ReadinessBlockerKind,
     TaskNode,
     TaskRef,
@@ -30,6 +31,7 @@ from untaped_orchestration.domain.time import UtcTimestamp
 
 STORE = StoreId("sto_019f0000000070008000000000000000")
 OTHER_STORE = StoreId("sto_019f0000000070008000000000000001")
+THIRD_STORE = StoreId("sto_019f0000000070008000000000000002")
 NOW = UtcTimestamp("2026-07-10T01:02:03.004Z")
 
 
@@ -136,7 +138,11 @@ def graph(
     return GraphState(
         tasks=tuple(task_node(task) for task in tasks),
         decisions=tuple(decision_node(value) for value in decisions),
-        completeness=GraphCompleteness(complete=complete, known_store_ids=(STORE,)),
+        completeness=GraphCompleteness(
+            complete=complete,
+            missing_store_ids=() if complete else (OTHER_STORE,),
+            known_store_ids=(STORE,),
+        ),
     )
 
 
@@ -206,6 +212,42 @@ def test_every_disjoint_cycle_component_gets_its_own_diagnostic() -> None:
     diagnostics = validate_graph(value)
 
     assert sum(value.message == "dependency cycle detected" for value in diagnostics) == 2
+
+
+def test_one_thousand_item_valid_chain_does_not_depend_on_python_recursion_depth() -> None:
+    values = tuple(
+        active(
+            number,
+            links=(link(LinkRelation.DEPENDS_ON, tid(number + 1)),) if number < 1000 else (),
+        )
+        for number in range(1, 1001)
+    )
+
+    diagnostics = validate_graph(graph(*values))
+
+    assert not any("cycle detected" in value.message for value in diagnostics)
+
+
+def test_large_cycle_component_is_deterministic_under_permutation_without_recursion() -> None:
+    values = tuple(
+        active(
+            number,
+            links=(
+                link(
+                    LinkRelation.DEPENDS_ON,
+                    tid(number + 1 if number < 1100 else 1),
+                ),
+            ),
+        )
+        for number in range(1, 1101)
+    )
+
+    first = validate_graph(graph(*values))
+    second = validate_graph(graph(*reversed(values)))
+
+    assert first == second
+    assert sum(value.message == "dependency cycle detected" for value in first) == 1
+    assert sum(value.message == "completion-precedence cycle detected" for value in first) == 1
 
 
 def test_supersession_enforces_kind_locality_cardinality_and_per_kind_cycles() -> None:
@@ -363,6 +405,76 @@ def test_readiness_includes_waiting_parties_and_all_descendant_states() -> None:
         ReadinessBlockerKind.DESCENDANT_ACTIVE,
         ReadinessBlockerKind.DESCENDANT_UNDELIVERED,
     }
+
+
+def test_readiness_blockers_use_semantic_order_and_qualified_payloads() -> None:
+    parent = active(
+        1,
+        links=(
+            link(LinkRelation.DEPENDS_ON, tid(4)),
+            link(LinkRelation.DEPENDS_ON, tid(5)),
+            link(LinkRelation.DEPENDS_ON, tid(98), THIRD_STORE),
+            link(LinkRelation.DEPENDS_ON, tid(99)),
+        ),
+        waiting=("alexis",),
+    )
+    active_child = active(2, parent=tid(1))
+    undelivered_child = archived(3, TaskOutcome.DECLINED, parent=tid(1))
+    prerequisite = active(4)
+    unsatisfied = archived(5, TaskOutcome.DECLINED)
+    value = graph(
+        parent,
+        active_child,
+        undelivered_child,
+        prerequisite,
+        unsatisfied,
+        complete=False,
+    )
+    value = GraphState(
+        value.tasks,
+        value.decisions,
+        GraphCompleteness(
+            complete=False,
+            missing_store_ids=(THIRD_STORE, OTHER_STORE),
+            known_store_ids=(STORE,),
+        ),
+    )
+
+    result = readiness(TaskRef(STORE, tid(1)), value)
+
+    assert [blocker.kind for blocker in result.blockers] == [
+        ReadinessBlockerKind.WAITING_PARTY,
+        ReadinessBlockerKind.DEPENDENCY_INVALID,
+        ReadinessBlockerKind.DEPENDENCY_UNKNOWN,
+        ReadinessBlockerKind.DEPENDENCY_ACTIVE,
+        ReadinessBlockerKind.DEPENDENCY_UNSATISFIED,
+        ReadinessBlockerKind.DESCENDANT_ACTIVE,
+        ReadinessBlockerKind.DESCENDANT_UNDELIVERED,
+        ReadinessBlockerKind.FEDERATION_INCOMPLETE,
+    ]
+    assert result.blockers[0].waiting_party == Slug("alexis")
+    assert result.blockers[1].related_task == TaskRef(STORE, tid(99))
+    assert result.blockers[2].related_task == TaskRef(THIRD_STORE, tid(98))
+    assert result.blockers[3].related_task == TaskRef(STORE, tid(4))
+    assert result.blockers[4].related_task == TaskRef(STORE, tid(5))
+    assert result.blockers[-1].missing_store_ids == (OTHER_STORE, THIRD_STORE)
+    assert result.ready is False
+
+
+def test_readiness_blocker_payload_shapes_are_explicit() -> None:
+    with pytest.raises(ValueError, match="missing store IDs"):
+        ReadinessBlocker(ReadinessBlockerKind.FEDERATION_INCOMPLETE)
+    with pytest.raises(ValueError, match="only federation"):
+        ReadinessBlocker(
+            ReadinessBlockerKind.DEPENDENCY_ACTIVE,
+            related_task=TaskRef(STORE, tid(1)),
+            missing_store_ids=(OTHER_STORE,),
+        )
+    with pytest.raises(ValueError, match="sorted unique"):
+        ReadinessBlocker(
+            ReadinessBlockerKind.FEDERATION_INCOMPLETE,
+            missing_store_ids=(THIRD_STORE, OTHER_STORE, OTHER_STORE),
+        )
 
 
 def test_decision_state_derives_active_superseded_and_retired_without_persisted_state() -> None:
