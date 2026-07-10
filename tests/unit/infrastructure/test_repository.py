@@ -245,6 +245,45 @@ def test_streaming_diagnostic_location_matches_across_a_chunk_boundary() -> None
     assert streamed.diagnostic == _direct_diagnostic(raw, relative)
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        b"\xc3\xa9\n",
+        b"\xc3x\n",
+    ],
+    ids=["valid-split-sequence", "invalid-split-continuation"],
+)
+def test_streaming_utf8_multibyte_state_matches_direct_codec_across_chunks(
+    suffix: bytes,
+) -> None:
+    canonical = decision_bytes()
+    closing_end = canonical.index(b"+++\n", 4) + 4
+    header = canonical[:closing_end]
+    raw = header + b"x" * (64 * 1024 - len(header) - 1) + suffix
+    relative = PurePosixPath(f"decisions/{DECISION_ID}-choice.md")
+
+    streamed = ItemCodec().parse_stream(
+        BoundedReader(raw),
+        relative_path=relative,
+        headers_only=True,
+    )
+
+    assert streamed.diagnostic == _direct_diagnostic(raw, relative)
+
+
+def test_streaming_utf8_incomplete_eof_sequence_matches_direct_codec() -> None:
+    raw = decision_bytes() + b"\xc3"
+    relative = PurePosixPath(f"decisions/{DECISION_ID}-choice.md")
+
+    streamed = ItemCodec().parse_stream(
+        BoundedReader(raw),
+        relative_path=relative,
+        headers_only=True,
+    )
+
+    assert streamed.diagnostic == _direct_diagnostic(raw, relative)
+
+
 def test_malformed_store_keeps_registry_and_item_diagnostics(local_store: Path) -> None:
     local_store.joinpath("store.toml").write_bytes(b"schema =")
     item = local_store / "decisions" / f"{DECISION_ID}-broken.md"
