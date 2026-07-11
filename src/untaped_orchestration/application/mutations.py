@@ -44,6 +44,7 @@ class MutationLockSetError(ValueError):
 class IntendedMutation:
     replacements: tuple[FileReplacement, ...] = ()
     deletions: tuple[FileDeletion, ...] = ()
+    replayed: bool = False
 
 
 type SnapshotLoader = Callable[[], FederatedSnapshot]
@@ -192,7 +193,7 @@ class MutationExecutor:
 
             return MutationReceipt(
                 applied=bool(changed),
-                replayed=replayed,
+                replayed=replayed or intended.replayed,
                 canonical_applied=canonical_applied,
                 views_current=view_state.current,
                 intended_paths=intended_paths,
