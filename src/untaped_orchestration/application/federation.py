@@ -1,18 +1,36 @@
 from __future__ import annotations
 
+import hashlib
 import os
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from untaped_orchestration.application.ports import LockManager, StoreLockTimeout, StoreReader
+from untaped_orchestration.application.ports import (
+    CanonicalFormatter,
+    FileReplacement,
+    LockManager,
+    StoreLockTimeout,
+    StoreReader,
+    StoreWriter,
+    ViewRenderer,
+)
 from untaped_orchestration.application.results import (
+    AdministrativeState,
     Completeness,
     FederatedSnapshot,
     IncompletenessReason,
     IncompleteStore,
+    ItemRevision,
+    MutationReceipt,
+    RawRecord,
+    StoreEntry,
     StoreLocation,
     StoreSnapshot,
 )
+from untaped_orchestration.application.validation import validate_snapshot
+from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.domain.diagnostics import (
     Diagnostic,
     DiagnosticCode,
@@ -20,8 +38,66 @@ from untaped_orchestration.domain.diagnostics import (
     diagnostic_sort_key,
 )
 from untaped_orchestration.domain.ids import StoreId
+from untaped_orchestration.domain.models import Registry, RegistryChild, Revision
 
 DEFAULT_LOCK_TIMEOUT = 10.0
+
+
+class RegistryRevisionConflict(ValueError):
+    pass
+
+
+class RegistryMutationConflict(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AddChildRequest:
+    location: StoreLocation
+    child_id: StoreId | str
+    path: str
+    expected_registry_revision: Revision | None
+    force_current: bool = False
+
+    def __post_init__(self) -> None:
+        if self.force_current == (self.expected_registry_revision is not None):
+            raise ValueError("provide exactly one of registry revision or force-current")
+
+
+@dataclass(frozen=True, slots=True)
+class RemoveChildRequest:
+    location: StoreLocation
+    child_id: StoreId | str
+    expected_registry_revision: Revision | None
+    force_current: bool = False
+
+    def __post_init__(self) -> None:
+        if self.force_current == (self.expected_registry_revision is not None):
+            raise ValueError("provide exactly one of registry revision or force-current")
+
+
+@dataclass(frozen=True, slots=True)
+class ListChildrenRequest:
+    location: StoreLocation
+
+
+@dataclass(frozen=True, slots=True)
+class RegistryChildRow:
+    store_id: StoreId
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ListChildrenResult:
+    children: tuple[RegistryChildRow, ...]
+    registry_revision: Revision
+
+
+class _NoopLocks:
+    @contextmanager
+    def acquire(self, locations: Sequence[StoreLocation], *, timeout: float) -> Iterator[None]:
+        del locations, timeout
+        yield
 
 
 class UnidentifiedStoreError(ValueError):
@@ -529,3 +605,203 @@ class FederationService:
                 hint="Retry after the conflicting store operation completes.",
             )
         )
+
+
+class _OverlayReader:
+    def __init__(self, reader: StoreReader, parent: StoreLocation, snapshot: StoreSnapshot) -> None:
+        self._reader = reader
+        self._parent = _path_key(parent.real_root)
+        self._snapshot = snapshot
+
+    def discover(self, start: Path, override: Path | None = None) -> StoreLocation:
+        return self._reader.discover(start, override)
+
+    def load_local(self, location: StoreLocation, *, headers_only: bool) -> StoreSnapshot:
+        if _path_key(location.real_root) == self._parent:
+            return self._snapshot
+        return self._reader.load_local(location, headers_only=headers_only)
+
+    def read_raw(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord:
+        return self._reader.read_raw(location, relative_path)
+
+    def read_file(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord:
+        return self._reader.read_file(location, relative_path)
+
+    def read_item_body(self, location: StoreLocation, relative_path: PurePosixPath) -> bytes:
+        return self._reader.read_item_body(location, relative_path)
+
+    def list_entries(self, location: StoreLocation) -> tuple[StoreEntry, ...]:
+        return self._reader.list_entries(location)
+
+    def inspect_administrative(self, location: StoreLocation) -> AdministrativeState:
+        return self._reader.inspect_administrative(location)
+
+
+class FederationRegistryService:
+    """Single-parent registry writes with optimistic, globally ordered federation locks."""
+
+    def __init__(
+        self,
+        reader: StoreReader,
+        writer: StoreWriter,
+        locks: LockManager,
+        views: ViewRenderer,
+        formatter: CanonicalFormatter,
+        *,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._locks = locks
+        self._views = views
+        self._formatter = formatter
+        self._lock_timeout = lock_timeout
+
+    def list_children(self, request: ListChildrenRequest) -> ListChildrenResult:
+        snapshot = self._reader.load_local(request.location, headers_only=True)
+        if snapshot.registry is None or snapshot.registry_revision is None:
+            raise RegistryMutationConflict("selected registry is invalid")
+        return ListChildrenResult(
+            tuple(RegistryChildRow(value.id, value.path) for value in snapshot.registry.children),
+            snapshot.registry_revision,
+        )
+
+    def add_child(self, request: AddChildRequest) -> MutationReceipt:
+        child_id = (
+            request.child_id if isinstance(request.child_id, StoreId) else StoreId(request.child_id)
+        )
+        current = self._optimistic(request.location)
+        selected = current.selected
+        if selected.registry is None:
+            raise RegistryMutationConflict("selected registry is invalid")
+        if any(value.id == child_id for value in selected.registry.children):
+            raise RegistryMutationConflict("child store ID is already registered")
+        child_location = self._reader.discover(
+            request.location.root,
+            override=request.location.root.joinpath(*PurePosixPath(request.path).parts),
+        )
+        proposed = self._optimistic(child_location)
+        if (
+            proposed.selected.store is None
+            or proposed.selected.store.id != child_id
+            or not proposed.completeness.complete
+        ):
+            raise RegistryMutationConflict(
+                "proposed child subtree is not complete with expected identity"
+            )
+        registry = Registry(
+            schema=selected.registry.schema_,
+            store_id=selected.registry.store_id,
+            children=(*selected.registry.children, RegistryChild(id=child_id, path=request.path)),
+        )
+        return self._mutate(request, current, proposed, registry)
+
+    def remove_child(self, request: RemoveChildRequest) -> MutationReceipt:
+        child_id = (
+            request.child_id if isinstance(request.child_id, StoreId) else StoreId(request.child_id)
+        )
+        current = self._optimistic(request.location)
+        selected = current.selected
+        if selected.registry is None:
+            raise RegistryMutationConflict("selected registry is invalid")
+        children = tuple(value for value in selected.registry.children if value.id != child_id)
+        if len(children) == len(selected.registry.children):
+            raise RegistryMutationConflict("child store ID is not registered")
+        registry = Registry(
+            schema=selected.registry.schema_,
+            store_id=selected.registry.store_id,
+            children=children,
+        )
+        return self._mutate(request, current, None, registry)
+
+    def _optimistic(self, location: StoreLocation) -> FederatedSnapshot:
+        return FederationService(self._reader, _NoopLocks()).load(
+            location, local=False, headers_only=True
+        )
+
+    def _mutate(
+        self,
+        request: AddChildRequest | RemoveChildRequest,
+        current: FederatedSnapshot,
+        proposed: FederatedSnapshot | None,
+        registry: Registry,
+    ) -> MutationReceipt:
+        by_path = {_path_key(value.location.real_root): value.location for value in current.stores}
+        if proposed is not None:
+            by_path.update(
+                {_path_key(value.location.real_root): value.location for value in proposed.stores}
+            )
+        locations = tuple(sorted(by_path.values(), key=_location_sort_key))
+        optimistic = {
+            _path_key(store.location.real_root): (
+                store.store_config_revision,
+                store.registry_revision,
+            )
+            for federation in (current, proposed)
+            if federation is not None
+            for store in federation.stores
+        }
+        with self._locks.acquire(locations, timeout=self._lock_timeout):
+            for location in locations:
+                present = self._reader.load_local(location, headers_only=True)
+                if optimistic[_path_key(location.real_root)] != (
+                    present.store_config_revision,
+                    present.registry_revision,
+                ):
+                    raise RegistryRevisionConflict(
+                        "a participating anchor or registry changed during registry mutation"
+                    )
+            parent = self._reader.load_local(request.location, headers_only=True)
+            if (
+                not request.force_current
+                and parent.registry_revision != request.expected_registry_revision
+            ):
+                raise RegistryRevisionConflict("registry revision guard does not match exact bytes")
+            raw = self._formatter.registry_bytes(registry)
+            revision = Revision(f"sha256:{hashlib.sha256(raw).hexdigest()}")
+            projected_parent = parent.__class__(
+                parent.location,
+                parent.store,
+                registry,
+                parent.records,
+                parent.load_diagnostics,
+                parent.raw_index,
+                parent.store_revision,
+                revision,
+                parent.store_config_revision,
+            )
+            overlay = _OverlayReader(self._reader, request.location, projected_parent)
+            final = FederationService(overlay, _NoopLocks()).load(
+                request.location, local=False, headers_only=True
+            )
+            final_paths = {_path_key(value.location.real_root) for value in final.stores}
+            if not final.completeness.complete or not final_paths <= set(by_path):
+                raise RegistryMutationConflict(
+                    "final registry graph is incomplete or discovered a path outside the lock set"
+                )
+            diagnostics = validate_snapshot(final, require_children=True)
+            if any(value.severity == "error" for value in diagnostics):
+                raise RegistryMutationConflict("final registry graph is invalid")
+            registry_path = PurePosixPath("registry.toml")
+            self._writer.replace(request.location, FileReplacement(registry_path, raw))
+            after = self._reader.load_local(request.location, headers_only=False)
+            view_state = apply_views(
+                self._reader,
+                self._writer,
+                request.location,
+                self._views,
+                after,
+            )
+            return MutationReceipt(
+                applied=True,
+                replayed=False,
+                canonical_applied=True,
+                views_current=view_state.current,
+                intended_paths=(registry_path, *view_state.intended_paths),
+                changed_paths=(registry_path, *view_state.changed_paths),
+                item_revisions=tuple(
+                    ItemRevision(value.path, value.revision) for value in after.records
+                ),
+                store_revision=after.store_revision,
+                registry_revision=after.registry_revision,
+            )

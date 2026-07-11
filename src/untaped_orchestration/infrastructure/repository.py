@@ -177,6 +177,11 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
             content=raw,
         )
 
+    def read_item_body(self, location: StoreLocation, relative_path: PurePosixPath) -> bytes:
+        raw = safe_read_path(location, relative_path).read_bytes()
+        document = self._items.parse(raw, relative_path=relative_path)
+        return document.body
+
     def list_entries(self, location: StoreLocation) -> tuple[StoreEntry, ...]:
         return store_entries(location)
 
