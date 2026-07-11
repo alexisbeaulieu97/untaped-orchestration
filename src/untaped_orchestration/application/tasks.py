@@ -16,7 +16,11 @@ from untaped_orchestration.application.item_support import (
     selected_store_id,
     validated_copy,
 )
-from untaped_orchestration.application.mutations import IntendedMutation, MutationExecutor
+from untaped_orchestration.application.mutations import (
+    IntendedMutation,
+    InvalidMutationState,
+    MutationExecutor,
+)
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
     Clock,
@@ -247,6 +251,7 @@ def _transition_target_matches(
     task: ActiveTask,
     request: TransitionTaskRequest,
 ) -> bool:
+    same_stage_backlog = task.stage is TaskStage.BACKLOG and request.to_stage is TaskStage.BACKLOG
     return (
         task.stage is request.to_stage
         and task.parent == request.expected_parent
@@ -255,11 +260,14 @@ def _transition_target_matches(
             if request.to_stage is TaskStage.BACKLOG
             else task.revisit_when is None
         )
-        and _placement_matches(
-            snapshot,
-            task,
-            RankScope(request.expected_parent, request.to_stage),
-            request.placement,
+        and (
+            same_stage_backlog
+            or _placement_matches(
+                snapshot,
+                task,
+                RankScope(request.expected_parent, request.to_stage),
+                request.placement,
+            )
         )
     )
 
@@ -300,7 +308,16 @@ def _guard_transition(
     if record.metadata.parent != request.expected_parent:
         raise TaskLifecycleConflict("current parent assertion failed")
     target = RankScope(request.expected_parent, request.to_stage)
-    _guard_anchor(snapshot, request.placement, request.expected_anchor_revision, target)
+    same_stage_backlog = (
+        record.metadata.stage is TaskStage.BACKLOG and request.to_stage is TaskStage.BACKLOG
+    )
+    if same_stage_backlog:
+        if request.placement.kind is not PlacementAnchorKind.LAST:
+            raise TaskLifecycleConflict("same-stage backlog transition is trigger-only")
+        if request.expected_anchor_revision is not None:
+            raise TaskLifecycleConflict("same-stage backlog transition is trigger-only")
+    else:
+        _guard_anchor(snapshot, request.placement, request.expected_anchor_revision, target)
     if request.to_stage is not TaskStage.INBOX and _transition_target_matches(
         snapshot, record.metadata, request
     ):
@@ -780,7 +797,9 @@ class TaskService:
 
         if not request.apply:
             snapshot = self._scope.recursive.load()
-            validator(snapshot)
+            diagnostics = validator(snapshot)
+            if any(value.severity == "error" for value in diagnostics):
+                raise InvalidMutationState(diagnostics)
             guard(snapshot)
             assert (
                 planned.path is not None

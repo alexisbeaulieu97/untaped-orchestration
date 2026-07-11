@@ -209,6 +209,99 @@ def test_started_at_is_set_once_and_backlog_same_stage_replaces_trigger(tmp_path
     assert replaced.record.metadata.revisit_when == "two"
 
 
+@pytest.mark.parametrize(
+    "placement_kind",
+    [PlacementAnchorKind.FIRST, PlacementAnchorKind.BEFORE, PlacementAnchorKind.AFTER],
+)
+def test_same_stage_backlog_trigger_replacement_rejects_placement(
+    tmp_path: Path,
+    placement_kind: PlacementAnchorKind,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    first = create(repository, location, scope, executor, suffix=1)
+    second = create(repository, location, scope, executor, suffix=2)
+    for task, trigger in ((first, "first"), (second, "second")):
+        current = repository.load_local(location, headers_only=False)
+        changed = service.transition(
+            transition_request(
+                task, current.store_revision, TaskStage.BACKLOG, revisit_when=trigger
+            )
+        )
+        if task is first:
+            first = changed
+        else:
+            second = changed
+    before = repository.load_local(location, headers_only=False)
+    placement = PlacementAnchor(
+        placement_kind,
+        second.record.metadata.id
+        if placement_kind in {PlacementAnchorKind.BEFORE, PlacementAnchorKind.AFTER}
+        else None,
+    )
+    with pytest.raises(TaskLifecycleConflict, match="trigger-only"):
+        service.transition(
+            transition_request(
+                first,
+                before.store_revision,
+                TaskStage.BACKLOG,
+                revisit_when="replacement",
+                placement=placement,
+                expected_anchor_revision=(
+                    second.record.revision if placement.task_id is not None else None
+                ),
+            )
+        )
+    after = repository.load_local(location, headers_only=False)
+    ranks = {
+        record.metadata.id: record.metadata.rank
+        for record in after.records
+        if getattr(record.metadata, "stage", None) is TaskStage.BACKLOG
+    }
+    assert ranks[first.record.metadata.id] < ranks[second.record.metadata.id]
+
+
+def test_same_stage_backlog_default_placement_is_ignored_for_change_and_noop(
+    tmp_path: Path,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    first = create(repository, location, scope, executor, suffix=1)
+    second = create(repository, location, scope, executor, suffix=2)
+    for task, trigger in ((first, "first"), (second, "second")):
+        current = repository.load_local(location, headers_only=False)
+        changed = service.transition(
+            transition_request(
+                task, current.store_revision, TaskStage.BACKLOG, revisit_when=trigger
+            )
+        )
+        if task is first:
+            first = changed
+    original_rank = first.record.metadata.rank
+    current = repository.load_local(location, headers_only=False)
+    changed = service.transition(
+        transition_request(
+            first,
+            current.store_revision,
+            TaskStage.BACKLOG,
+            revisit_when="replacement",
+        )
+    )
+    assert changed.record.metadata.rank == original_rank
+    assert changed.record.metadata.revisit_when == "replacement"
+    current = repository.load_local(location, headers_only=False)
+    noop = service.transition(
+        transition_request(
+            changed,
+            current.store_revision,
+            TaskStage.BACKLOG,
+            revisit_when="replacement",
+        )
+    )
+    assert not noop.receipt.applied
+    assert not noop.receipt.canonical_applied
+    assert not noop.receipt.replayed
+    assert noop.record.metadata.rank == original_rank
+
+
 def test_start_refuses_waiting_party_and_stale_parent_store_or_item_guards(tmp_path: Path) -> None:
     repository, location, scope, executor, service = state(tmp_path)
     task = create(repository, location, scope, executor, waiting=(Slug("alexis"),))

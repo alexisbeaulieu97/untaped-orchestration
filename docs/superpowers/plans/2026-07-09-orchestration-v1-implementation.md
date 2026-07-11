@@ -834,9 +834,9 @@ git commit -m "feat: add guarded item mutations"
 
 - [ ] **Step 1: Write failing lifecycle and interruption matrices**
 
-Exercise every allowed/rejected transition, backlog `revisit_when`, one-time `started_at`, same-stage backlog trigger replacement, default last placement, explicit first/last/before/after anchors, current-parent assertion including explicit none, primary/store/anchor revision guards, blocked start and delivery under incomplete federation, and task review as an alias of the kind-aware curation acknowledge use case. Test generic acknowledge/snooze routing for both tasks and decisions without CLI kind inspection.
+Exercise every allowed/rejected transition, backlog `revisit_when`, one-time `started_at`, same-stage backlog trigger-only replacement with ignored last placement and refused first/before/after placement, default last placement for stage changes, explicit first/last/before/after anchors, current-parent assertion including explicit none, primary/store/anchor revision guards, blocked start and delivery under incomplete federation, and task review as an alias of the kind-aware curation acknowledge use case. Test generic acknowledge/snooze routing for both tasks and decisions without CLI kind inspection.
 
-Exercise all four close outcomes and preconditions; archive shape; body/field preservation; archive-before-active-delete ordering; duplicate active/archive detection; exact duplicate repair; ordinary acknowledgement replay after deletion; superseded successor-link-first order; predecessor/successor guards; exact final-state replay; and divergent refusal. Inject a stop after every rebalance, final move/transition primary fsync before stdout, successor-link, archive, delete, and final close fsync. Exact final move/transition state is replayed idempotently; a merely stale or divergent state still conflicts.
+Exercise all four close outcomes and preconditions; archive shape; body/field preservation; archive-before-active-delete ordering; duplicate active/archive detection; exact duplicate repair; ordinary acknowledgement replay after deletion; superseded successor-link-first order; predecessor/successor guards; exact close final-state replay; and divergent refusal. Inject a stop after every rebalance, final move/transition primary fsync before stdout, successor-link, archive, delete, and final close fsync. An old stale move/transition request always conflicts because overwritten source rank/timestamp state cannot be proven from hashes without a journal or source snapshot. After rereading, fresh full guards against an exact final target return an `applied=false`, `replayed=false` idempotent no-op.
 
 - [ ] **Step 2: Run lifecycle tests and confirm they fail before services exist**
 
@@ -864,8 +864,9 @@ ordered locks while writing only the selected store. Validate every guard,
 compute and validate the complete intended result, execute a rank rebalance
 fully before the final primary replacement, render selected-store views, and
 expose changed/intended paths plus current revisions. Fresh guards are required
-unless the service proves an exact accepted final move, transition, or close
-state after acknowledgement loss.
+for move and transition recovery; an already exact target is a guarded no-op.
+Close may reuse old guards only when reverse projection proves an exact accepted
+archive/successor/base-store state after acknowledgement loss.
 
 - [ ] **Step 4: Prove every accepted intermediate state remains safe**
 

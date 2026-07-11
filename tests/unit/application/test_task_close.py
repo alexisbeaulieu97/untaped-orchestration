@@ -7,6 +7,7 @@ import pytest
 
 from tests.unit.application.test_task_transition import create, state, transition_request
 from untaped_orchestration.application.items import RevisionConflict
+from untaped_orchestration.application.mutations import InvalidMutationState
 from untaped_orchestration.application.tasks import (
     CloseTaskRequest,
     RepairDuplicateRequest,
@@ -173,6 +174,35 @@ def test_duplicate_repair_refuses_divergent_active_copy(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("apply", [False, True])
+def test_duplicate_repair_preview_and_apply_both_refuse_invalid_projected_store(
+    tmp_path: Path,
+    apply: bool,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    current = repository.load_local(location, headers_only=False)
+    archived = service.close(close_request(task, current.store_revision, TaskOutcome.DECLINED))
+    active_path = location.real_root.joinpath(*task.record.path.parts)
+    active_path.parent.mkdir(exist_ok=True)
+    active_path.write_bytes(repository.item_bytes(task.record.metadata, task.record.body or b""))
+    (location.real_root / "tasks" / "malformed.md").write_bytes(b"not canonical front matter")
+    duplicate = repository.load_local(location, headers_only=False)
+    active = next(r for r in duplicate.records if isinstance(r.metadata, ActiveTask))
+
+    with pytest.raises(InvalidMutationState) as failure:
+        service.repair_duplicate(
+            RepairDuplicateRequest(
+                task.record.metadata.id,
+                active.revision,
+                archived.record.revision,
+                apply,
+            )
+        )
+    assert any(diagnostic.code == "ORC001" for diagnostic in failure.value.diagnostics)
+    assert active_path.exists()
+
+
 @pytest.mark.parametrize(
     "outcome",
     [TaskOutcome.DELIVERED, TaskOutcome.DECLINED, TaskOutcome.CANCELLED],
@@ -208,4 +238,46 @@ def test_final_close_replay_refuses_unrelated_store_divergence(tmp_path: Path) -
     create(repository, location, scope, executor, suffix=2)
 
     with pytest.raises(RevisionConflict):
+        service.close(request)
+
+
+@pytest.mark.parametrize("divergence", ["archive", "successor", "unrelated-store"])
+def test_final_superseded_close_replay_refuses_every_durable_divergence(
+    tmp_path: Path,
+    divergence: str,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    predecessor = create(repository, location, scope, executor, suffix=1)
+    successor = create(repository, location, scope, executor, suffix=2)
+    guarded = repository.load_local(location, headers_only=False)
+    request = close_request(
+        predecessor,
+        guarded.store_revision,
+        TaskOutcome.SUPERSEDED,
+        successor_id=successor.record.metadata.id,
+        expected_successor_revision=successor.record.revision,
+    )
+    archived = service.close(request)
+    if divergence == "unrelated-store":
+        create(repository, location, scope, executor, suffix=3)
+    else:
+        current = repository.load_local(location, headers_only=False)
+        record = (
+            next(value for value in current.records if value.path == archived.record.path)
+            if divergence == "archive"
+            else next(
+                value
+                for value in current.records
+                if value.metadata.id == successor.record.metadata.id
+            )
+        )
+        path = location.real_root.joinpath(*record.path.parts)
+        path.write_bytes(
+            repository.item_bytes(
+                record.metadata.model_copy(update={"title": f"diverged {divergence}"}),
+                record.body or b"",
+            )
+        )
+
+    with pytest.raises((TaskLifecycleConflict, RevisionConflict)):
         service.close(request)

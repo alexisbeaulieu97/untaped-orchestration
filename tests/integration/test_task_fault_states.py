@@ -400,6 +400,13 @@ def test_task9_mutations_report_canonical_success_when_view_finalization_fails(
         )
     assert result.receipt.canonical_applied
     assert not result.receipt.views_current
+    assert result.receipt.intended_paths
+    assert result.receipt.changed_paths
+    assert set(result.receipt.changed_paths) < set(result.receipt.intended_paths)
+    failed_paths = set(result.receipt.intended_paths) - set(result.receipt.changed_paths)
+    assert failed_paths
+    assert all(path.parts[0] == "views" for path in failed_paths)
+    assert all(path.parts[0] != "views" for path in result.receipt.changed_paths)
 
 
 @pytest.mark.parametrize(

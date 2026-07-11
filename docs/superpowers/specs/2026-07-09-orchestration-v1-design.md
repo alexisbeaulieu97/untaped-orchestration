@@ -463,8 +463,10 @@ transitions. Entering a new stage places the item last unless relative
 placement is supplied, clears `revisit_when` except in backlog, and does not
 alter `review_on`. `task transition --to backlog --revisit-when TEXT` is also
 the only allowed same-stage transition and replaces the backlog trigger;
-update cannot write that lifecycle-owned field. Other same-stage changes use
-update, move, or review commands.
+last placement (the CLI default) is ignored, while first/before/after placement
+is refused. It never changes rank. Update cannot write that
+lifecycle-owned field. Other same-stage changes use update, move, or review
+commands.
 
 ### 5.4 Curation
 
@@ -749,6 +751,12 @@ check is the only create path allowed to precede an otherwise-stale store
 revision conflict. For other stale-guard mutations,
 the caller rereads current state/revisions before choosing whether to retry;
 the tool never treats an unprovable stale revision as successful.
+In particular, a completed move or transition may have overwritten its source
+rank or generated timestamp, which cannot be reconstructed from one-way item
+and store hashes. V1 therefore rejects the old stale request rather than adding
+a journal or caller-supplied source snapshot. After rereading, a request with
+fresh item/store/current-parent/anchor guards whose target and placement are
+already exact succeeds as an `applied=false`, `replayed=false` no-op.
 
 Typed ownership:
 
@@ -1022,7 +1030,7 @@ use the fault-state protocol below.
 |---|---|---|
 | Init | No anchor plus ignored lock/temp only; matching `store.toml` plus a prefix of exact scaffold; or complete scaffold before acknowledgement | Before the anchor, retry removes only its own validated temporary. `check` reports missing scaffold after the anchor; same-ID/config retry fills the exact remainder or returns complete state with `replayed=true`. Divergence refuses recovery. |
 | Task/decision create | The caller-stable ID is absent or one matching active item is fully durable | Retry with the same ID/inputs returns the existing item and `replayed=true`; mismatch or archived/inactive state conflicts. Fault injection includes final fsync before stdout. |
-| Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff, reread item/store revisions, rerun. Final target state is an idempotent success. |
+| Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff and reread item/store/anchor revisions. The old stale request conflicts. Rerun with fresh full guards; an already exact final target is an `applied=false`, `replayed=false` idempotent no-op. |
 | Ordinary close | Complete archive exists with matching active source, or the active source is gone and the archive is final but acknowledgement was lost | `check` reports a duplicate pair; guarded retry/`repair duplicate` removes only a match. Retry of the same outcome/note against the final archive returns it with `replayed=true`; divergent closure conflicts. |
 | Superseded close | Exact successor link may exist before the close pair, or the linked successor/final archive remain after active deletion but acknowledgement is lost | `check` reports a successor pointing at an active predecessor; reread both revisions and retry. When predecessor archive, successor link, outcome, and note exactly match the requested final state, retry returns `replayed=true`; every divergence conflicts. |
 | Decision supersede | One exact linked successor may exist before pin replacement, or successor/pins are final before acknowledgement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement, or returns the final state with `replayed=true`. |
