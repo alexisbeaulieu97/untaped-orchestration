@@ -51,10 +51,16 @@ class RelationConflict(ItemMutationConflict):
 
 
 @dataclass(frozen=True, slots=True)
-class MutationScope:
+class MutationExecutionScope:
     locations: tuple[StoreLocation, ...]
     selected: StoreLocation
     load: Callable[[], FederatedSnapshot]
+
+
+@dataclass(frozen=True, slots=True)
+class MutationScope:
+    recursive: MutationExecutionScope
+    selected_local: MutationExecutionScope
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +207,7 @@ def validated_copy(
 
 def execute_mutation(
     executor: MutationExecutor,
-    scope: MutationScope,
+    scope: MutationExecutionScope,
     guard: Callable[[FederatedSnapshot], None],
     build: Callable[[FederatedSnapshot], IntendedMutation],
     *,

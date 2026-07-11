@@ -34,6 +34,9 @@ from untaped_orchestration.application.item_support import (
     LinkRequest as LinkRequest,
 )
 from untaped_orchestration.application.item_support import (
+    MutationExecutionScope as MutationExecutionScope,
+)
+from untaped_orchestration.application.item_support import (
     RelationConflict as RelationConflict,
 )
 from untaped_orchestration.application.mutations import (
@@ -156,7 +159,7 @@ class CreateTask:
             )
             return IntendedMutation(replacements=tuple(replacements))
 
-        receipt = execute_mutation(self._executor, scope, guard, build)
+        receipt = execute_mutation(self._executor, scope.recursive, guard, build)
         return record_result(planned, receipt)
 
 
@@ -221,7 +224,7 @@ class CreateDecision:
             planned.body = request.body
             return replacement(self._formatter, path, metadata, request.body)
 
-        receipt = execute_mutation(self._executor, scope, guard, build)
+        receipt = execute_mutation(self._executor, scope.recursive, guard, build)
         return record_result(planned, receipt)
 
 
@@ -269,7 +272,7 @@ class UpdateTask:
             planned.body = body
             return replacement(self._formatter, record.path, metadata, body)
 
-        receipt = execute_mutation(self._executor, scope, guard, build)
+        receipt = execute_mutation(self._executor, scope.recursive, guard, build)
         return record_result(planned, receipt)
 
 
@@ -308,7 +311,7 @@ class UpdateDecision:
 
         receipt = execute_mutation(
             self._executor,
-            scope,
+            scope.selected_local,
             guard,
             build,
             validator=validate_selected_local,

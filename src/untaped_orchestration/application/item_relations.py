@@ -141,7 +141,7 @@ class ChangeLink:
             planned.body = source.body
             return replacement(self._formatter, source.path, metadata, source.body)
 
-        receipt = execute_mutation(self._executor, scope, guard, build)
+        receipt = execute_mutation(self._executor, scope.recursive, guard, build)
         return record_result(planned, receipt)
 
 
@@ -200,9 +200,12 @@ class ChangeEvidence:
             return replacement(self._formatter, record.path, metadata, record.body)
 
         validator = validate_selected_local if isinstance(request.item_id, DecisionId) else None
+        execution = (
+            scope.selected_local if isinstance(request.item_id, DecisionId) else scope.recursive
+        )
         receipt = execute_mutation(
             self._executor,
-            scope,
+            execution,
             guard,
             build,
             validator=validator,

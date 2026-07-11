@@ -14,6 +14,7 @@ from untaped_orchestration.application.items import (
     CreateTask,
     CreateTaskRequest,
     ItemStateConflict,
+    MutationExecutionScope,
     MutationScope,
     RevisionConflict,
     UpdateDecision,
@@ -56,7 +57,8 @@ def _state(tmp_path: Path):
         selected = repository.load_local(location, headers_only=False)
         return FederatedSnapshot(selected, (selected,), Completeness())
 
-    scope = MutationScope((location,), location, load)
+    execution = MutationExecutionScope((location,), location, load)
+    scope = MutationScope(execution, execution)
     executor = MutationExecutor(repository, repository, locks, views, projector=repository)
     return repository, location, scope, executor
 
@@ -266,7 +268,7 @@ def test_decision_update_uses_selected_local_policy_for_unrelated_child_failure(
     child_id = StoreId("sto_019f0000000070008000000000000001")
 
     def incomplete_load() -> FederatedSnapshot:
-        current = scope.load()
+        current = scope.recursive.load()
         entry = IncompleteStore(
             child_id,
             reason,  # type: ignore[arg-type]
@@ -282,7 +284,14 @@ def test_decision_update_uses_selected_local_policy_for_unrelated_child_failure(
         return FederatedSnapshot(current.selected, current.stores, Completeness((entry,)))
 
     result = UpdateDecision(executor, repository).execute(
-        MutationScope(scope.locations, scope.selected, incomplete_load),
+        MutationScope(
+            MutationExecutionScope(
+                scope.recursive.locations,
+                scope.recursive.selected,
+                incomplete_load,
+            ),
+            scope.selected_local,
+        ),
         UpdateDecisionRequest(decision_id, created.record.revision, title="Clarified"),
     )
 

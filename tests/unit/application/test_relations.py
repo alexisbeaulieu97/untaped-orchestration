@@ -18,6 +18,7 @@ from untaped_orchestration.application.items import (
     EvidenceRequest,
     ItemStateConflict,
     LinkRequest,
+    MutationExecutionScope,
     MutationScope,
     RelationConflict,
     RevisionConflict,
@@ -58,7 +59,8 @@ def _state(tmp_path: Path):
         selected = repository.load_local(location, headers_only=False)
         return FederatedSnapshot(selected, (selected,), Completeness())
 
-    scope = MutationScope((location,), location, load)
+    execution = MutationExecutionScope((location,), location, load)
+    scope = MutationScope(execution, execution)
     executor = MutationExecutor(repository, repository, locks, views, projector=repository)
     before = repository.load_local(location, headers_only=False)
     task = CreateTask(executor, repository, Clock()).execute(
@@ -332,7 +334,7 @@ def test_decision_evidence_add_remove_uses_selected_local_policy(
     child_id = StoreId("sto_019f0000000070008000000000000001")
 
     def incomplete_load() -> FederatedSnapshot:
-        current = scope.load()
+        current = scope.recursive.load()
         entry = IncompleteStore(
             child_id,
             reason,  # type: ignore[arg-type]
@@ -347,7 +349,14 @@ def test_decision_evidence_add_remove_uses_selected_local_policy(
         )
         return FederatedSnapshot(current.selected, current.stores, Completeness((entry,)))
 
-    incomplete_scope = MutationScope(scope.locations, scope.selected, incomplete_load)
+    incomplete_scope = MutationScope(
+        MutationExecutionScope(
+            scope.recursive.locations,
+            scope.recursive.selected,
+            incomplete_load,
+        ),
+        scope.selected_local,
+    )
     service = ChangeEvidence(executor, repository)
     request = EvidenceRequest(
         decision.record.metadata.id,
@@ -393,7 +402,8 @@ def test_cross_store_governance_validates_federated_target_without_mutating_targ
         selected = repository.load_local(child, headers_only=False)
         return FederatedSnapshot(selected, (selected,), Completeness())
 
-    child_scope = MutationScope((child,), child, child_load)
+    child_execution = MutationExecutionScope((child,), child, child_load)
+    child_scope = MutationScope(child_execution, child_execution)
     executor = MutationExecutor(repository, repository, locks, views, projector=repository)
     child_before = repository.load_local(child, headers_only=False)
     decision = CreateDecision(executor, repository, Clock()).execute(
@@ -413,7 +423,18 @@ def test_cross_store_governance_validates_federated_target_without_mutating_targ
         target = repository.load_local(child, headers_only=False)
         return FederatedSnapshot(selected, (selected, target), Completeness())
 
-    parent_scope = MutationScope((parent, child), parent, parent_load)
+    def parent_local_load() -> FederatedSnapshot:
+        selected = repository.load_local(parent, headers_only=False)
+        return FederatedSnapshot(selected, (selected,), Completeness())
+
+    parent_scope = MutationScope(
+        MutationExecutionScope((parent, child), parent, parent_load),
+        MutationExecutionScope(
+            (parent,),
+            parent,
+            parent_local_load,
+        ),
+    )
     task = CreateTask(executor, repository, Clock()).execute(
         parent_scope,
         CreateTaskRequest(

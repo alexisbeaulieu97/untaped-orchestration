@@ -14,6 +14,7 @@ from untaped_orchestration.application.items import (
     CreateDecisionRequest,
     CreateTask,
     CreateTaskRequest,
+    MutationExecutionScope,
     MutationScope,
     RevisionConflict,
 )
@@ -60,7 +61,8 @@ def _services(tmp_path: Path):
         selected = repository.load_local(location, headers_only=False)
         return FederatedSnapshot(selected, (selected,), Completeness())
 
-    scope = MutationScope((location,), location, load)
+    execution = MutationExecutionScope((location,), location, load)
+    scope = MutationScope(execution, execution)
     executor = MutationExecutor(
         repository,
         repository,

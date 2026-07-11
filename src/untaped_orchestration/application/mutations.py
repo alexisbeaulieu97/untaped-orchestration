@@ -17,6 +17,7 @@ from untaped_orchestration.application.ports import (
 from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
+    IncompleteStore,
     ItemRevision,
     MutationReceipt,
 )
@@ -27,6 +28,7 @@ from untaped_orchestration.application.scaffold import (
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.models import LinkRelation
 
 DEFAULT_LOCK_TIMEOUT = 10.0
 
@@ -55,10 +57,40 @@ type SnapshotValidator = Callable[[FederatedSnapshot], tuple[Diagnostic, ...]]
 
 
 def validate_selected_local(snapshot: FederatedSnapshot) -> tuple[Diagnostic, ...]:
+    config = snapshot.selected.store
+    selected_id = config.id if config is not None else None
+    remote_store_ids = tuple(
+        sorted(
+            {
+                link.target_store_id
+                for record in snapshot.selected.records
+                for link in record.metadata.links
+                if selected_id is not None
+                and link.target_store_id != selected_id
+                and link.relation in {LinkRelation.GOVERNED_BY, LinkRelation.FOLLOW_UP_TO}
+            },
+            key=lambda value: value.root,
+        )
+    )
+    incompleteness = tuple(
+        IncompleteStore(
+            expected_store_id=store_id,
+            reason="missing",
+            diagnostic=Diagnostic(
+                code="ORC005",
+                severity="warning",
+                path=snapshot.selected.location.root.as_posix(),
+                field=f"navigation.{store_id.root}",
+                message="remote navigation targets are unresolved in selected-local validation",
+                hint="Use recursive validation before a cross-store structural operation.",
+            ),
+        )
+        for store_id in remote_store_ids
+    )
     selected_only = FederatedSnapshot(
         snapshot.selected,
         (snapshot.selected,),
-        Completeness(),
+        Completeness(incompleteness),
     )
     return validate_snapshot(selected_only, require_children=False)
 
