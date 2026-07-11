@@ -22,8 +22,13 @@ from untaped_orchestration.application.items import (
     UpdateTaskRequest,
 )
 from untaped_orchestration.application.mutations import MutationExecutor
-from untaped_orchestration.application.results import Completeness, FederatedSnapshot
-from untaped_orchestration.domain.ids import DecisionId, Slug, TaskId
+from untaped_orchestration.application.results import (
+    Completeness,
+    FederatedSnapshot,
+    IncompleteStore,
+)
+from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.ids import DecisionId, Slug, StoreId, TaskId
 from untaped_orchestration.domain.models import Revision, TaskPriority, TaskStage
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
@@ -243,3 +248,65 @@ def test_decision_update_allows_inactive_clarification(tmp_path: Path) -> None:
 
     assert updated.record.metadata.title == "Clarified after retirement"
     assert updated.record.metadata.retire_note == "ended"
+
+
+@pytest.mark.parametrize(("reason", "severity"), [("missing", "warning"), ("invalid", "error")])
+def test_decision_update_uses_selected_local_policy_for_unrelated_child_failure(
+    tmp_path: Path,
+    reason: str,
+    severity: str,
+) -> None:
+    repository, location, scope, executor = _state(tmp_path)
+    before = repository.load_local(location, headers_only=False)
+    decision_id = DecisionId("dec_019f0000000070008000000000000001")
+    created = CreateDecision(executor, repository, Clock()).execute(
+        scope,
+        CreateDecisionRequest(decision_id, "Original", b"body", (), before.store_revision),
+    )
+    child_id = StoreId("sto_019f0000000070008000000000000001")
+
+    def incomplete_load() -> FederatedSnapshot:
+        current = scope.load()
+        entry = IncompleteStore(
+            child_id,
+            reason,  # type: ignore[arg-type]
+            Diagnostic(
+                code="ORC005",
+                severity=severity,
+                path="registry.toml",
+                field=f"children.{child_id.root}",
+                message="unrelated child unavailable",
+                hint="restore child",
+            ),
+        )
+        return FederatedSnapshot(current.selected, current.stores, Completeness((entry,)))
+
+    result = UpdateDecision(executor, repository).execute(
+        MutationScope(scope.locations, scope.selected, incomplete_load),
+        UpdateDecisionRequest(decision_id, created.record.revision, title="Clarified"),
+    )
+
+    assert result.record.metadata.title == "Clarified"
+
+
+def test_decision_update_selected_local_policy_still_refuses_invalid_selected_store(
+    tmp_path: Path,
+) -> None:
+    repository, location, scope, executor = _state(tmp_path)
+    before = repository.load_local(location, headers_only=False)
+    decision_id = DecisionId("dec_019f0000000070008000000000000001")
+    created = CreateDecision(executor, repository, Clock()).execute(
+        scope,
+        CreateDecisionRequest(decision_id, "Original", b"body", (), before.store_revision),
+    )
+    invalid = location.real_root / "tasks" / f"{TASK_ID}-invalid.md"
+    invalid.parent.mkdir()
+    invalid.write_bytes(b"not an item")
+
+    from untaped_orchestration.application.mutations import InvalidMutationState
+
+    with pytest.raises(InvalidMutationState):
+        UpdateDecision(executor, repository).execute(
+            scope,
+            UpdateDecisionRequest(decision_id, created.record.revision, title="Forbidden"),
+        )

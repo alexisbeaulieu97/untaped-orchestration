@@ -21,6 +21,7 @@ from untaped_orchestration.application.mutations import MutationExecutor
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
 from untaped_orchestration.domain.ids import DecisionId, Slug, TaskId
 from untaped_orchestration.domain.models import (
+    ActiveTask,
     ArchivedTask,
     Revision,
     TaskOutcome,
@@ -170,6 +171,43 @@ def test_task_create_appends_last_sparse_rank_and_decision_has_exact_generated_t
     assert (
         decision.record.path.as_posix() == f"decisions/{DECISION_ID}-keep-caller-owned-identity.md"
     )
+
+
+def test_task_create_reuses_domain_rebalance_at_signed_int64_last_rank(
+    tmp_path: Path,
+) -> None:
+    repository, location, scope, tasks, _, _ = _services(tmp_path)
+    initial = repository.load_local(location, headers_only=False)
+    first = tasks.execute(scope, _task_request(initial.store_revision))
+    at_boundary = ActiveTask.model_validate(
+        {**first.record.metadata.model_dump(by_alias=True), "rank": 2**63 - 1}
+    )
+    location.real_root.joinpath(*first.record.path.parts).write_bytes(
+        repository.item_bytes(at_boundary, first.record.body or b"")
+    )
+    boundary = repository.load_local(location, headers_only=False)
+
+    created = tasks.execute(
+        scope,
+        _task_request(
+            boundary.store_revision,
+            item_id=TaskId("tsk_019f0000000070008000000000000011"),
+            title="After boundary",
+            body=b"",
+            tags=(),
+            waiting_on=(),
+        ),
+    )
+
+    current = repository.load_local(location, headers_only=False)
+    ranks = {
+        record.metadata.id: record.metadata.rank
+        for record in current.records
+        if isinstance(record.metadata, ActiveTask)
+    }
+    assert ranks == {TaskId(TASK_ID): 1000, created.record.metadata.id: 2000}
+    assert created.record.path.name.endswith("-after-boundary.md")
+    assert created.record.metadata.created_at == UtcTimestamp("2026-07-11T12:34:56.789Z")
 
 
 def test_exact_existing_id_replay_precedes_stale_store_guard_and_returns_existing_generated_data(

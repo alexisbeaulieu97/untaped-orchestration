@@ -13,6 +13,7 @@ from untaped_orchestration.application.mutations import (
     InvalidMutationState,
     MutationExecutor,
     MutationLockSetError,
+    validate_selected_local,
 )
 from untaped_orchestration.application.ports import FileDeletion, FileReplacement
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
@@ -217,6 +218,48 @@ def test_shared_finalizer_projects_bytes_and_enforces_exact_phase_order(
         PurePosixPath("registry.toml"),
         PurePosixPath("views/decisions.md"),
     )
+
+
+def test_finalizer_accepts_an_explicit_per_operation_validator(tmp_path: Path) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = RecordingRepository(repository, events, locks)
+    projector = RecordingProjector(repository, events, locks)
+    default_calls = 0
+    operation_calls = 0
+
+    def default_validator(snapshot: FederatedSnapshot):
+        nonlocal default_calls
+        del snapshot
+        default_calls += 1
+        return ()
+
+    def operation_validator(snapshot: FederatedSnapshot):
+        nonlocal operation_calls
+        del snapshot
+        operation_calls += 1
+        return ()
+
+    MutationExecutor(
+        adapter,
+        adapter,
+        locks,
+        RecordingViews(events, locks),
+        projector=projector,
+        validator=default_validator,
+    ).execute(
+        locations=tuple(value.location for value in current.stores),
+        selected=current.selected.location,
+        load=lambda: current,
+        guard=lambda _: None,
+        build=lambda _: IntendedMutation(),
+        validator=operation_validator,
+    )
+
+    assert default_calls == 0
+    assert operation_calls == 3
+    assert callable(validate_selected_local)
 
 
 @pytest.mark.parametrize("mode", ["missing", "extra", "wrong-selected"])

@@ -7,22 +7,35 @@ import pytest
 
 from tests.builders import STORE_ID, TASK_ID
 from untaped_orchestration.application.bootstrap import InitializeStore, InitRequest
+from untaped_orchestration.application.federation import FederationService
 from untaped_orchestration.application.items import (
     ChangeEvidence,
     ChangeLink,
+    CreateDecision,
+    CreateDecisionRequest,
     CreateTask,
     CreateTaskRequest,
     EvidenceRequest,
     LinkRequest,
     MutationScope,
+    RelationConflict,
+    UpdateDecision,
+    UpdateDecisionRequest,
     UpdateTask,
     UpdateTaskRequest,
 )
-from untaped_orchestration.application.mutations import MutationExecutor
+from untaped_orchestration.application.mutations import InvalidMutationState, MutationExecutor
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
+from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.domain.evidence import EvidenceReference, EvidenceRelation
-from untaped_orchestration.domain.ids import StoreId, TaskId
-from untaped_orchestration.domain.models import LinkRelation, TaskPriority
+from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
+from untaped_orchestration.domain.models import (
+    ActiveTask,
+    LinkRelation,
+    Registry,
+    RegistryChild,
+    TaskPriority,
+)
 from untaped_orchestration.infrastructure.filesystem import AtomicFilesystem, location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -178,6 +191,503 @@ def test_create_acknowledgement_loss_after_final_fsync_replays_exact_durable_ite
     assert replay.record.metadata.rank == 1000
 
 
+def test_decision_create_acknowledgement_loss_replays_exact_durable_item(
+    tmp_path: Path,
+) -> None:
+    repository, location, scope, executor = _fixture(tmp_path)
+    before = repository.load_local(location, headers_only=False)
+    request = CreateDecisionRequest(
+        DecisionId("dec_019f0000000070008000000000000001"),
+        "Decision",
+        b"body",
+        (),
+        before.store_revision,
+    )
+    armed = True
+
+    def fail_after_fsync(event: str) -> None:
+        nonlocal armed
+        if armed and event == "before-ack":
+            armed = False
+            raise OSError("acknowledgement lost")
+
+    fault_repository = FilesystemStoreRepository(
+        atomic=AtomicFilesystem(event_hook=fail_after_fsync)
+    )
+    fault_executor = MutationExecutor(
+        fault_repository,
+        fault_repository,
+        FileLockManager(),
+        MarkdownViewRenderer(),
+        projector=fault_repository,
+    )
+    fault_scope = MutationScope(
+        scope.locations,
+        scope.selected,
+        lambda: _load(fault_repository, location),
+    )
+    with pytest.raises(OSError, match="acknowledgement lost"):
+        CreateDecision(fault_executor, fault_repository, Clock()).execute(fault_scope, request)
+
+    replay = CreateDecision(executor, repository, Clock()).execute(scope, request)
+    assert replay.receipt.replayed
+    assert not replay.receipt.canonical_applied
+    assert replay.record.metadata.created_at.root == "2026-07-11T01:02:03.004Z"
+    assert replay.record.path.name.endswith("-decision.md")
+
+
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_boundary_create_fault_prefix_is_valid_and_retryable(
+    tmp_path: Path,
+    fail_at: int,
+) -> None:
+    repository, location, scope, executor = _fixture(tmp_path)
+    initial = repository.load_local(location, headers_only=False)
+    first = CreateTask(executor, repository, Clock()).execute(
+        scope,
+        CreateTaskRequest(
+            TaskId(TASK_ID), "First", b"", (), TaskPriority.NORMAL, (), initial.store_revision
+        ),
+    )
+    boundary = ActiveTask.model_validate(
+        {**first.record.metadata.model_dump(by_alias=True), "rank": 2**63 - 1}
+    )
+    location.real_root.joinpath(*first.record.path.parts).write_bytes(
+        repository.item_bytes(boundary, first.record.body or b"")
+    )
+    before = repository.load_local(location, headers_only=False)
+    request = CreateTaskRequest(
+        TaskId("tsk_019f0000000070008000000000000011"),
+        "After boundary",
+        b"body",
+        (),
+        TaskPriority.NORMAL,
+        (),
+        before.store_revision,
+    )
+    acknowledgements = 0
+
+    def fail_on_prefix(event: str) -> None:
+        nonlocal acknowledgements
+        if event != "before-ack":
+            return
+        acknowledgements += 1
+        if acknowledgements == fail_at:
+            raise OSError(f"fault after replacement {fail_at}")
+
+    fault_repository = FilesystemStoreRepository(atomic=AtomicFilesystem(event_hook=fail_on_prefix))
+    fault_executor = MutationExecutor(
+        fault_repository,
+        fault_repository,
+        FileLockManager(),
+        MarkdownViewRenderer(),
+        projector=fault_repository,
+    )
+    fault_scope = MutationScope(
+        scope.locations,
+        scope.selected,
+        lambda: _load(fault_repository, location),
+    )
+    with pytest.raises(OSError, match=f"replacement {fail_at}"):
+        CreateTask(fault_executor, fault_repository, Clock()).execute(fault_scope, request)
+
+    interrupted = _load(repository, location)
+    assert not [
+        value
+        for value in validate_snapshot(interrupted, require_children=True)
+        if value.severity == "error"
+    ]
+    existing = next(
+        (
+            record
+            for record in interrupted.selected.records
+            if record.metadata.id == request.item_id
+        ),
+        None,
+    )
+    retry_request = (
+        request
+        if existing is not None
+        else CreateTaskRequest(
+            request.item_id,
+            request.title,
+            request.body,
+            request.tags,
+            request.priority,
+            request.waiting_on,
+            interrupted.selected.store_revision,
+        )
+    )
+    result = CreateTask(executor, repository, Clock()).execute(scope, retry_request)
+
+    assert result.record.metadata.rank == 2000
+    assert result.receipt.replayed is (fail_at == 2)
+
+
 def _load(repository: FilesystemStoreRepository, location) -> FederatedSnapshot:
     selected = repository.load_local(location, headers_only=False)
     return FederatedSnapshot(selected, (selected,), Completeness())
+
+
+def _register_child(
+    repository: FilesystemStoreRepository,
+    parent,
+    child_id: StoreId,
+    path: str,
+) -> None:
+    registry = Registry(
+        schema="untaped.orchestration.registry/v1",
+        store_id=StoreId(STORE_ID),
+        children=(RegistryChild(id=child_id, path=path),),
+    )
+    parent.real_root.joinpath("registry.toml").write_bytes(repository.registry_bytes(registry))
+
+
+def _resolved_scope(
+    repository: FilesystemStoreRepository,
+    resolved: FederatedSnapshot,
+) -> MutationScope:
+    locations = tuple(store.location for store in resolved.stores)
+
+    def load() -> FederatedSnapshot:
+        stores = tuple(
+            repository.load_local(location, headers_only=False) for location in locations
+        )
+        selected = next(
+            store
+            for store in stores
+            if store.location.real_root == resolved.selected.location.real_root
+        )
+        return FederatedSnapshot(selected, stores, resolved.completeness)
+
+    return MutationScope(locations, resolved.selected.location, load)
+
+
+def _files(root: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != ".lock"
+    }
+
+
+def test_registered_child_links_use_real_federation_and_never_write_target(
+    tmp_path: Path,
+) -> None:
+    parent_repo = tmp_path / "parent"
+    child_repo = tmp_path / "child"
+    parent_repo.mkdir()
+    child_repo.mkdir()
+    repository = FilesystemStoreRepository()
+    locks = FileLockManager()
+    views = MarkdownViewRenderer()
+    child_id = StoreId("sto_019f0000000070008000000000000001")
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(parent_repo, STORE_ID, "Parent", "UTC")
+    )
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(child_repo, child_id.root, "Child", "UTC")
+    )
+    parent = location_from_root(parent_repo / ".untaped" / "orchestration")
+    child = location_from_root(child_repo / ".untaped" / "orchestration")
+    executor = MutationExecutor(repository, repository, locks, views, projector=repository)
+    parent_local = MutationScope((parent,), parent, lambda: _load(repository, parent))
+    child_local = MutationScope((child,), child, lambda: _load(repository, child))
+    parent_before = repository.load_local(parent, headers_only=False)
+    task = CreateTask(executor, repository, Clock()).execute(
+        parent_local,
+        CreateTaskRequest(
+            TaskId(TASK_ID),
+            "Parent task",
+            b"",
+            (),
+            TaskPriority.NORMAL,
+            (),
+            parent_before.store_revision,
+        ),
+    )
+    child_before = repository.load_local(child, headers_only=False)
+    decision = CreateDecision(executor, repository, Clock()).execute(
+        child_local,
+        CreateDecisionRequest(
+            DecisionId("dec_019f0000000070008000000000000002"),
+            "Child decision",
+            b"",
+            (),
+            child_before.store_revision,
+        ),
+    )
+    child_after_decision = repository.load_local(child, headers_only=False)
+    child_task = CreateTask(executor, repository, Clock()).execute(
+        child_local,
+        CreateTaskRequest(
+            TaskId("tsk_019f0000000070008000000000000012"),
+            "Child task",
+            b"",
+            (),
+            TaskPriority.NORMAL,
+            (),
+            child_after_decision.store_revision,
+        ),
+    )
+    _register_child(
+        repository,
+        parent,
+        child_id,
+        "../../../child/.untaped/orchestration",
+    )
+    resolved = FederationService(repository, locks).load(parent, local=False, headers_only=False)
+    assert resolved.completeness.complete
+    scope = _resolved_scope(repository, resolved)
+    target_before = _files(child.real_root)
+    links = ChangeLink(executor, repository)
+
+    with pytest.raises(RelationConflict, match="same-store"):
+        links.add(
+            scope,
+            LinkRequest(
+                task.record.metadata.id,
+                LinkRelation.DEPENDS_ON,
+                child_id,
+                child_task.record.metadata.id,
+                task.record.revision,
+            ),
+        )
+    governed = links.add(
+        scope,
+        LinkRequest(
+            task.record.metadata.id,
+            LinkRelation.GOVERNED_BY,
+            child_id,
+            decision.record.metadata.id,
+            task.record.revision,
+        ),
+    )
+    followed = links.add(
+        scope,
+        LinkRequest(
+            task.record.metadata.id,
+            LinkRelation.FOLLOW_UP_TO,
+            child_id,
+            child_task.record.metadata.id,
+            governed.record.revision,
+        ),
+    )
+
+    assert [link.relation for link in followed.record.metadata.links] == [
+        LinkRelation.FOLLOW_UP_TO,
+        LinkRelation.GOVERNED_BY,
+    ]
+    assert _files(child.real_root) == target_before
+
+
+@pytest.mark.parametrize("child_state", ["missing", "invalid", "wrong-id"])
+def test_registered_child_completeness_keeps_cross_store_links_fail_closed(
+    tmp_path: Path,
+    child_state: str,
+) -> None:
+    parent_repo = tmp_path / "parent"
+    parent_repo.mkdir()
+    repository = FilesystemStoreRepository()
+    locks = FileLockManager()
+    views = MarkdownViewRenderer()
+    child_id = StoreId("sto_019f0000000070008000000000000001")
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(parent_repo, STORE_ID, "Parent", "UTC")
+    )
+    parent = location_from_root(parent_repo / ".untaped" / "orchestration")
+    executor = MutationExecutor(repository, repository, locks, views, projector=repository)
+    local_scope = MutationScope((parent,), parent, lambda: _load(repository, parent))
+    before = repository.load_local(parent, headers_only=False)
+    task = CreateTask(executor, repository, Clock()).execute(
+        local_scope,
+        CreateTaskRequest(
+            TaskId(TASK_ID), "Task", b"", (), TaskPriority.NORMAL, (), before.store_revision
+        ),
+    )
+    child_root = tmp_path / "child"
+    child_bytes_before: dict[Path, bytes] | None = None
+    if child_state != "missing":
+        child_root.mkdir()
+        actual_id = (
+            "sto_019f0000000070008000000000000002" if child_state == "wrong-id" else child_id.root
+        )
+        InitializeStore(repository, repository, locks, views).execute(
+            InitRequest(child_root, actual_id, "Child", "UTC")
+        )
+        child_location = location_from_root(child_root / ".untaped" / "orchestration")
+        if child_state == "invalid":
+            child_location.real_root.joinpath("store.toml").write_bytes(b"invalid = [")
+        child_bytes_before = _files(child_location.real_root)
+    _register_child(
+        repository,
+        parent,
+        child_id,
+        "../../../child/.untaped/orchestration",
+    )
+    resolved = FederationService(repository, locks).load(parent, local=False, headers_only=False)
+    assert not resolved.completeness.complete
+
+    with pytest.raises(InvalidMutationState):
+        ChangeLink(executor, repository).add(
+            _resolved_scope(repository, resolved),
+            LinkRequest(
+                task.record.metadata.id,
+                LinkRelation.GOVERNED_BY,
+                child_id,
+                DecisionId("dec_019f0000000070008000000000000002"),
+                task.record.revision,
+            ),
+        )
+    if child_bytes_before is not None:
+        assert _files(child_location.real_root) == child_bytes_before
+
+
+@pytest.mark.parametrize("child_state", ["missing", "invalid"])
+def test_registered_child_failure_allows_local_decision_update_and_evidence_only(
+    tmp_path: Path,
+    child_state: str,
+) -> None:
+    parent_repo = tmp_path / "parent"
+    parent_repo.mkdir()
+    repository = FilesystemStoreRepository()
+    locks = FileLockManager()
+    views = MarkdownViewRenderer()
+    child_id = StoreId("sto_019f0000000070008000000000000001")
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(parent_repo, STORE_ID, "Parent", "UTC", decisions_only=True)
+    )
+    parent = location_from_root(parent_repo / ".untaped" / "orchestration")
+    executor = MutationExecutor(repository, repository, locks, views, projector=repository)
+    local_scope = MutationScope((parent,), parent, lambda: _load(repository, parent))
+    before = repository.load_local(parent, headers_only=False)
+    decision = CreateDecision(executor, repository, Clock()).execute(
+        local_scope,
+        CreateDecisionRequest(
+            DecisionId("dec_019f0000000070008000000000000001"),
+            "Decision",
+            b"",
+            (),
+            before.store_revision,
+        ),
+    )
+    child_location = None
+    child_bytes_before = None
+    if child_state == "invalid":
+        child_repo = tmp_path / "child"
+        child_repo.mkdir()
+        InitializeStore(repository, repository, locks, views).execute(
+            InitRequest(child_repo, child_id.root, "Child", "UTC", decisions_only=True)
+        )
+        child_location = location_from_root(child_repo / ".untaped" / "orchestration")
+        child_location.real_root.joinpath("store.toml").write_bytes(b"invalid = [")
+        child_bytes_before = _files(child_location.real_root)
+    _register_child(
+        repository,
+        parent,
+        child_id,
+        "../../../child/.untaped/orchestration",
+    )
+    resolved = FederationService(repository, locks).load(parent, local=False, headers_only=False)
+    assert not resolved.completeness.complete
+    scope = _resolved_scope(repository, resolved)
+    updated = UpdateDecision(executor, repository).execute(
+        scope,
+        UpdateDecisionRequest(
+            decision.record.metadata.id,
+            decision.record.revision,
+            title="Clarified",
+        ),
+    )
+    evidence = ChangeEvidence(executor, repository)
+    request = EvidenceRequest(
+        decision.record.metadata.id,
+        EvidenceRelation.TRACKED_BY,
+        EvidenceReference("url:https://example.com/context"),
+        updated.record.revision,
+    )
+    added = evidence.add(scope, request)
+    removed = evidence.remove(
+        scope,
+        EvidenceRequest(
+            request.item_id,
+            request.relation,
+            request.reference,
+            added.record.revision,
+        ),
+    )
+
+    assert removed.record.metadata.title == "Clarified"
+    assert removed.record.metadata.evidence == ()
+    if child_location is not None and child_bytes_before is not None:
+        assert _files(child_location.real_root) == child_bytes_before
+
+
+def test_registered_child_rejects_missing_and_ambiguous_target_ids(tmp_path: Path) -> None:
+    parent_repo = tmp_path / "parent"
+    child_repo = tmp_path / "child"
+    parent_repo.mkdir()
+    child_repo.mkdir()
+    repository = FilesystemStoreRepository()
+    locks = FileLockManager()
+    views = MarkdownViewRenderer()
+    child_id = StoreId("sto_019f0000000070008000000000000001")
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(parent_repo, STORE_ID, "Parent", "UTC")
+    )
+    InitializeStore(repository, repository, locks, views).execute(
+        InitRequest(child_repo, child_id.root, "Child", "UTC")
+    )
+    parent = location_from_root(parent_repo / ".untaped" / "orchestration")
+    child = location_from_root(child_repo / ".untaped" / "orchestration")
+    executor = MutationExecutor(repository, repository, locks, views, projector=repository)
+    parent_scope = MutationScope((parent,), parent, lambda: _load(repository, parent))
+    parent_before = repository.load_local(parent, headers_only=False)
+    task = CreateTask(executor, repository, Clock()).execute(
+        parent_scope,
+        CreateTaskRequest(
+            TaskId(TASK_ID), "Task", b"", (), TaskPriority.NORMAL, (), parent_before.store_revision
+        ),
+    )
+    _register_child(
+        repository,
+        parent,
+        child_id,
+        "../../../child/.untaped/orchestration",
+    )
+    complete = FederationService(repository, locks).load(parent, local=False, headers_only=False)
+    missing_id = DecisionId("dec_019f0000000070008000000000000002")
+    with pytest.raises(RelationConflict, match="target item"):
+        ChangeLink(executor, repository).add(
+            _resolved_scope(repository, complete),
+            LinkRequest(
+                task.record.metadata.id,
+                LinkRelation.GOVERNED_BY,
+                child_id,
+                missing_id,
+                task.record.revision,
+            ),
+        )
+
+    child_local = MutationScope((child,), child, lambda: _load(repository, child))
+    child_before = repository.load_local(child, headers_only=False)
+    decision = CreateDecision(executor, repository, Clock()).execute(
+        child_local,
+        CreateDecisionRequest(missing_id, "Decision", b"", (), child_before.store_revision),
+    )
+    duplicate = child.real_root / "decisions" / f"{missing_id.root}-duplicate.md"
+    duplicate.write_bytes(repository.read_file(child, decision.record.path).content)
+    ambiguous = FederationService(repository, locks).load(parent, local=False, headers_only=False)
+    child_before_attempt = _files(child.real_root)
+    with pytest.raises(InvalidMutationState):
+        ChangeLink(executor, repository).add(
+            _resolved_scope(repository, ambiguous),
+            LinkRequest(
+                task.record.metadata.id,
+                LinkRelation.GOVERNED_BY,
+                child_id,
+                missing_id,
+                task.record.revision,
+            ),
+        )
+    assert _files(child.real_root) == child_before_attempt

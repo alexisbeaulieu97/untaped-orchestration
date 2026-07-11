@@ -15,6 +15,7 @@ from untaped_orchestration.application.ports import (
     ViewRenderer,
 )
 from untaped_orchestration.application.results import (
+    Completeness,
     FederatedSnapshot,
     ItemRevision,
     MutationReceipt,
@@ -51,6 +52,15 @@ type SnapshotLoader = Callable[[], FederatedSnapshot]
 type MutationGuard = Callable[[FederatedSnapshot], None]
 type MutationBuilder = Callable[[FederatedSnapshot], IntendedMutation]
 type SnapshotValidator = Callable[[FederatedSnapshot], tuple[Diagnostic, ...]]
+
+
+def validate_selected_local(snapshot: FederatedSnapshot) -> tuple[Diagnostic, ...]:
+    selected_only = FederatedSnapshot(
+        snapshot.selected,
+        (snapshot.selected,),
+        Completeness(),
+    )
+    return validate_snapshot(selected_only, require_children=False)
 
 
 def _valid_or_raise(
@@ -119,13 +129,15 @@ class MutationExecutor:
         guard: MutationGuard,
         build: MutationBuilder,
         replayed: bool = False,
+        validator: SnapshotValidator | None = None,
     ) -> MutationReceipt:
+        operation_validator = validator or self._validator
         with self._locks.acquire(locations, timeout=self._lock_timeout):
             current_shape = inspect_store_shape(self._reader, selected)
             if current_shape.diagnostics:
                 raise InvalidMutationState(current_shape.diagnostics)
             current = load()
-            _valid_or_raise(current, self._validator)
+            _valid_or_raise(current, operation_validator)
             _validate_lock_set(locations, selected, current)
             guard(current)
             intended = build(current)
@@ -139,7 +151,7 @@ class MutationExecutor:
             if shape_diagnostics:
                 raise InvalidMutationState(shape_diagnostics)
             projected = projection.snapshot
-            _valid_or_raise(projected, self._validator)
+            _valid_or_raise(projected, operation_validator)
 
             changed = []
             for replacement in intended.replacements:
@@ -164,7 +176,7 @@ class MutationExecutor:
                 ),
                 projected.completeness,
             )
-            _valid_or_raise(after, self._validator)
+            _valid_or_raise(after, operation_validator)
             if selected_after != projected.selected:
                 raise InvalidMutationState(
                     (

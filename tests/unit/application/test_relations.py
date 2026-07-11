@@ -23,7 +23,12 @@ from untaped_orchestration.application.items import (
     RevisionConflict,
 )
 from untaped_orchestration.application.mutations import MutationExecutor
-from untaped_orchestration.application.results import Completeness, FederatedSnapshot
+from untaped_orchestration.application.results import (
+    Completeness,
+    FederatedSnapshot,
+    IncompleteStore,
+)
+from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.evidence import EvidenceReference, EvidenceRelation
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import LinkRelation, TaskPriority
@@ -315,6 +320,53 @@ def test_inactive_decision_allows_evidence_add_but_refuses_remove_and_generic_li
                 added.record.revision,
             ),
         )
+
+
+@pytest.mark.parametrize(("reason", "severity"), [("missing", "warning"), ("invalid", "error")])
+def test_decision_evidence_add_remove_uses_selected_local_policy(
+    tmp_path: Path,
+    reason: str,
+    severity: str,
+) -> None:
+    repository, _location, scope, executor, _task, decision = _state(tmp_path)
+    child_id = StoreId("sto_019f0000000070008000000000000001")
+
+    def incomplete_load() -> FederatedSnapshot:
+        current = scope.load()
+        entry = IncompleteStore(
+            child_id,
+            reason,  # type: ignore[arg-type]
+            Diagnostic(
+                code="ORC005",
+                severity=severity,
+                path="registry.toml",
+                field=f"children.{child_id.root}",
+                message="unrelated child unavailable",
+                hint="restore child",
+            ),
+        )
+        return FederatedSnapshot(current.selected, current.stores, Completeness((entry,)))
+
+    incomplete_scope = MutationScope(scope.locations, scope.selected, incomplete_load)
+    service = ChangeEvidence(executor, repository)
+    request = EvidenceRequest(
+        decision.record.metadata.id,
+        EvidenceRelation.TRACKED_BY,
+        EvidenceReference("url:https://example.com/context"),
+        decision.record.revision,
+    )
+    added = service.add(incomplete_scope, request)
+    removed = service.remove(
+        incomplete_scope,
+        EvidenceRequest(
+            request.item_id,
+            request.relation,
+            request.reference,
+            added.record.revision,
+        ),
+    )
+
+    assert removed.record.metadata.evidence == ()
 
 
 def test_cross_store_governance_validates_federated_target_without_mutating_target(
