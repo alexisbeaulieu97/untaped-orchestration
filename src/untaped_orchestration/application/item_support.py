@@ -212,6 +212,7 @@ def execute_mutation(
     build: Callable[[FederatedSnapshot], IntendedMutation],
     *,
     validator: SnapshotValidator | None = None,
+    dry_run: bool = False,
 ) -> MutationReceipt:
     return executor.execute(
         locations=scope.locations,
@@ -220,6 +221,7 @@ def execute_mutation(
         guard=guard,
         build=build,
         validator=validator,
+        dry_run=dry_run,
     )
 
 

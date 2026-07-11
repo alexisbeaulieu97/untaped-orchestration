@@ -176,6 +176,7 @@ class MutationExecutor:
         build: MutationBuilder,
         replayed: bool = False,
         validator: SnapshotValidator | None = None,
+        dry_run: bool = False,
     ) -> MutationReceipt:
         operation_validator = validator or self._validator
         with self._locks.acquire(locations, timeout=self._lock_timeout):
@@ -198,6 +199,27 @@ class MutationExecutor:
                 raise InvalidMutationState(shape_diagnostics)
             projected = projection.snapshot
             _valid_or_raise(projected, operation_validator)
+
+            if dry_run:
+                return MutationReceipt(
+                    applied=False,
+                    replayed=False,
+                    canonical_applied=False,
+                    views_current=False,
+                    intended_paths=tuple(
+                        (
+                            *(value.path for value in intended.replacements),
+                            *(value.path for value in intended.deletions),
+                        )
+                    ),
+                    changed_paths=(),
+                    item_revisions=tuple(
+                        ItemRevision(record.path, record.revision)
+                        for record in current.selected.records
+                    ),
+                    store_revision=current.selected.store_revision,
+                    registry_revision=current.selected.registry_revision,
+                )
 
             changed = []
             for replacement in intended.replacements:

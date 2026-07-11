@@ -18,7 +18,6 @@ from untaped_orchestration.application.item_support import (
 )
 from untaped_orchestration.application.mutations import (
     IntendedMutation,
-    InvalidMutationState,
     MutationExecutor,
 )
 from untaped_orchestration.application.ports import (
@@ -29,9 +28,7 @@ from untaped_orchestration.application.ports import (
 )
 from untaped_orchestration.application.results import (
     FederatedSnapshot,
-    ItemRevision,
     LoadedRecord,
-    MutationReceipt,
 )
 from untaped_orchestration.application.task_recovery import (
     accepted_close_base_matches,
@@ -789,43 +786,14 @@ class TaskService:
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
             active = _active(snapshot, request.item_id)
             assert active is not None
-            return (
-                IntendedMutation(deletions=(FileDeletion(active.path),))
-                if request.apply
-                else IntendedMutation()
-            )
+            return IntendedMutation(deletions=(FileDeletion(active.path),))
 
-        if not request.apply:
-            snapshot = self._scope.recursive.load()
-            diagnostics = validator(snapshot)
-            if any(value.severity == "error" for value in diagnostics):
-                raise InvalidMutationState(diagnostics)
-            guard(snapshot)
-            assert (
-                planned.path is not None
-                and planned.metadata is not None
-                and planned.body is not None
-            )
-            receipt = MutationReceipt(
-                applied=False,
-                replayed=False,
-                canonical_applied=False,
-                views_current=False,
-                intended_paths=(),
-                changed_paths=(),
-                item_revisions=tuple(
-                    ItemRevision(record.path, record.revision)
-                    for record in snapshot.selected.records
-                ),
-                store_revision=snapshot.selected.store_revision,
-                registry_revision=snapshot.selected.registry_revision,
-            )
-            return record_result(planned, receipt)
         receipt = execute_mutation(
             self._executor,
             self._scope.recursive,
             guard,
             build,
             validator=validator,
+            dry_run=not request.apply,
         )
         return record_result(planned, receipt)

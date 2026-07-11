@@ -203,6 +203,35 @@ def test_duplicate_repair_preview_and_apply_both_refuse_invalid_projected_store(
     assert active_path.exists()
 
 
+@pytest.mark.parametrize("apply", [False, True])
+def test_duplicate_repair_preview_and_apply_both_refuse_invalid_store_shape(
+    tmp_path: Path,
+    apply: bool,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    current = repository.load_local(location, headers_only=False)
+    archived = service.close(close_request(task, current.store_revision, TaskOutcome.DECLINED))
+    active_path = location.real_root.joinpath(*task.record.path.parts)
+    active_path.parent.mkdir(exist_ok=True)
+    active_path.write_bytes(repository.item_bytes(task.record.metadata, task.record.body or b""))
+    (location.real_root / "rogue.bin").write_bytes(b"unexpected")
+    duplicate = repository.load_local(location, headers_only=False)
+    active = next(r for r in duplicate.records if isinstance(r.metadata, ActiveTask))
+
+    with pytest.raises(InvalidMutationState) as failure:
+        service.repair_duplicate(
+            RepairDuplicateRequest(
+                task.record.metadata.id,
+                active.revision,
+                archived.record.revision,
+                apply,
+            )
+        )
+    assert failure.value.diagnostics
+    assert active_path.exists()
+
+
 @pytest.mark.parametrize(
     "outcome",
     [TaskOutcome.DELIVERED, TaskOutcome.DECLINED, TaskOutcome.CANCELLED],
