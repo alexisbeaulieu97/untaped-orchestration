@@ -109,6 +109,9 @@ def validate_store_shape(
 
 
 def shape_is_load_safe(entries: tuple[StoreEntry, ...]) -> bool:
+    by_path = {entry.path: entry for entry in entries}
+    if any(by_path.get(path) != StoreEntry(path, "file") for path in REQUIRED_SCAFFOLD_PATHS):
+        return False
     for entry in entries:
         path = entry.path
         if entry.kind in {"symlink", "other"}:
@@ -136,8 +139,5 @@ def inspect_store_shape(reader: StoreReader, location: StoreLocation) -> ShapeIn
         entries=entries,
         contents=contents,
         diagnostics=validate_store_shape(entries, contents),
-        load_safe=(
-            shape_is_load_safe(entries)
-            and any(entry == StoreEntry(STORE_PATH, "file") for entry in entries)
-        ),
+        load_safe=(shape_is_load_safe(entries)),
     )

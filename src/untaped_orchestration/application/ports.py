@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
+from untaped_orchestration.application.results import AdministrativeState as AdministrativeState
 from untaped_orchestration.application.results import FederatedSnapshot as FederatedSnapshot
 from untaped_orchestration.application.results import (
     FileDeletion as FileDeletion,
@@ -36,6 +37,7 @@ from untaped_orchestration.domain.models import Registry, StoreConfig
 
 __all__ = [
     "MANAGED_VIEW_PATHS",
+    "AdministrativeState",
     "CanonicalFormatter",
     "Clock",
     "FileDeletion",
@@ -82,6 +84,8 @@ class StoreReader(Protocol):
     def read_file(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord: ...
 
     def list_entries(self, location: StoreLocation) -> tuple[StoreEntry, ...]: ...
+
+    def inspect_administrative(self, location: StoreLocation) -> AdministrativeState: ...
 
 
 class StoreWriter(Protocol):

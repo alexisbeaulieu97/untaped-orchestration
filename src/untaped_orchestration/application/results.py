@@ -80,6 +80,12 @@ class StoreEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class AdministrativeState:
+    store_id: str | None
+    registry_revision: Revision | None
+
+
+@dataclass(frozen=True, slots=True)
 class IncompleteStore:
     expected_store_id: StoreId
     reason: IncompletenessReason
@@ -155,8 +161,8 @@ class MutationReceipt:
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
-    store_id: str
-    store_revision: Revision
+    store_id: str | None
+    store_revision: Revision | None
     registry_revision: Revision | None
     valid: bool
     views_current: bool

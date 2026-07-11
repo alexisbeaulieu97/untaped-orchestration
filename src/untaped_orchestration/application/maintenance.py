@@ -28,7 +28,6 @@ from untaped_orchestration.domain.diagnostics import Diagnostic, sort_diagnostic
 from untaped_orchestration.domain.models import Revision
 
 DEFAULT_LOCK_TIMEOUT = 10.0
-_ZERO_REVISION = Revision("sha256:" + "0" * 64)
 
 
 class InvalidStoreState(ValueError):
@@ -75,11 +74,16 @@ def _invalid_result(
     )
 
 
-def _shape_result(inspection: ShapeInspection) -> CheckResult:
+def _shape_result(
+    reader: StoreReader,
+    location: StoreLocation,
+    inspection: ShapeInspection,
+) -> CheckResult:
+    administrative = reader.inspect_administrative(location)
     return CheckResult(
-        store_id="",
-        store_revision=_ZERO_REVISION,
-        registry_revision=None,
+        store_id=administrative.store_id,
+        store_revision=None,
+        registry_revision=administrative.registry_revision,
         valid=False,
         views_current=False,
         diagnostics=inspection.diagnostics,
@@ -142,7 +146,7 @@ class CheckStore:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
             inspection = inspect_store_shape(self._reader, location)
             if not inspection.load_safe:
-                return _shape_result(inspection)
+                return _shape_result(self._reader, location, inspection)
             snapshot = self._reader.load_local(location, headers_only=False)
             semantic_diagnostics = _validate(snapshot)
             diagnostics = list(semantic_diagnostics)
@@ -207,7 +211,10 @@ class RenderStore:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
             inspection = inspect_store_shape(self._reader, location)
             if inspection.diagnostics:
-                raise InvalidStoreState(inspection.diagnostics, _shape_result(inspection))
+                raise InvalidStoreState(
+                    inspection.diagnostics,
+                    _shape_result(self._reader, location, inspection),
+                )
             snapshot = self._reader.load_local(location, headers_only=False)
             diagnostics = _validate(snapshot)
             if _invalid(diagnostics):
@@ -289,7 +296,10 @@ class FormatStore:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
             inspection = inspect_store_shape(self._reader, location)
             if inspection.diagnostics:
-                raise InvalidStoreState(inspection.diagnostics, _shape_result(inspection))
+                raise InvalidStoreState(
+                    inspection.diagnostics,
+                    _shape_result(self._reader, location, inspection),
+                )
             snapshot = self._reader.load_local(location, headers_only=False)
             diagnostics = _validate(snapshot)
             if _invalid(diagnostics) or snapshot.store is None or snapshot.registry is None:

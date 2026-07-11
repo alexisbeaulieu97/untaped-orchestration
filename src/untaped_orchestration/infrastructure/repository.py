@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 from untaped_orchestration.application.ports import (
+    AdministrativeState,
     CanonicalFormatter,
     FederatedSnapshot,
     FileDeletion,
@@ -31,6 +32,7 @@ from untaped_orchestration.infrastructure.codec import (
 from untaped_orchestration.infrastructure.filesystem import (
     ADMIN_PATHS,
     AtomicFilesystem,
+    PathSafetyError,
     StoreNotFoundError,
     canonical_input_paths,
     discover_location,
@@ -177,6 +179,21 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
 
     def list_entries(self, location: StoreLocation) -> tuple[StoreEntry, ...]:
         return store_entries(location)
+
+    def inspect_administrative(self, location: StoreLocation) -> AdministrativeState:
+        store_id = None
+        registry_revision = None
+        try:
+            store_raw = safe_read_path(location, PurePosixPath("store.toml")).read_bytes()
+            store_id = self._stores.parse(store_raw).id.root
+        except CodecError, FileNotFoundError, PathSafetyError:
+            pass
+        try:
+            registry_raw = safe_read_path(location, PurePosixPath("registry.toml")).read_bytes()
+            registry_revision = file_revision(registry_raw)
+        except FileNotFoundError, PathSafetyError:
+            pass
+        return AdministrativeState(store_id, registry_revision)
 
     def prepare(self, root: Path) -> StoreLocation:
         return prepare_store_root(root)

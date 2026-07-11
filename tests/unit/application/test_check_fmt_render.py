@@ -309,6 +309,41 @@ def test_check_reports_a_missing_anchor_without_attempting_semantic_load(
 
     assert not result.valid
     assert [(value.code, value.path) for value in result.diagnostics] == [("ORC003", "store.toml")]
+    assert result.store_id is None
+    assert result.store_revision is None
+    assert result.registry_revision is not None
+
+
+@pytest.mark.parametrize("relative", ["registry.toml", "AGENTS.md", "CLAUDE.md"])
+def test_required_scaffold_directory_returns_structured_truthful_result_and_refusals(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    path = root / relative
+    path.unlink()
+    path.mkdir()
+    location = location_from_root(root)
+
+    checked = CheckStore(repository, locks, views).execute(location)
+
+    assert not checked.valid
+    assert checked.store_id == STORE_ID
+    assert checked.store_revision is None
+    assert (checked.registry_revision is None) is (relative == "registry.toml")
+    assert checked.diagnostics
+    assert {value.path for value in checked.diagnostics} == {relative}
+
+    for operation in (
+        lambda: RenderStore(repository, repository, locks, views).write(location),
+        lambda: FormatStore(repository, repository, locks, views, CanonicalStoreFormatter()).write(
+            location, expected_store_revision="sha256:" + "0" * 64
+        ),
+    ):
+        with pytest.raises(InvalidStoreState) as captured:
+            operation()
+        assert captured.value.diagnostics == checked.diagnostics
+        assert captured.value.result == checked
 
 
 @pytest.mark.parametrize("kind", ["decision", "task"])
@@ -452,6 +487,9 @@ def test_check_reports_unsafe_shape_before_tolerant_semantic_load(
 
     assert not result.valid
     assert [(value.code, value.path) for value in result.diagnostics] == [(code, relative)]
+    assert result.store_id == STORE_ID
+    assert (result.store_revision is None) is (relative != "unexpected")
+    assert result.registry_revision is not None
 
 
 def test_fmt_and_render_refusal_carry_unsafe_shape_diagnostics(tmp_path: Path) -> None:
