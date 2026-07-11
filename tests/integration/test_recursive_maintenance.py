@@ -94,6 +94,9 @@ def test_recursive_check_reports_all_invalid_children_but_missing_is_warning_by_
 
     assert not result.valid
     assert any(value.path.endswith(f"{TASK_ID}-bad.md") for value in result.diagnostics)
+    child_check = next(value for value in result.checks if value.store_id == CHILD_STORE_ID)
+    assert not child_check.valid
+    assert any(value.path.endswith(f"{TASK_ID}-bad.md") for value in child_check.diagnostics)
 
     child.rename(tmp_path / "gone")
     missing = _service().check(RecursiveCheckRequest(location))
@@ -146,3 +149,44 @@ def test_recursive_fmt_check_is_read_only_and_fmt_write_requires_local(tmp_path:
         service.fmt_write(
             RecursiveFormatRequest(location, local=False), expected_store_revision=None
         )
+
+
+@pytest.mark.integration
+def test_recursive_fmt_qualifies_identical_paths_and_invalid_data_never_matches(
+    tmp_path: Path,
+) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    _registry(parent, child)
+    relative = PurePosixPath(f"tasks/{TASK_ID}-same.md")
+    for root in (parent, child):
+        target = root.joinpath(*relative.parts)
+        target.parent.mkdir()
+        target.write_bytes(task_bytes())
+    result = _service().fmt_check(RecursiveFormatRequest(location_from_root(parent)))
+    attributed = [value.store_id for value in result.comparisons if value.path == relative]
+    assert attributed == [CHILD_STORE_ID, STORE_ID]
+
+    child.joinpath(*relative.parts).write_bytes(b"not front matter")
+    invalid = _service().fmt_check(RecursiveFormatRequest(location_from_root(parent)))
+    assert not invalid.matches
+    assert any(value.code == "ORC001" for value in invalid.diagnostics)
+
+
+@pytest.mark.integration
+def test_recursive_check_reads_child_view_revision_without_rendering_child(tmp_path: Path) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    _registry(parent, child)
+    _render_local(parent)
+    _render_local(child)
+    child.joinpath("registry.toml").write_bytes(
+        child.joinpath("registry.toml").read_bytes() + b"\n"
+    )
+    views = RecordingViews()
+
+    result = _service(views).check(RecursiveCheckRequest(location_from_root(parent)))
+
+    child_check = next(value for value in result.checks if value.store_id == CHILD_STORE_ID)
+    assert not child_check.views_current
+    assert child.resolve() not in views.locations

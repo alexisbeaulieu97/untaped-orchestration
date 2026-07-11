@@ -79,6 +79,7 @@ class RemoveChildRequest:
 @dataclass(frozen=True, slots=True)
 class ListChildrenRequest:
     location: StoreLocation
+    limit: int = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,7 @@ class RegistryChildRow:
 class ListChildrenResult:
     children: tuple[RegistryChildRow, ...]
     registry_revision: Revision
+    truncated: bool = False
 
 
 class _NoopLocks:
@@ -658,18 +660,23 @@ class FederationRegistryService:
         self._lock_timeout = lock_timeout
 
     def list_children(self, request: ListChildrenRequest) -> ListChildrenResult:
+        if not 1 <= request.limit <= 200:
+            raise ValueError("limit must be in range 1..200")
         snapshot = self._reader.load_local(request.location, headers_only=True)
         if snapshot.registry is None or snapshot.registry_revision is None:
             raise RegistryMutationConflict("selected registry is invalid")
+        rows = tuple(RegistryChildRow(value.id, value.path) for value in snapshot.registry.children)
         return ListChildrenResult(
-            tuple(RegistryChildRow(value.id, value.path) for value in snapshot.registry.children),
+            rows[: request.limit],
             snapshot.registry_revision,
+            len(rows) > request.limit,
         )
 
     def add_child(self, request: AddChildRequest) -> MutationReceipt:
         child_id = (
             request.child_id if isinstance(request.child_id, StoreId) else StoreId(request.child_id)
         )
+        child = RegistryChild(id=child_id, path=request.path)
         current = self._optimistic(request.location)
         selected = current.selected
         if selected.registry is None:
@@ -678,7 +685,7 @@ class FederationRegistryService:
             raise RegistryMutationConflict("child store ID is already registered")
         child_location = self._reader.discover(
             request.location.root,
-            override=request.location.root.joinpath(*PurePosixPath(request.path).parts),
+            override=request.location.root.joinpath(*PurePosixPath(child.path).parts),
         )
         proposed = self._optimistic(child_location)
         if (
@@ -692,7 +699,7 @@ class FederationRegistryService:
         registry = Registry(
             schema=selected.registry.schema_,
             store_id=selected.registry.store_id,
-            children=(*selected.registry.children, RegistryChild(id=child_id, path=request.path)),
+            children=(*selected.registry.children, child),
         )
         return self._mutate(request, current, proposed, registry)
 
@@ -719,6 +726,33 @@ class FederationRegistryService:
             location, local=False, headers_only=True
         )
 
+    def _reread_locked(
+        self,
+        locations: tuple[StoreLocation, ...],
+        optimistic: dict[str, tuple[Revision, Revision | None]],
+    ) -> None:
+        for location in locations:
+            try:
+                rediscovered = self._reader.discover(location.root, override=location.root)
+                if rediscovered.real_root != location.real_root:
+                    raise RegistryRevisionConflict(
+                        "a participating store path changed during registry mutation"
+                    )
+                present = self._reader.load_local(rediscovered, headers_only=True)
+            except RegistryRevisionConflict:
+                raise
+            except (OSError, ValueError) as error:
+                raise RegistryRevisionConflict(
+                    "a participating path, anchor, or registry changed during mutation"
+                ) from error
+            if optimistic[_path_key(location.real_root)] != (
+                present.store_config_revision,
+                present.registry_revision,
+            ):
+                raise RegistryRevisionConflict(
+                    "a participating anchor or registry changed during registry mutation"
+                )
+
     def _mutate(
         self,
         request: AddChildRequest | RemoveChildRequest,
@@ -742,16 +776,13 @@ class FederationRegistryService:
             for store in federation.stores
         }
         with self._locks.acquire(locations, timeout=self._lock_timeout):
-            for location in locations:
-                present = self._reader.load_local(location, headers_only=True)
-                if optimistic[_path_key(location.real_root)] != (
-                    present.store_config_revision,
-                    present.registry_revision,
-                ):
-                    raise RegistryRevisionConflict(
-                        "a participating anchor or registry changed during registry mutation"
-                    )
-            parent = self._reader.load_local(request.location, headers_only=True)
+            self._reread_locked(locations, optimistic)
+            try:
+                parent = self._reader.load_local(request.location, headers_only=True)
+            except (OSError, ValueError) as error:
+                raise RegistryRevisionConflict(
+                    "selected registry changed during mutation"
+                ) from error
             if (
                 not request.force_current
                 and parent.registry_revision != request.expected_registry_revision
@@ -771,14 +802,21 @@ class FederationRegistryService:
                 parent.store_config_revision,
             )
             overlay = _OverlayReader(self._reader, request.location, projected_parent)
-            final = FederationService(overlay, _NoopLocks()).load(
-                request.location, local=False, headers_only=True
-            )
-            final_paths = {_path_key(value.location.real_root) for value in final.stores}
-            if not final.completeness.complete or not final_paths <= set(by_path):
-                raise RegistryMutationConflict(
-                    "final registry graph is incomplete or discovered a path outside the lock set"
+            try:
+                final = FederationService(overlay, _NoopLocks()).load(
+                    request.location, local=False, headers_only=True
                 )
+            except (OSError, ValueError) as error:
+                raise RegistryRevisionConflict(
+                    "registry graph changed while validating the locked union"
+                ) from error
+            final_paths = {_path_key(value.location.real_root) for value in final.stores}
+            if not final_paths <= set(by_path):
+                raise RegistryRevisionConflict(
+                    "registry graph discovered a path outside the locked union"
+                )
+            if not final.completeness.complete:
+                raise RegistryMutationConflict("final registry graph is incomplete")
             diagnostics = validate_snapshot(final, require_children=True)
             if any(value.severity == "error" for value in diagnostics):
                 raise RegistryMutationConflict("final registry graph is invalid")

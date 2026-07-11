@@ -8,7 +8,10 @@ import pytest
 from tests.builders import DECISION_ID, STORE_ID, TASK_ID
 from untaped_orchestration.application.queries import (
     BriefRequest,
+    HistoryListRequest,
     HistoryRequest,
+    HistorySearchRequest,
+    HistoryShowRequest,
     ListRequest,
     NextRequest,
     QueryScope,
@@ -302,6 +305,44 @@ def test_invalid_canonical_store_makes_partial_reads_incomplete_and_readiness_fa
         service.next(NextRequest())
 
 
+def test_duplicate_and_cyclic_unrelated_graph_data_degrades_partial_queries_without_crash() -> None:
+    scope, reader = _scope()
+    selected = scope.local().selected
+    task_record = next(r for r in selected.records if isinstance(r.metadata, ActiveTask))
+    decision_record = next(r for r in selected.records if isinstance(r.metadata, Decision))
+    cyclic = task_record.metadata.model_copy(update={"parent": task_record.metadata.id})
+    cyclic_record = task_record.__class__(task_record.path, task_record.revision, cyclic, None)
+    duplicate_path = PurePosixPath(f"decisions/{DECISION_ID}-duplicate.md")
+    duplicate = decision_record.__class__(
+        duplicate_path, _revision("7"), decision_record.metadata, None
+    )
+    selected = selected.__class__(
+        selected.location,
+        selected.store,
+        selected.registry,
+        (cyclic_record, decision_record, duplicate),
+        (),
+        (),
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    federation = FederatedSnapshot(selected, (selected,), Completeness())
+    reader.bodies[duplicate_path] = b"duplicate body"
+    service = QueryService(QueryScope(lambda: federation, lambda: federation), reader, Clock())
+
+    listed = service.list(ListRequest())
+    shown = service.show(ShowRequest(TaskId(TASK_ID)))
+    searched = service.search(SearchRequest("body", limit=2))
+    brief = service.brief(BriefRequest())
+
+    assert not listed.complete and listed.diagnostics
+    assert not shown.complete and shown.data.blocked is not None
+    assert not searched.complete and len(searched.data) <= 2
+    assert not brief.complete and brief.data.ready == ()
+    assert brief.data.globally_ready is False
+
+
 def test_limit_contract_and_history_and_trace_are_typed() -> None:
     scope, reader = _scope()
     service = QueryService(scope, reader, Clock())
@@ -353,6 +394,65 @@ def test_history_show_loads_one_archived_body() -> None:
     assert result.retained_bodies == 1
 
 
+def test_history_has_disjoint_typed_list_search_show_and_searches_body_metadata() -> None:
+    scope, reader = _scope()
+    selected = scope.local().selected
+    active = _task(waiting="alexis")
+    values = active.model_dump(by_alias=True)
+    values.pop("stage")
+    values.update(
+        {
+            "tags": ["historical-tag"],
+            "closed_from": "inbox",
+            "outcome": "declined",
+            "closed_at": "2026-07-10T00:00:00.000Z",
+            "close_note": "No longer needed",
+        }
+    )
+    archived = ArchivedTask.model_validate(values)
+    path = PurePosixPath(f"archive/tasks/{TASK_ID}-task.md")
+    record = LoadedRecord(path, _revision("8"), archived, None)
+    selected = selected.__class__(
+        selected.location,
+        selected.store,
+        selected.registry,
+        (record,),
+        (),
+        (),
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    federation = FederatedSnapshot(selected, (selected,), Completeness())
+    reader.bodies[path] = b"unique body needle"
+    service = QueryService(QueryScope(lambda: federation, lambda: federation), reader, Clock())
+
+    listed = service.history_list(HistoryListRequest(outcome="declined", tag="historical-tag"))
+    searched = service.history_search(HistorySearchRequest("unique body needle"))
+    metadata = service.history_search(HistorySearchRequest("No longer needed"))
+    shown = service.history_show(HistoryShowRequest(TaskId(TASK_ID)))
+
+    assert len(listed.data) == len(searched.data) == len(metadata.data) == 1
+    assert searched.retained_bodies == 1
+    assert shown.data.body == b"unique body needle"
+    assert shown.retained_bodies == 1
+
+
+def test_item_models_include_stable_projection_fields_for_task13() -> None:
+    scope, reader = _scope()
+    service = QueryService(scope, reader, Clock())
+    row = service.list(ListRequest(waiting_on="alexis")).data[0]
+    detail = service.show(ShowRequest(TaskId(TASK_ID))).data
+
+    assert row.priority.value == "high"
+    assert row.rank == 1000
+    assert row.due_on.root == "2026-07-08"
+    assert detail.blocked is True
+    assert detail.blockers
+    assert detail.due_on == row.due_on
+    assert detail.complete is True
+
+
 def test_trace_is_cycle_safe_breadth_first_directional_and_limit_bounded() -> None:
     scope, reader = _scope()
     selected = scope.local().selected
@@ -396,3 +496,49 @@ def test_trace_is_cycle_safe_breadth_first_directional_and_limit_bounded() -> No
     assert [value.depth for value in result.data.items] == [1]
     assert result.truncated
     assert reader.reads == []
+
+
+def test_trace_both_dedupes_edges_and_bounds_star_links_evidence_at_limit_one() -> None:
+    scope, reader = _scope()
+    selected = scope.local().selected
+    root_id = TaskId(TASK_ID)
+    records = []
+    root = _task(waiting="alexis").model_copy(update={"waiting_on": ()})
+    links = []
+    for index in range(3):
+        target = TaskId(f"tsk_019f00000000700080000000000000{index + 20:02x}")
+        links.append(
+            Link(relation=LinkRelation.DEPENDS_ON, target_store_id=StoreId(STORE_ID), target=target)
+        )
+        child = _task(waiting="alexis").model_copy(
+            update={"id": target, "rank": (index + 2) * 1000}
+        )
+        path = PurePosixPath(f"tasks/{target.root}-task.md")
+        records.append(LoadedRecord(path, _revision(str(index + 4)), child, None))
+    root = root.model_copy(update={"links": tuple(links)})
+    root_path = PurePosixPath(f"tasks/{root_id.root}-task.md")
+    records.append(LoadedRecord(root_path, _revision("1"), root, None))
+    selected = selected.__class__(
+        selected.location,
+        selected.store,
+        selected.registry,
+        tuple(records),
+        (),
+        (),
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    federation = FederatedSnapshot(selected, (selected,), Completeness())
+    service = QueryService(QueryScope(lambda: federation, lambda: federation), reader, Clock())
+
+    both = service.trace(TraceRequest(root_id, limit=1))
+    outgoing = service.trace(TraceRequest(root_id, direction=TraceDirection.OUTGOING, limit=1))
+    incoming = service.trace(TraceRequest(root_id, direction=TraceDirection.INCOMING, limit=1))
+
+    assert len(both.data.items) == len(outgoing.data.items) == 1
+    assert len(both.data.links) == len(outgoing.data.links) == 1
+    assert len(both.data.evidence) <= 1
+    assert len({(v.source, v.target, v.relation) for v in both.data.links}) == len(both.data.links)
+    assert incoming.data.items == ()
+    assert both.truncated and outgoing.truncated

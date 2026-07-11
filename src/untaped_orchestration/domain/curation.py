@@ -49,7 +49,7 @@ _PRIORITY_ORDER = {
 }
 
 
-def _task_due_on(
+def task_due_on(
     task: ActiveTask,
     *,
     timezone: IanaTimezone,
@@ -94,7 +94,7 @@ def curation_queue(
             continue
         context = by_store[task_node.store_id]
         today = local_calendar_date(now, context.timezone).as_date()
-        due_on = _task_due_on(
+        due_on = task_due_on(
             task_node.task,
             timezone=context.timezone,
             config=context.config,

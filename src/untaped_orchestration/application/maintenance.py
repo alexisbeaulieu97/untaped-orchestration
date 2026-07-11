@@ -46,6 +46,13 @@ class RecursiveFormatRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class StorePathComparison:
+    store_id: str | None
+    path: PurePosixPath
+    matches: bool
+
+
+@dataclass(frozen=True, slots=True)
 class RecursiveCheckResult:
     valid: bool
     complete: bool
@@ -55,13 +62,15 @@ class RecursiveCheckResult:
 
 @dataclass(frozen=True, slots=True)
 class RecursiveFormatResult:
-    comparisons: tuple[PathComparison, ...]
+    comparisons: tuple[StorePathComparison, ...]
     complete: bool
     diagnostics: tuple[Diagnostic, ...]
 
     @property
     def matches(self) -> bool:
-        return all(value.matches for value in self.comparisons)
+        return not any(value.severity == "error" for value in self.diagnostics) and all(
+            value.matches for value in self.comparisons
+        )
 
 
 class InvalidStoreState(ValueError):
@@ -405,6 +414,25 @@ class RecursiveMaintenanceService:
         self._local_formatter = local_formatter
         self._local_renderer = local_renderer
 
+    def _child_views_current(self, store: StoreSnapshot) -> bool:
+        if store.store is None:
+            return False
+        paths = self._views.managed_paths()
+        if not store.store.capabilities.active_tasks:
+            paths = tuple(path for path in paths if path.name == "decisions.md")
+        marker = f"Store revision: `{store.store_revision.root}`".encode()
+        try:
+            return all(
+                marker in self._reader.read_file(store.location, path).content for path in paths
+            )
+        except FileNotFoundError, OSError, ValueError:
+            return False
+
+    @staticmethod
+    def _local_diagnostics(store: StoreSnapshot) -> tuple[Diagnostic, ...]:
+        local = FederatedSnapshot(store, (store,), Completeness())
+        return validate_snapshot(local, require_children=False)
+
     def check(self, request: RecursiveCheckRequest) -> RecursiveCheckResult:
         snapshot = self._federation.load(
             request.location,
@@ -438,29 +466,39 @@ class RecursiveMaintenanceService:
                         )
             except OSError, ValueError:
                 selected_views_current = False
-        ordered = sort_diagnostics(diagnostics)
         checks = []
         for store in snapshot.stores:
-            local_diagnostics = tuple(
-                value
-                for value in ordered
-                if value.path.startswith(store.location.root.as_posix())
-                or value.path in {record.path.as_posix() for record in store.records}
+            local_diagnostics = list(self._local_diagnostics(store))
+            selected_store = store.location.real_root == snapshot.selected.location.real_root
+            views_current = (
+                selected_views_current if selected_store else self._child_views_current(store)
             )
+            if not views_current:
+                local_diagnostics.append(
+                    Diagnostic(
+                        code="ORC008",
+                        severity="error",
+                        path=(store.location.root / "views").as_posix(),
+                        field="",
+                        message="generated views are missing or stale",
+                        hint="Run render --write locally in this store.",
+                    )
+                )
+            local_ordered = sort_diagnostics(local_diagnostics)
             checks.append(
                 CheckResult(
                     _store_id(store),
                     store.store_revision,
                     store.registry_revision,
-                    not any(value.severity == "error" for value in local_diagnostics),
-                    selected_views_current
-                    if store.location.real_root == snapshot.selected.location.real_root
-                    else True,
-                    local_diagnostics,
+                    not any(value.severity == "error" for value in local_ordered),
+                    views_current,
+                    local_ordered,
                 )
             )
+        ordered = sort_diagnostics(diagnostics)
         return RecursiveCheckResult(
-            not any(value.severity == "error" for value in ordered),
+            not any(value.severity == "error" for value in ordered)
+            and all(value.valid for value in checks),
             True if request.local else snapshot.completeness.complete,
             tuple(checks),
             ordered,
@@ -473,7 +511,7 @@ class RecursiveMaintenanceService:
             headers_only=False,
         )
         diagnostics = validate_snapshot(snapshot, require_children=False)
-        comparisons: list[PathComparison] = []
+        comparisons: list[StorePathComparison] = []
         for store in snapshot.stores:
             if store.store is None or store.registry is None:
                 continue
@@ -484,7 +522,11 @@ class RecursiveMaintenanceService:
             for record in store.records:
                 assert record.body is not None
                 expected[record.path] = self._formatter.item_bytes(record.metadata, record.body)
-            comparisons.extend(_comparisons(self._reader, store.location, expected))
+            store_id = _store_id(store)
+            comparisons.extend(
+                StorePathComparison(store_id, value.path, value.matches)
+                for value in _comparisons(self._reader, store.location, expected)
+            )
         return RecursiveFormatResult(
             tuple(comparisons),
             True if request.local else snapshot.completeness.complete,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from untaped_orchestration.application.results import FederatedSnapshot
+from untaped_orchestration.domain.curation import CurationEntry
 from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.graph import DecisionState
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
@@ -15,8 +16,11 @@ from untaped_orchestration.domain.models import (
     ItemKind,
     LinkRelation,
     Revision,
+    TaskOutcome,
+    TaskPriority,
     TaskStage,
 )
+from untaped_orchestration.domain.time import CalendarDate
 
 DEFAULT_LIMIT = 50
 
@@ -97,8 +101,29 @@ class HistoryRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoryListRequest:
+    outcome: TaskOutcome | str | None = None
+    tag: str | None = None
+    local: bool = False
+    limit: int = DEFAULT_LIMIT
+
+
+@dataclass(frozen=True, slots=True)
+class HistorySearchRequest:
+    query: str
+    local: bool = False
+    limit: int = DEFAULT_LIMIT
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryShowRequest:
+    item_id: TaskId
+    local: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class BriefRequest:
-    pass
+    local: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +137,9 @@ class ItemRow:
     stage: TaskStage | None = None
     state: DecisionState | None = None
     waiting_on: tuple[str, ...] = ()
+    priority: TaskPriority | None = None
+    rank: int | None = None
+    due_on: CalendarDate | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +148,10 @@ class ItemDetail:
     metadata: ActiveTask | ArchivedTask | Decision
     body: bytes
     store_revision: Revision
+    blocked: bool | None = None
+    blockers: tuple[str, ...] = ()
+    due_on: CalendarDate | None = None
+    complete: bool = True
 
     @property
     def revision(self) -> Revision:
@@ -188,6 +220,7 @@ class BriefDecision:
 
 @dataclass(frozen=True, slots=True)
 class InactiveRuling:
+    store_id: StoreId
     item_id: DecisionId
     state: DecisionState | None
 
@@ -203,7 +236,7 @@ class BriefData:
     in_progress: ItemRow | None
     ready: tuple[ItemRow, ...]
     blockers: tuple[ItemRow, ...]
-    due: tuple[object, ...]
+    due: tuple[CurationEntry, ...]
     diagnostics: tuple[Diagnostic, ...]
     missing_store_ids: tuple[str, ...]
     ready_count: int
@@ -211,4 +244,5 @@ class BriefData:
     due_count: int
     diagnostic_count: int
     missing_store_count: int
+    inactive_ruling_count: int
     globally_ready: bool

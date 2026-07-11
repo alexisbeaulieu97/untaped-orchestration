@@ -9,8 +9,16 @@ from __future__ import annotations
 import tracemalloc
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 from tests.unit.application.test_federation import _registry, _store
+from untaped_orchestration.application.curation import CurateNextRequest, CurationService
+from untaped_orchestration.application.item_support import (
+    MutationExecutionScope,
+    MutationScope,
+)
+from untaped_orchestration.application.mutations import MutationExecutor
+from untaped_orchestration.application.ports import CanonicalFormatter
 from untaped_orchestration.application.queries import (
     BriefRequest,
     ListRequest,
@@ -141,6 +149,15 @@ def test_11_store_1000_item_queries_are_structurally_bounded() -> None:
     assert bodies.reads == []
     service.next(NextRequest(limit=200))
     assert bodies.reads == []
+    recursive = scope.recursive()
+    execution = MutationExecutionScope((), recursive.selected.location, scope.recursive)
+    CurationService(
+        cast(MutationExecutor, object()),
+        cast(CanonicalFormatter, object()),
+        Clock(),
+        MutationScope(execution, execution),
+    ).next(CurateNextRequest())
+    assert bodies.reads == []
 
     shown = service.show(ShowRequest(first_task))
     assert shown.retained_bodies == 1
@@ -158,4 +175,6 @@ def test_11_store_1000_item_queries_are_structurally_bounded() -> None:
     tracemalloc.stop()
     assert searched.retained_bodies <= 5
     assert len(searched.data) == 5
+    assert all(len(hit.snippet) <= 512 for hit in searched.data)
+    assert sum(len(hit.snippet) for hit in searched.data) <= 5 * 512
     assert peak > 0

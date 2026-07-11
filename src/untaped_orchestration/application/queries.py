@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Iterable
 
 from untaped_orchestration.application.ports import Clock, StoreReader
+from untaped_orchestration.application.query_brief import assemble_brief
 from untaped_orchestration.application.query_models import (
     BriefData,
-    BriefDecision,
     BriefRequest,
+    HistoryListRequest,
     HistoryRequest,
-    InactiveRuling,
+    HistorySearchRequest,
+    HistoryShowRequest,
     ItemDetail,
     ItemRow,
     ListRequest,
@@ -23,12 +24,22 @@ from untaped_orchestration.application.query_models import (
     SearchRequest,
     ShowRequest,
     TraceData,
-    TraceDirection,
-    TraceEvidence,
-    TraceItem,
-    TraceLink,
     TraceRequest,
 )
+from untaped_orchestration.application.query_models import (
+    TraceDirection as TraceDirection,
+)
+from untaped_orchestration.application.query_projection import (
+    SafeProjection,
+    active_records,
+    detail_for,
+    project_safely,
+    row_for,
+    selected_stores,
+    store_revisions,
+)
+from untaped_orchestration.application.query_search import stream_search
+from untaped_orchestration.application.query_trace import build_trace
 from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
@@ -41,7 +52,6 @@ from untaped_orchestration.domain.curation import StoreCurationContext, curation
 from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.graph import (
     DecisionRef,
-    DecisionState,
     GraphState,
     TaskRef,
     decision_state,
@@ -54,7 +64,7 @@ from untaped_orchestration.domain.models import (
     Decision,
     LinkRelation,
     Revision,
-    TaskStage,
+    TaskOutcome,
 )
 from untaped_orchestration.domain.ordering import TaskOrderItem, sort_tasks
 from untaped_orchestration.domain.time import UtcTimestamp
@@ -171,6 +181,13 @@ class QueryService:
     def _load(self, local: bool) -> FederatedSnapshot:
         return (self._scope.local if local else self._scope.recursive)()
 
+    def _project(self, snapshot: FederatedSnapshot, local: bool) -> SafeProjection:
+        return project_safely(
+            snapshot,
+            local=local,
+            now=UtcTimestamp.from_datetime(self._clock.now()),
+        )
+
     def _result[T](
         self,
         snapshot: FederatedSnapshot,
@@ -181,13 +198,13 @@ class QueryService:
         revisions: tuple[tuple[str, Revision], ...] = (),
         retained: int = 0,
     ) -> QueryResult[T]:
-        diagnostics = _query_diagnostics(snapshot, local)
+        projection = self._project(snapshot, local)
         return QueryResult(
             data,
-            _query_complete(snapshot, local),
+            projection.complete,
             truncated,
-            diagnostics,
-            _store_revisions(snapshot, local),
+            projection.diagnostics,
+            store_revisions(projection),
             revisions,
             retained,
         )
@@ -195,9 +212,9 @@ class QueryService:
     def list(self, request: ListRequest) -> QueryResult[tuple[ItemRow, ...]]:
         limit = _limit(request.limit)
         snapshot = self._load(request.local)
-        graph = _graph_state(snapshot)
+        projection = self._project(snapshot, request.local)
         rows = []
-        for store, record in _active_records(snapshot, request.local):
+        for store, record in active_records(projection):
             metadata = record.metadata
             if request.kind is not None and metadata.kind is not request.kind:
                 continue
@@ -215,7 +232,7 @@ class QueryService:
             ):
                 continue
             assert store.store is not None
-            row = _row(store.store.id, record, graph)
+            row = row_for(projection, store.store.id, record)
             if request.decision_state is not None and row.state is not request.decision_state:
                 continue
             rows.append(row)
@@ -233,12 +250,8 @@ class QueryService:
         store, record = _find(snapshot, request.item_id, request.local)
         assert store.store is not None
         body = self._reader.read_item_body(store.location, record.path)
-        detail = ItemDetail(
-            _row(store.store.id, record, _graph_state(snapshot)),
-            record.metadata,
-            body,
-            store.store_revision,
-        )
+        projection = self._project(snapshot, request.local)
+        detail = detail_for(projection, store, record, body)
         return self._result(
             snapshot,
             detail,
@@ -271,25 +284,14 @@ class QueryService:
         if not request.query:
             raise ValueError("search query must be nonempty")
         snapshot = self._load(request.local)
-        graph = _graph_state(snapshot)
-        needle = request.query.casefold()
-        hits: list[SearchHit] = []
-        total = 0
-        for store in _selected(snapshot, request.local):
-            if store.store is None:
-                continue
-            for record in store.records:
-                archived = isinstance(record.metadata, ArchivedTask)
-                if archived != request.history:
-                    continue
-                body = self._reader.read_item_body(store.location, record.path)
-                haystack = f"{record.metadata.title}\n".encode() + body
-                if needle not in haystack.decode("utf-8", errors="replace").casefold():
-                    continue
-                total += 1
-                if len(hits) < limit:
-                    text = body.decode("utf-8", errors="replace")
-                    hits.append(SearchHit(_row(store.store.id, record, graph), text[:512]))
+        projection = self._project(snapshot, request.local)
+        hits, total = stream_search(
+            projection,
+            self._reader,
+            request.query,
+            limit=limit,
+            archived=request.history,
+        )
         return self._result(
             snapshot, tuple(hits), local=request.local, truncated=total > limit, retained=len(hits)
         )
@@ -368,231 +370,122 @@ class QueryService:
             revisions=tuple((value.row.item_id.root, value.row.revision) for value in result_rows),
         )
 
-    def history(self, request: HistoryRequest) -> QueryResult[tuple[ItemRow, ...] | ItemDetail]:
+    def history(
+        self, request: HistoryRequest
+    ) -> (
+        QueryResult[tuple[ItemRow, ...]]
+        | QueryResult[tuple[SearchHit, ...]]
+        | QueryResult[ItemDetail]
+    ):
+        if request.item_id is not None:
+            return self.history_show(HistoryShowRequest(request.item_id, local=request.local))
+        if request.query is not None:
+            return self.history_search(
+                HistorySearchRequest(request.query, local=request.local, limit=request.limit)
+            )
+        return self.history_list(HistoryListRequest(local=request.local, limit=request.limit))
+
+    def history_list(self, request: HistoryListRequest) -> QueryResult[tuple[ItemRow, ...]]:
         limit = _limit(request.limit)
         snapshot = self._load(request.local)
-        values = [
-            (store, record)
-            for store in _selected(snapshot, request.local)
-            for record in store.records
-            if isinstance(record.metadata, ArchivedTask)
-            and (
-                request.query is None
-                or request.query.casefold() in record.metadata.title.casefold()
-            )
-        ]
-        if request.item_id is not None:
-            matches = [
-                (store, record) for store, record in values if record.metadata.id == request.item_id
-            ]
-            if len(matches) != 1:
-                raise ValueError("archived item does not resolve uniquely")
-            store, record = matches[0]
-            assert store.store is not None
-            body = self._reader.read_item_body(store.location, record.path)
-            return self._result(
-                snapshot,
-                ItemDetail(
-                    _row(store.store.id, record), record.metadata, body, store.store_revision
-                ),
-                local=request.local,
-                revisions=((record.metadata.id.root, record.revision),),
-                retained=1,
-            )
-        rows = sorted(
-            (_row(store.store.id, record) for store, record in values if store.store is not None),
-            key=lambda row: (row.store_id.root, row.path),
+        projection = self._project(snapshot, request.local)
+        outcome = (
+            request.outcome.value if isinstance(request.outcome, TaskOutcome) else request.outcome
+        )
+        rows = []
+        for store in projection.snapshot.stores:
+            if store.store is None:
+                continue
+            for record in store.records:
+                metadata = record.metadata
+                if not isinstance(metadata, ArchivedTask):
+                    continue
+                if outcome is not None and metadata.outcome.value != outcome:
+                    continue
+                if request.tag is not None and request.tag not in {
+                    value.root for value in metadata.tags
+                }:
+                    continue
+                rows.append(row_for(projection, store.store.id, record))
+        rows.sort(key=lambda value: (value.store_id.root, value.path))
+        selected = tuple(rows[:limit])
+        return self._result(
+            snapshot,
+            selected,
+            local=request.local,
+            truncated=len(rows) > limit,
+            revisions=tuple((row.item_id.root, row.revision) for row in selected),
+        )
+
+    def history_search(self, request: HistorySearchRequest) -> QueryResult[tuple[SearchHit, ...]]:
+        limit = _limit(request.limit)
+        if not request.query:
+            raise ValueError("search query must be nonempty")
+        snapshot = self._load(request.local)
+        projection = self._project(snapshot, request.local)
+        hits, total = stream_search(
+            projection,
+            self._reader,
+            request.query,
+            limit=limit,
+            archived=True,
         )
         return self._result(
-            snapshot, tuple(rows[:limit]), local=request.local, truncated=len(rows) > limit
+            snapshot,
+            hits,
+            local=request.local,
+            truncated=total > limit,
+            revisions=tuple((hit.row.item_id.root, hit.row.revision) for hit in hits),
+            retained=len(hits),
+        )
+
+    def history_show(self, request: HistoryShowRequest) -> QueryResult[ItemDetail]:
+        snapshot = self._load(request.local)
+        matches = [
+            (store, record)
+            for store in selected_stores(snapshot, request.local)
+            for record in store.records
+            if isinstance(record.metadata, ArchivedTask) and record.metadata.id == request.item_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("archived item does not resolve uniquely")
+        store, record = matches[0]
+        assert store.store is not None
+        body = self._reader.read_item_body(store.location, record.path)
+        projection = self._project(snapshot, request.local)
+        detail = detail_for(projection, store, record, body)
+        return self._result(
+            snapshot,
+            detail,
+            local=request.local,
+            revisions=((record.metadata.id.root, record.revision),),
+            retained=1,
         )
 
     def trace(self, request: TraceRequest) -> QueryResult[TraceData]:
         limit = _limit(request.limit)
         snapshot = self._load(request.local)
-        stores = _selected(snapshot, request.local)
-        index = {
-            (store.store.id.root, record.metadata.id.root): (store, record)
-            for store in stores
-            if store.store is not None
-            for record in store.records
-        }
+        stores = selected_stores(snapshot, request.local)
         root_store, root_record = _find(snapshot, request.item_id, request.local)
         assert root_store.store is not None
         root = QualifiedItem(root_store.store.id, root_record.metadata.id)
-        pending = deque([(root, 0)])
-        seen = {(root.store_id.root, root.item_id.root)}
-        items: list[TraceItem] = []
-        links: list[TraceLink] = []
-        evidence: list[TraceEvidence] = []
-        truncated = False
-        while pending:
-            current, depth = pending.popleft()
-            pair = index.get((current.store_id.root, current.item_id.root))
-            if pair is None:
-                continue
-            _, record = pair
-            evidence.extend(
-                TraceEvidence(current, value.relation.value, value.reference.root, depth)
-                for value in record.metadata.evidence
-            )
-            edges: list[tuple[QualifiedItem, QualifiedItem, LinkRelation]] = []
-            if request.direction in {TraceDirection.OUTGOING, TraceDirection.BOTH}:
-                edges.extend(
-                    (current, QualifiedItem(link.target_store_id, link.target), link.relation)
-                    for link in record.metadata.links
-                )
-            if request.direction in {TraceDirection.INCOMING, TraceDirection.BOTH}:
-                for (source_store, _), (_, candidate) in index.items():
-                    for link in candidate.metadata.links:
-                        if (
-                            link.target_store_id == current.store_id
-                            and link.target == current.item_id
-                        ):
-                            edges.append(
-                                (
-                                    QualifiedItem(StoreId(source_store), candidate.metadata.id),
-                                    current,
-                                    link.relation,
-                                )
-                            )
-            edges.sort(
-                key=lambda value: (
-                    value[2].value,
-                    value[1].store_id.root,
-                    value[1].item_id.root,
-                    value[0].item_id.root,
-                )
-            )
-            for source, target, relation in edges:
-                neighbor = target if source == current else source
-                key = (neighbor.store_id.root, neighbor.item_id.root)
-                links.append(TraceLink(source, target, relation, depth + 1))
-                if key in seen:
-                    continue
-                if len(items) >= limit:
-                    truncated = True
-                    continue
-                seen.add(key)
-                items.append(TraceItem(neighbor, depth + 1))
-                pending.append((neighbor, depth + 1))
-        data = TraceData(root, tuple(items), tuple(links), tuple(evidence))
+        data, truncated = build_trace(
+            stores,
+            root,
+            direction=request.direction,
+            limit=limit,
+        )
         return self._result(snapshot, data, local=request.local, truncated=truncated)
 
     def brief(self, request: BriefRequest) -> QueryResult[BriefData]:
-        del request
-        snapshot = self._load(False)
-        selected = snapshot.selected
-        config = selected.store
-        if config is None:
-            raise ValueError("brief requires a valid selected store configuration")
-        graph = _graph_state(snapshot)
-        query_complete = _query_complete(snapshot, False)
-        local_decisions = {
-            record.metadata.id: record
-            for record in selected.records
-            if isinstance(record.metadata, Decision)
-        }
-        pinned: list[BriefDecision] = []
-        inactive: list[InactiveRuling] = []
-        item_revisions: list[tuple[str, Revision]] = []
-        remaining = config.brief.max_total_body_bytes
-        truncated = False
-        for item_id in config.brief.pinned_decisions[:10]:
-            record = local_decisions.get(item_id)
-            if record is None:
-                inactive.append(InactiveRuling(item_id, None))
-                continue
-            state = decision_state(DecisionRef(config.id, item_id), graph)
-            item_revisions.append((item_id.root, record.revision))
-            if state is not DecisionState.ACTIVE:
-                inactive.append(InactiveRuling(item_id, state))
-                continue
-            body = self._reader.read_item_body(selected.location, record.path)
-            body, cut = _truncate_utf8(
-                body,
-                min(config.brief.max_decision_body_bytes, remaining),
-            )
-            truncated |= cut
-            remaining -= len(body)
-            pinned.append(BriefDecision(item_id, record.metadata.title, record.revision, body))
-
-        task_pairs: list[tuple[StoreSnapshot, LoadedRecord]] = []
-        order_items: list[TaskOrderItem] = []
-        for store, record in _active_records(snapshot, False):
-            if not isinstance(record.metadata, ActiveTask):
-                continue
-            assert store.store is not None
-            task_pairs.append((store, record))
-            order_items.append(TaskOrderItem(store.store.id, record.metadata))
-        ordered = sort_tasks(order_items)
-        record_index = {
-            (store.store.id, record.metadata.id): record
-            for store, record in task_pairs
-            if store.store is not None
-        }
-        rows = [
-            _row(value.store_id, record_index[(value.store_id, value.task.id)], graph)
-            for value in ordered
-        ]
-        in_progress = next((row for row in rows if row.stage is TaskStage.IN_PROGRESS), None)
-        ready_rows: list[ItemRow] = []
-        blocker_rows: list[ItemRow] = []
-        for value, row in zip(ordered, rows, strict=True):
-            status = readiness(TaskRef(value.store_id, value.task.id), graph)
-            if status.ready and query_complete:
-                ready_rows.append(row)
-            elif not status.ready:
-                blocker_rows.append(row)
-
-        contexts = tuple(
-            StoreCurationContext(store.store.id, store.store.timezone, store.store.curation)
-            for store in snapshot.stores
-            if store.store is not None
-        )
-        due = curation_queue(
-            graph,
-            now=UtcTimestamp.from_datetime(self._clock.now()),
-            contexts=contexts,
-        )
-        cap = config.brief.max_rows_per_section
-        diagnostics = _query_diagnostics(snapshot, False)
-        missing = snapshot.completeness.missing_store_ids
-        data = BriefData(
-            config.id,
-            selected.store_revision,
-            selected.registry_revision,
-            tuple(item_revisions),
-            tuple(pinned),
-            tuple(inactive[:cap]),
-            in_progress,
-            tuple(ready_rows[:cap]),
-            tuple(blocker_rows[:cap]),
-            tuple(due[:cap]),
-            diagnostics[:cap],
-            missing[:cap],
-            len(ready_rows),
-            len(blocker_rows),
-            len(due),
-            len(diagnostics),
-            len(missing),
-            query_complete and bool(ready_rows),
-        )
-        truncated |= any(
-            value > cap
-            for value in (
-                len(ready_rows),
-                len(blocker_rows),
-                len(due),
-                len(diagnostics),
-                len(missing),
-            )
-        )
+        snapshot = self._load(request.local)
+        projection = self._project(snapshot, request.local)
+        data, truncated, revisions, retained = assemble_brief(projection, self._reader)
         return self._result(
             snapshot,
             data,
-            local=False,
+            local=request.local,
             truncated=truncated,
-            revisions=tuple(item_revisions),
-            retained=len(pinned),
+            revisions=revisions,
+            retained=retained,
         )

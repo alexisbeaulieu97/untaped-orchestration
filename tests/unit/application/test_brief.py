@@ -113,6 +113,10 @@ def test_incomplete_brief_names_missing_stores_and_never_emits_global_ready_rows
     assert result.data.diagnostic_count == 1
     assert result.data.globally_ready is False
 
+    local = QueryService(scope, bodies, Clock()).brief(BriefRequest(local=True))
+    assert local.complete
+    assert local.data.missing_store_ids == ()
+
 
 def test_brief_caps_diagnostics_and_missing_ids_but_preserves_full_counts() -> None:
     from tests.unit.application.test_queries import _scope
@@ -194,3 +198,69 @@ def test_brief_names_inactive_pinned_ruling_without_loading_its_body() -> None:
     assert result.data.inactive_rulings[0].item_id == retired.id
     assert result.data.inactive_rulings[0].state.value == "retired"
     assert bodies.reads == []
+
+
+def test_brief_collects_store_qualified_governed_inactive_rulings_with_full_count() -> None:
+    from tests.unit.application.test_queries import _scope, _task
+    from untaped_orchestration.domain.ids import TaskId
+    from untaped_orchestration.domain.models import Link, LinkRelation
+
+    scope, bodies = _scope()
+    selected = scope.local().selected
+    assert selected.store is not None
+    records = []
+    for index in range(11):
+        decision_id = DecisionId(f"dec_019f00000000700080000000{index + 100:08x}")
+        decision = Decision.model_validate(
+            {
+                "schema": "untaped.orchestration.decision/v1",
+                "id": decision_id.root,
+                "kind": "decision",
+                "title": f"Retired {index}",
+                "created_at": "2026-07-01T00:00:00.000Z",
+                "tags": [],
+                "links": [],
+                "evidence": [],
+                "retired_at": "2026-07-02T00:00:00.000Z",
+                "retire_note": "old",
+            }
+        )
+        decision_path = PurePosixPath(f"decisions/{decision_id.root}-retired.md")
+        records.append(LoadedRecord(decision_path, _revision("d"), decision, None))
+        task_id = TaskId(f"tsk_019f00000000700080000000{index + 100:08x}")
+        task = _task(waiting="alexis").model_copy(
+            update={
+                "id": task_id,
+                "rank": (index + 1) * 1000,
+                "links": (
+                    Link(
+                        relation=LinkRelation.GOVERNED_BY,
+                        target_store_id=selected.store.id,
+                        target=decision_id,
+                    ),
+                ),
+            }
+        )
+        task_path = PurePosixPath(f"tasks/{task_id.root}-task.md")
+        records.append(LoadedRecord(task_path, _revision("e"), task, None))
+    selected = selected.__class__(
+        selected.location,
+        selected.store,
+        selected.registry,
+        tuple(records),
+        (),
+        (),
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    federation = FederatedSnapshot(selected, (selected,), Completeness())
+
+    result = QueryService(
+        QueryScope(lambda: federation, lambda: federation), bodies, Clock()
+    ).brief(BriefRequest())
+
+    assert len(result.data.inactive_rulings) == 10
+    assert result.data.inactive_ruling_count == 11
+    assert all(value.store_id == selected.store.id for value in result.data.inactive_rulings)
+    assert result.truncated

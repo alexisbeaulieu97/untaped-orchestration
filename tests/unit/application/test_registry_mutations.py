@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from tests.builders import CHILD_STORE_ID, STORE_ID, write_store
 from untaped_orchestration.application.federation import (
@@ -67,12 +68,16 @@ def test_child_add_list_remove_use_exact_registry_revision_and_only_write_parent
 
     assert added.canonical_applied
     assert added.changed_paths[0].as_posix() == "registry.toml"
-    listed = service.list_children(ListChildrenRequest(parent_location))
+    listed = service.list_children(ListChildrenRequest(parent_location, limit=50))
     assert [(row.store_id.root, row.path) for row in listed.children] == [
         (CHILD_STORE_ID, _relative(parent, child))
     ]
     assert listed.registry_revision == added.registry_revision
+    assert not listed.truncated
     assert child_before == _durable_files(child)
+
+    with pytest.raises(ValueError, match=r"1\.\.200"):
+        service.list_children(ListChildrenRequest(parent_location, limit=201))
 
     removed = service.remove_child(
         RemoveChildRequest(
@@ -133,6 +138,71 @@ def test_force_current_does_not_bypass_invalid_child_identity(tmp_path: Path) ->
         )
 
 
+def test_invalid_absolute_child_path_is_rejected_before_any_store_io(tmp_path: Path) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+
+    class CountingRepository(FilesystemStoreRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def discover(self, start: Path, override: Path | None = None):
+            self.calls += 1
+            return super().discover(start, override)
+
+        def load_local(self, location, *, headers_only):
+            self.calls += 1
+            return super().load_local(location, headers_only=headers_only)
+
+    repository = CountingRepository()
+    service = FederationRegistryService(
+        repository, repository, FileLockManager(), MarkdownViewRenderer(), repository
+    )
+
+    with pytest.raises(ValidationError):
+        service.add_child(
+            AddChildRequest(
+                location_from_root(parent),
+                CHILD_STORE_ID,
+                "/absolute/unsafe",
+                expected_registry_revision=repository.inspect_administrative(
+                    location_from_root(parent)
+                ).registry_revision,
+            )
+        )
+
+    assert repository.calls == 0
+
+
+def test_renderer_failure_returns_truthful_canonical_receipt(tmp_path: Path) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    repository = FilesystemStoreRepository()
+    location = location_from_root(parent)
+    before = repository.load_local(location, headers_only=True)
+
+    class FailingViews(MarkdownViewRenderer):
+        def expected(self, snapshot):
+            raise ValueError("renderer failed")
+
+    service = FederationRegistryService(
+        repository, repository, FileLockManager(), FailingViews(), repository
+    )
+    result = service.add_child(
+        AddChildRequest(
+            location,
+            CHILD_STORE_ID,
+            _relative(parent, child),
+            expected_registry_revision=before.registry_revision,
+        )
+    )
+
+    assert result.canonical_applied
+    assert not result.views_current
+    assert result.changed_paths == (Path("registry.toml"),)
+    assert len(result.intended_paths) == 5
+
+
 def test_add_rejects_registry_change_that_would_discover_an_unlocked_path(
     tmp_path: Path,
 ) -> None:
@@ -184,3 +254,46 @@ path = "{_relative(child, grandchild)}"
         )
 
     assert repository.load_local(location, headers_only=True).registry.children == ()
+
+
+def test_add_rejects_symlinked_child_real_path_swap_under_union_lock(tmp_path: Path) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    first = write_store(tmp_path / "first", store_id=CHILD_STORE_ID)
+    second = write_store(tmp_path / "second", store_id=CHILD_STORE_ID)
+    link = tmp_path / "child-link"
+    link.symlink_to(first.parents[1], target_is_directory=True)
+    linked_root = link / ".untaped" / "orchestration"
+    repository = FilesystemStoreRepository()
+    location = location_from_root(parent)
+    before = repository.load_local(location, headers_only=True)
+
+    class SwappingLocks:
+        @contextmanager
+        def acquire(
+            self,
+            locations: Sequence[StoreLocation],
+            *,
+            timeout: float,
+        ) -> Iterator[None]:
+            with FileLockManager().acquire(locations, timeout=timeout):
+                link.unlink()
+                link.symlink_to(second.parents[1], target_is_directory=True)
+                yield
+
+    service = FederationRegistryService(
+        repository,
+        repository,
+        SwappingLocks(),
+        MarkdownViewRenderer(),
+        repository,
+    )
+
+    with pytest.raises(RegistryRevisionConflict, match="path changed"):
+        service.add_child(
+            AddChildRequest(
+                location,
+                CHILD_STORE_ID,
+                _relative(parent, linked_root),
+                expected_registry_revision=before.registry_revision,
+            )
+        )
