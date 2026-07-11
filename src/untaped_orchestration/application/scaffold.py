@@ -96,7 +96,7 @@ def validate_store_shape(
     diagnostics: list[Diagnostic] = []
     for required in REQUIRED_SCAFFOLD_PATHS:
         entry = by_path.get(required)
-        if entry is None or entry.kind != "file":
+        if entry is None:
             diagnostics.append(_diagnostic(required, "required scaffold file is missing"))
     for path, expected in INSTRUCTION_BYTES.items():
         if by_path.get(path) == StoreEntry(path, "file") and contents.get(path) != expected:

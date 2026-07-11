@@ -53,19 +53,20 @@ def _invalid(diagnostics: tuple[Diagnostic, ...]) -> bool:
     return any(value.severity == "error" for value in diagnostics)
 
 
+def _store_id(snapshot: StoreSnapshot) -> str | None:
+    if snapshot.store is not None:
+        return snapshot.store.id.root
+    if snapshot.registry is not None:
+        return snapshot.registry.store_id.root
+    return None
+
+
 def _invalid_result(
     snapshot: StoreSnapshot,
     diagnostics: tuple[Diagnostic, ...],
 ) -> CheckResult:
-    store_id = (
-        snapshot.store.id.root
-        if snapshot.store is not None
-        else snapshot.registry.store_id.root
-        if snapshot.registry is not None
-        else ""
-    )
     return CheckResult(
-        store_id=store_id,
+        store_id=_store_id(snapshot),
         store_revision=snapshot.store_revision,
         registry_revision=snapshot.registry_revision,
         valid=False,
@@ -168,15 +169,8 @@ class CheckStore:
                             )
                         )
             ordered = sort_diagnostics(diagnostics)
-            store_id = (
-                snapshot.store.id.root
-                if snapshot.store is not None
-                else snapshot.registry.store_id.root
-                if snapshot.registry is not None
-                else ""
-            )
             return CheckResult(
-                store_id=store_id,
+                store_id=_store_id(snapshot),
                 store_revision=snapshot.store_revision,
                 registry_revision=snapshot.registry_revision,
                 valid=not _invalid(ordered),

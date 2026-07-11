@@ -211,6 +211,35 @@ def test_check_reports_invalid_store_metadata_without_crashing(tmp_path: Path) -
     )
 
 
+def test_malformed_administrative_metadata_preserves_revisions_without_identity(
+    tmp_path: Path,
+) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    root.joinpath("store.toml").write_bytes(b"not = [valid\n")
+    root.joinpath("registry.toml").write_bytes(b"also = [invalid\n")
+    location = location_from_root(root)
+
+    checked = CheckStore(repository, locks, views).execute(location)
+
+    assert checked.store_id is None
+    assert checked.store_revision is not None
+    assert checked.registry_revision is not None
+    assert [(value.code, value.path) for value in checked.diagnostics] == [
+        ("ORC001", "registry.toml"),
+        ("ORC001", "store.toml"),
+    ]
+    for operation in (
+        lambda: RenderStore(repository, repository, locks, views).write(location),
+        lambda: FormatStore(repository, repository, locks, views, CanonicalStoreFormatter()).write(
+            location, expected_store_revision=checked.store_revision
+        ),
+    ):
+        with pytest.raises(InvalidStoreState) as captured:
+            operation()
+        assert captured.value.diagnostics == checked.diagnostics
+        assert captured.value.result == checked
+
+
 def test_fmt_view_failure_preserves_canonical_write_and_reports_stale_views(
     tmp_path: Path,
 ) -> None:
@@ -280,12 +309,12 @@ def test_check_keeps_partial_scaffold_and_orphan_temp_diagnostics_after_view_rep
     result = CheckStore(repository, locks, views).execute(location)
 
     assert not result.valid
-    assert {(value.code, value.path) for value in result.diagnostics} >= {
-        ("ORC003", "registry.toml"),
-        ("ORC003", "AGENTS.md"),
-        ("ORC003", "CLAUDE.md"),
-        ("ORC003", orphan.name),
-    }
+    assert [(value.code, value.path, value.message) for value in result.diagnostics] == [
+        ("ORC003", orphan.name, "orphan atomic-write temporary exists"),
+        ("ORC003", "AGENTS.md", "required scaffold file is missing"),
+        ("ORC003", "CLAUDE.md", "required scaffold file is missing"),
+        ("ORC003", "registry.toml", "required scaffold file is missing"),
+    ]
     assert not any(value.code == "ORC008" for value in result.diagnostics)
 
     with pytest.raises(InvalidStoreState) as captured:
@@ -314,25 +343,44 @@ def test_check_reports_a_missing_anchor_without_attempting_semantic_load(
     assert result.registry_revision is not None
 
 
-@pytest.mark.parametrize("relative", ["registry.toml", "AGENTS.md", "CLAUDE.md"])
-def test_required_scaffold_directory_returns_structured_truthful_result_and_refusals(
+@pytest.mark.parametrize(
+    ("relative", "entry", "message"),
+    [
+        (relative, entry, message)
+        for relative in ("store.toml", "registry.toml", "AGENTS.md", "CLAUDE.md")
+        for entry, message in (
+            ("directory", "unexpected directory exists"),
+            ("symlink", "unsafe symlink entry exists"),
+            ("nonregular", "unsafe other entry exists"),
+        )
+    ],
+)
+def test_required_scaffold_nonfile_returns_one_primary_diagnostic_and_refusals(
     tmp_path: Path,
     relative: str,
+    entry: str,
+    message: str,
 ) -> None:
     root, repository, locks, views = _initialized(tmp_path)
     path = root / relative
     path.unlink()
-    path.mkdir()
+    if entry == "directory":
+        path.mkdir()
+    elif entry == "symlink":
+        path.symlink_to(tmp_path)
+    else:
+        os.mkfifo(path)
     location = location_from_root(root)
 
     checked = CheckStore(repository, locks, views).execute(location)
 
     assert not checked.valid
-    assert checked.store_id == STORE_ID
+    assert (checked.store_id is None) is (relative == "store.toml")
     assert checked.store_revision is None
     assert (checked.registry_revision is None) is (relative == "registry.toml")
-    assert checked.diagnostics
-    assert {value.path for value in checked.diagnostics} == {relative}
+    assert [(value.code, value.path, value.message) for value in checked.diagnostics] == [
+        ("ORC003", relative, message)
+    ]
 
     for operation in (
         lambda: RenderStore(repository, repository, locks, views).write(location),

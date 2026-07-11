@@ -50,7 +50,7 @@ def _cell(value: object | None, *, identifier: bool = False) -> str:
 
 
 def _values(values: Iterable[object]) -> str:
-    rendered = ", ".join(_root(value) or "" for value in values)
+    rendered = ", ".join(value for item in values if (value := _root(item)) is not None)
     return _escape(rendered) if rendered else _MISSING
 
 
