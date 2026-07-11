@@ -62,7 +62,7 @@ def apply_views(
         expected, before = view_comparisons(reader, location, renderer, snapshot)
     except OSError, ValueError:
         return ViewState(
-            managed,
+            () if not write else managed,
             (),
             tuple(PathComparison(path, False) for path in managed),
             False,

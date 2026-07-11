@@ -17,6 +17,7 @@ from untaped_orchestration.application.mutations import (
 )
 from untaped_orchestration.application.ports import FileDeletion, FileReplacement
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
+from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -407,6 +408,31 @@ def test_renderer_failure_preserves_complete_intended_view_paths(
         PurePosixPath("views/decisions.md"),
     )
     assert result.changed_paths == (PurePosixPath("registry.toml"),)
+
+
+def test_observe_only_renderer_failure_never_claims_view_write_intent(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    views = RecordingViews(events, locks, fail=True)
+
+    locks.active = True
+    result = apply_views(
+        repository,
+        repository,
+        current.selected.location,
+        views,
+        current.selected,
+        write=False,
+    )
+
+    assert result.intended_paths == ()
+    assert result.changed_paths == ()
+    assert not result.current
+    assert result.comparisons
+    assert all(not comparison.matches for comparison in result.comparisons)
 
 
 def test_finalizer_rejects_a_durable_result_that_differs_from_the_projection(

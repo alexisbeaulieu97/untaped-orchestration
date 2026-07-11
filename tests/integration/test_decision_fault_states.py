@@ -284,3 +284,31 @@ def test_view_failure_receipt_keeps_truthful_canonical_paths(tmp_path: Path, fam
     assert not result.receipt.views_current
     assert set(result.receipt.changed_paths) < set(result.receipt.intended_paths)
     assert all(path.parts[0] != "views" for path in result.receipt.changed_paths)
+
+
+def test_fresh_final_noop_renderer_failure_claims_no_write_intent(tmp_path: Path) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    value = create_decision(repository, location, scope, executor, 1)
+    pin(repository, location, value.record.metadata.id)
+    guarded = repository.load_local(location, headers_only=False)
+    request = supersede_request((value,), guarded.store_revision)
+    DecisionService(executor, repository, Clock(), scope).supersede(request)
+    final = repository.load_local(location, headers_only=False)
+    failing_executor = MutationExecutor(
+        repository,
+        repository,
+        FileLockManager(),
+        FailingViews(),
+        projector=repository,
+    )
+
+    result = DecisionService(failing_executor, repository, Clock(), scope).supersede(
+        replace(request, expected_store_revision=final.store_revision)
+    )
+
+    assert not result.receipt.applied
+    assert not result.receipt.canonical_applied
+    assert not result.receipt.replayed
+    assert not result.receipt.views_current
+    assert result.receipt.intended_paths == ()
+    assert result.receipt.changed_paths == ()
