@@ -16,6 +16,7 @@ from untaped_orchestration.application.item_support import (
 )
 from untaped_orchestration.application.mutations import (
     IntendedMutation,
+    InvalidMutationState,
     MutationExecutor,
     validate_selected_local,
 )
@@ -65,6 +66,8 @@ class CurationService:
 
     def next(self, request: CurateNextRequest) -> tuple[CurationEntry, ...]:
         snapshot = (self._scope.selected_local if request.local else self._scope.recursive).load()
+        if not request.local and not snapshot.completeness.complete:
+            raise InvalidMutationState(snapshot.completeness.diagnostics)
         stores = (snapshot.selected,) if request.local else snapshot.stores
         contexts = []
         for store in stores:
@@ -123,10 +126,8 @@ class CurationService:
         decision = isinstance(initial_record.metadata, Decision)
         scope = self._scope.selected_local if decision else self._scope.recursive
         planned = PlannedRecord()
-        replay = False
 
         def guard(snapshot: FederatedSnapshot) -> None:
-            nonlocal replay
             record = selected_record(snapshot, item_id)
             if (
                 record is None
@@ -138,23 +139,10 @@ class CurationService:
                 snapshot, record.metadata.id
             ):
                 raise ItemStateConflict("inactive decision cannot be curated")
-            intended = all(
-                getattr(record.metadata, name) == value for name, value in updates.items()
-            )
-            if record.revision != expected_revision and intended:
-                planned.path, planned.metadata, planned.body = (
-                    record.path,
-                    record.metadata,
-                    record.body,
-                )
-                replay = True
-                return
             if record.revision != expected_revision:
                 raise RevisionConflict("curation revision is stale")
 
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
-            if replay:
-                return IntendedMutation(replayed=True)
             record = selected_record(snapshot, item_id)
             assert (
                 record is not None

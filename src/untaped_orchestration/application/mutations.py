@@ -20,6 +20,7 @@ from untaped_orchestration.application.results import (
     IncompleteStore,
     ItemRevision,
     MutationReceipt,
+    ProjectedMutation,
 )
 from untaped_orchestration.application.scaffold import (
     inspect_store_shape,
@@ -151,6 +152,19 @@ class MutationExecutor:
             lambda snapshot: validate_snapshot(snapshot, require_children=True)
         )
         self._lock_timeout = lock_timeout
+
+    def project(
+        self,
+        current: FederatedSnapshot,
+        replacements: Sequence[FileReplacement],
+        deletions: Sequence[FileDeletion],
+    ) -> ProjectedMutation:
+        return self._projector.project(
+            current,
+            current.selected.location,
+            replacements,
+            deletions,
+        )
 
     def execute(
         self,

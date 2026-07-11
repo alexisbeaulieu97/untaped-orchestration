@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import PurePosixPath
 
 from untaped_orchestration.application.curation import AcknowledgeRequest, CurationService
@@ -29,6 +29,14 @@ from untaped_orchestration.application.results import (
     LoadedRecord,
     MutationReceipt,
 )
+from untaped_orchestration.application.task_recovery import (
+    accepted_close_base_matches,
+    active_source,
+    canonical_revision,
+    semantic_source_matches,
+    successor_source,
+    supersedes_link,
+)
 from untaped_orchestration.application.validation import _graph_state, validate_snapshot
 from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.graph import TaskRef, readiness
@@ -36,8 +44,6 @@ from untaped_orchestration.domain.ids import TaskId
 from untaped_orchestration.domain.models import (
     ActiveTask,
     ArchivedTask,
-    Link,
-    LinkRelation,
     Revision,
     TaskOutcome,
     TaskStage,
@@ -139,32 +145,6 @@ def _archive_metadata(
     return ArchivedTask.model_validate(values)
 
 
-def _semantic_source_matches(active: LoadedRecord, archived: LoadedRecord) -> bool:
-    if not isinstance(active.metadata, ActiveTask) or not isinstance(
-        archived.metadata, ArchivedTask
-    ):
-        return False
-    return _active_source(archived.metadata) == active.metadata and active.body == archived.body
-
-
-def _active_source(archived: ArchivedTask) -> ActiveTask:
-    values = archived.model_dump(by_alias=True)
-    closed_from = values.pop("closed_from")
-    for field in ("outcome", "closed_at", "close_note"):
-        values.pop(field)
-    values["stage"] = closed_from
-    return ActiveTask.model_validate(values)
-
-
-def _canonical_revision(
-    formatter: CanonicalFormatter,
-    metadata: ActiveTask,
-    body: bytes,
-) -> Revision:
-    digest = sha256(formatter.item_bytes(metadata, body)).hexdigest()
-    return Revision(f"sha256:{digest}")
-
-
 def _placement_matches(
     snapshot: FederatedSnapshot,
     task: ActiveTask,
@@ -251,6 +231,301 @@ def _placement_replacements(
     return tuple(changes), plan.primary
 
 
+_ALLOWED_TRANSITIONS = {
+    (TaskStage.INBOX, TaskStage.BACKLOG),
+    (TaskStage.INBOX, TaskStage.PLANNED),
+    (TaskStage.BACKLOG, TaskStage.PLANNED),
+    (TaskStage.PLANNED, TaskStage.BACKLOG),
+    (TaskStage.PLANNED, TaskStage.IN_PROGRESS),
+    (TaskStage.IN_PROGRESS, TaskStage.PLANNED),
+    (TaskStage.BACKLOG, TaskStage.BACKLOG),
+}
+
+
+def _transition_target_matches(
+    snapshot: FederatedSnapshot,
+    task: ActiveTask,
+    request: TransitionTaskRequest,
+) -> bool:
+    return (
+        task.stage is request.to_stage
+        and task.parent == request.expected_parent
+        and (
+            task.revisit_when == request.revisit_when
+            if request.to_stage is TaskStage.BACKLOG
+            else task.revisit_when is None
+        )
+        and _placement_matches(
+            snapshot,
+            task,
+            RankScope(request.expected_parent, request.to_stage),
+            request.placement,
+        )
+    )
+
+
+def _validate_transition_change(
+    snapshot: FederatedSnapshot,
+    task: ActiveTask,
+    request: TransitionTaskRequest,
+) -> None:
+    if (task.stage, request.to_stage) not in _ALLOWED_TRANSITIONS:
+        raise TaskLifecycleConflict("task stage transition is not allowed")
+    if request.to_stage is TaskStage.BACKLOG:
+        if request.revisit_when is None or not request.revisit_when.strip():
+            raise TaskLifecycleConflict("backlog transition requires revisit_when")
+    elif request.revisit_when is not None:
+        raise TaskLifecycleConflict("revisit_when is allowed only for backlog")
+    if request.to_stage is TaskStage.IN_PROGRESS:
+        result = readiness(
+            TaskRef(selected_store_id(snapshot), request.item_id),
+            _graph_state(snapshot),
+        )
+        if not result.ready:
+            raise TaskLifecycleConflict("blocked task cannot enter in-progress")
+
+
+def _guard_transition(
+    snapshot: FederatedSnapshot,
+    request: TransitionTaskRequest,
+    planned: PlannedRecord,
+) -> bool:
+    record = _active(snapshot, request.item_id)
+    if record is None or not isinstance(record.metadata, ActiveTask) or record.body is None:
+        raise TaskLifecycleConflict("transition requires an active task")
+    if record.revision != request.expected_revision:
+        raise RevisionConflict("task transition revision is stale")
+    if snapshot.selected.store_revision != request.expected_store_revision:
+        raise RevisionConflict("task transition store revision is stale")
+    if record.metadata.parent != request.expected_parent:
+        raise TaskLifecycleConflict("current parent assertion failed")
+    target = RankScope(request.expected_parent, request.to_stage)
+    _guard_anchor(snapshot, request.placement, request.expected_anchor_revision, target)
+    if request.to_stage is not TaskStage.INBOX and _transition_target_matches(
+        snapshot, record.metadata, request
+    ):
+        planned.path, planned.metadata, planned.body = (
+            record.path,
+            record.metadata,
+            record.body,
+        )
+        return True
+    _validate_transition_change(snapshot, record.metadata, request)
+    return False
+
+
+def _guard_move(
+    snapshot: FederatedSnapshot,
+    request: MoveTaskRequest,
+    planned: PlannedRecord,
+) -> bool:
+    record = _active(snapshot, request.item_id)
+    if record is None or not isinstance(record.metadata, ActiveTask) or record.body is None:
+        raise TaskLifecycleConflict("move requires an active task")
+    if record.revision != request.expected_revision:
+        raise RevisionConflict("task move revision is stale")
+    if snapshot.selected.store_revision != request.expected_store_revision:
+        raise RevisionConflict("task move store revision is stale")
+    if record.metadata.parent != request.expected_parent:
+        raise TaskLifecycleConflict("current parent assertion failed")
+    if request.parent == request.item_id:
+        raise TaskLifecycleConflict("task cannot parent itself")
+    if request.parent is not None and _active(snapshot, request.parent) is None:
+        raise TaskLifecycleConflict("target parent must be an active same-store task")
+    ancestor = request.parent
+    seen = {request.item_id}
+    while ancestor is not None:
+        if ancestor in seen:
+            raise TaskLifecycleConflict("task move would create a containment cycle")
+        seen.add(ancestor)
+        parent_record = _active(snapshot, ancestor)
+        ancestor = (
+            parent_record.metadata.parent
+            if parent_record is not None and isinstance(parent_record.metadata, ActiveTask)
+            else None
+        )
+    target = RankScope(request.parent, record.metadata.stage)
+    _guard_anchor(snapshot, request.placement, request.expected_anchor_revision, target)
+    if not _placement_matches(snapshot, record.metadata, target, request.placement):
+        return False
+    planned.path, planned.metadata, planned.body = record.path, record.metadata, record.body
+    return True
+
+
+def _validate_close_preconditions(
+    snapshot: FederatedSnapshot,
+    request: CloseTaskRequest,
+    active: LoadedRecord,
+) -> None:
+    if _archive(snapshot, request.item_id) is not None:
+        return
+    assert isinstance(active.metadata, ActiveTask)
+    result = readiness(
+        TaskRef(selected_store_id(snapshot), request.item_id),
+        _graph_state(snapshot),
+    )
+    if request.outcome is TaskOutcome.DELIVERED and not result.ready:
+        raise TaskLifecycleConflict("delivered close requires complete unblocked readiness")
+    descendants = {"descendant-active", "descendant-undelivered"}
+    if request.outcome is not TaskOutcome.DELIVERED and any(
+        blocker.kind.value in descendants for blocker in result.blockers
+    ):
+        raise TaskLifecycleConflict("close outcome requires every descendant archived")
+    if request.outcome is TaskOutcome.CANCELLED and active.metadata.started_at is None:
+        raise TaskLifecycleConflict("cancelled close requires a previously started task")
+
+
+def _guard_close(
+    snapshot: FederatedSnapshot,
+    request: CloseTaskRequest,
+    planned: PlannedRecord,
+    formatter: CanonicalFormatter,
+    *,
+    successor_matches: Callable[[FederatedSnapshot], bool],
+    accepted_base_matches: Callable[[FederatedSnapshot], bool],
+) -> bool:
+    active = _active(snapshot, request.item_id)
+    archive = _archive(snapshot, request.item_id)
+    if active is None:
+        if not (
+            archive is not None
+            and isinstance(archive.metadata, ArchivedTask)
+            and archive.body is not None
+            and canonical_revision(formatter, active_source(archive.metadata), archive.body)
+            == request.expected_revision
+            and archive.metadata.outcome is request.outcome
+            and archive.metadata.close_note == request.note
+            and successor_matches(snapshot)
+        ):
+            raise TaskLifecycleConflict("final archive does not exactly match close request")
+        if not accepted_base_matches(snapshot):
+            raise RevisionConflict("task close store revision is stale")
+        planned.path, planned.metadata, planned.body = archive.path, archive.metadata, archive.body
+        return True
+    if not isinstance(active.metadata, ActiveTask) or active.body is None:
+        raise TaskLifecycleConflict("close requires an active task")
+    if archive is not None and not semantic_source_matches(active, archive):
+        raise TaskLifecycleConflict("active/archive duplicate is divergent")
+    if active.revision != request.expected_revision:
+        raise RevisionConflict("task close revision is stale")
+    if (
+        snapshot.selected.store_revision != request.expected_store_revision
+        and not accepted_base_matches(snapshot)
+    ):
+        raise RevisionConflict("task close store revision is stale")
+    if request.successor_id is not None:
+        successor = _active(snapshot, request.successor_id)
+        if successor is None or successor.metadata.id == request.item_id:
+            raise TaskLifecycleConflict("successor must be a distinct active same-store task")
+        if successor.revision != request.expected_successor_revision and not successor_matches(
+            snapshot
+        ):
+            raise RevisionConflict("successor revision is stale")
+    _validate_close_preconditions(snapshot, request, active)
+    return False
+
+
+def _validate_close_snapshot(
+    snapshot: FederatedSnapshot,
+    request: CloseTaskRequest,
+    *,
+    intended_archive: Callable[[LoadedRecord], ArchivedTask],
+    successor_matches: Callable[[FederatedSnapshot], bool],
+) -> tuple[Diagnostic, ...]:
+    active = _active(snapshot, request.item_id)
+    archive = _archive(snapshot, request.item_id)
+    projected_record: LoadedRecord | None = None
+    removed: LoadedRecord | None = None
+    if active is not None and archive is not None:
+        removed = active
+    elif active is not None and request.successor_id is not None and successor_matches(snapshot):
+        projected_record = LoadedRecord(
+            PurePosixPath("archive/tasks") / active.path.name,
+            active.revision,
+            intended_archive(active),
+            active.body,
+        )
+    else:
+        return validate_snapshot(snapshot, require_children=True)
+    selected = snapshot.selected.__class__(
+        snapshot.selected.location,
+        snapshot.selected.store,
+        snapshot.selected.registry,
+        tuple(
+            projected_record if record is active and projected_record is not None else record
+            for record in snapshot.selected.records
+            if record is not removed
+        ),
+        snapshot.selected.load_diagnostics,
+        tuple(
+            value
+            for value in snapshot.selected.raw_index
+            if removed is None or value.path != removed.path
+        ),
+        snapshot.selected.store_revision,
+        snapshot.selected.registry_revision,
+        snapshot.selected.store_config_revision,
+    )
+    stores = tuple(selected if store is snapshot.selected else store for store in snapshot.stores)
+    return validate_snapshot(
+        FederatedSnapshot(selected, stores, snapshot.completeness),
+        require_children=True,
+    )
+
+
+def _build_close(
+    snapshot: FederatedSnapshot,
+    request: CloseTaskRequest,
+    planned: PlannedRecord,
+    formatter: CanonicalFormatter,
+    *,
+    replay: bool,
+    intended_archive: Callable[[LoadedRecord], ArchivedTask],
+    successor_matches: Callable[[FederatedSnapshot], bool],
+) -> IntendedMutation:
+    if replay:
+        return IntendedMutation(replayed=True)
+    active = _active(snapshot, request.item_id)
+    assert (
+        active is not None and isinstance(active.metadata, ActiveTask) and active.body is not None
+    )
+    archive = _archive(snapshot, request.item_id)
+    archive_path = PurePosixPath("archive/tasks") / active.path.name
+    if archive is not None:
+        assert isinstance(archive.metadata, ArchivedTask) and archive.body is not None
+        if (
+            archive.metadata.outcome is not request.outcome
+            or archive.metadata.close_note != request.note
+        ):
+            raise TaskLifecycleConflict("existing archive diverges from close request")
+        metadata = archive.metadata
+        planned.path, planned.metadata, planned.body = archive.path, archive.metadata, archive.body
+    else:
+        metadata = intended_archive(active)
+        planned.path, planned.metadata, planned.body = archive_path, metadata, active.body
+    replacements: list[FileReplacement] = []
+    if request.successor_id is not None and not successor_matches(snapshot):
+        successor = _active(snapshot, request.successor_id)
+        assert (
+            successor is not None
+            and isinstance(successor.metadata, ActiveTask)
+            and successor.body is not None
+        )
+        link = supersedes_link(selected_store_id(snapshot), request.item_id)
+        linked = validated_copy(successor.metadata, {"links": (*successor.metadata.links, link)})
+        replacements.append(
+            FileReplacement(successor.path, formatter.item_bytes(linked, successor.body))
+        )
+    if archive is None:
+        replacements.append(
+            FileReplacement(archive_path, formatter.item_bytes(metadata, active.body))
+        )
+    return IntendedMutation(
+        replacements=tuple(replacements),
+        deletions=(FileDeletion(active.path),),
+    )
+
+
 class TaskService:
     def __init__(
         self,
@@ -264,69 +539,17 @@ class TaskService:
         self._clock = clock
         self._scope = scope
 
-    def transition(self, request: TransitionTaskRequest) -> ItemMutationResult:  # noqa: C901
+    def transition(self, request: TransitionTaskRequest) -> ItemMutationResult:
         planned = PlannedRecord()
-        replay = False
+        idempotent = False
 
         def guard(snapshot: FederatedSnapshot) -> None:
-            nonlocal replay
-            record = _active(snapshot, request.item_id)
-            if record is None or not isinstance(record.metadata, ActiveTask) or record.body is None:
-                raise TaskLifecycleConflict("transition requires an active task")
-            target_scope = RankScope(request.expected_parent, request.to_stage)
-            final_fields = (
-                record.metadata.stage is request.to_stage
-                and record.metadata.parent == request.expected_parent
-                and (
-                    record.metadata.revisit_when == request.revisit_when
-                    if request.to_stage is TaskStage.BACKLOG
-                    else record.metadata.revisit_when is None
-                )
-                and _placement_matches(snapshot, record.metadata, target_scope, request.placement)
-            )
-            if record.revision != request.expected_revision and final_fields:
-                planned.path, planned.metadata, planned.body = (
-                    record.path,
-                    record.metadata,
-                    record.body,
-                )
-                replay = True
-                return
-            if record.metadata.parent != request.expected_parent:
-                raise TaskLifecycleConflict("current parent assertion failed")
-            if record.revision != request.expected_revision:
-                raise RevisionConflict("task transition revision is stale")
-            if snapshot.selected.store_revision != request.expected_store_revision:
-                raise RevisionConflict("task transition store revision is stale")
-            _guard_anchor(
-                snapshot, request.placement, request.expected_anchor_revision, target_scope
-            )
-            allowed = {
-                (TaskStage.INBOX, TaskStage.BACKLOG),
-                (TaskStage.INBOX, TaskStage.PLANNED),
-                (TaskStage.BACKLOG, TaskStage.PLANNED),
-                (TaskStage.PLANNED, TaskStage.BACKLOG),
-                (TaskStage.PLANNED, TaskStage.IN_PROGRESS),
-                (TaskStage.IN_PROGRESS, TaskStage.PLANNED),
-                (TaskStage.BACKLOG, TaskStage.BACKLOG),
-            }
-            if (record.metadata.stage, request.to_stage) not in allowed:
-                raise TaskLifecycleConflict("task stage transition is not allowed")
-            if request.to_stage is TaskStage.BACKLOG:
-                if request.revisit_when is None or not request.revisit_when.strip():
-                    raise TaskLifecycleConflict("backlog transition requires revisit_when")
-            elif request.revisit_when is not None:
-                raise TaskLifecycleConflict("revisit_when is allowed only for backlog")
-            if request.to_stage is TaskStage.IN_PROGRESS:
-                result = readiness(
-                    TaskRef(selected_store_id(snapshot), request.item_id), _graph_state(snapshot)
-                )
-                if not result.ready:
-                    raise TaskLifecycleConflict("blocked task cannot enter in-progress")
+            nonlocal idempotent
+            idempotent = _guard_transition(snapshot, request, planned)
 
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
-            if replay:
-                return IntendedMutation(replayed=True)
+            if idempotent:
+                return IntendedMutation()
             record = _active(snapshot, request.item_id)
             assert (
                 record is not None
@@ -366,51 +589,17 @@ class TaskService:
         receipt = execute_mutation(self._executor, self._scope.recursive, guard, build)
         return record_result(planned, receipt)
 
-    def move(self, request: MoveTaskRequest) -> ItemMutationResult:  # noqa: C901
+    def move(self, request: MoveTaskRequest) -> ItemMutationResult:
         planned = PlannedRecord()
-        replay = False
+        idempotent = False
 
         def guard(snapshot: FederatedSnapshot) -> None:
-            nonlocal replay
-            record = _active(snapshot, request.item_id)
-            if record is None or not isinstance(record.metadata, ActiveTask) or record.body is None:
-                raise TaskLifecycleConflict("move requires an active task")
-            target = RankScope(request.parent, record.metadata.stage)
-            if record.revision != request.expected_revision and _placement_matches(
-                snapshot, record.metadata, target, request.placement
-            ):
-                planned.path, planned.metadata, planned.body = (
-                    record.path,
-                    record.metadata,
-                    record.body,
-                )
-                replay = True
-                return
-            if record.metadata.parent != request.expected_parent:
-                raise TaskLifecycleConflict("current parent assertion failed")
-            if record.revision != request.expected_revision:
-                raise RevisionConflict("task move revision is stale")
-            if snapshot.selected.store_revision != request.expected_store_revision:
-                raise RevisionConflict("task move store revision is stale")
-            if request.parent == request.item_id:
-                raise TaskLifecycleConflict("task cannot parent itself")
-            if request.parent is not None and _active(snapshot, request.parent) is None:
-                raise TaskLifecycleConflict("target parent must be an active same-store task")
-            ancestor = request.parent
-            seen = {request.item_id}
-            while ancestor is not None:
-                if ancestor in seen:
-                    raise TaskLifecycleConflict("task move would create a containment cycle")
-                seen.add(ancestor)
-                parent_record = _active(snapshot, ancestor)
-                if parent_record is None or not isinstance(parent_record.metadata, ActiveTask):
-                    break
-                ancestor = parent_record.metadata.parent
-            _guard_anchor(snapshot, request.placement, request.expected_anchor_revision, target)
+            nonlocal idempotent
+            idempotent = _guard_move(snapshot, request, planned)
 
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
-            if replay:
-                return IntendedMutation(replayed=True)
+            if idempotent:
+                return IntendedMutation()
             record = _active(snapshot, request.item_id)
             assert (
                 record is not None
@@ -441,7 +630,7 @@ class TaskService:
             self._executor, self._formatter, self._clock, self._scope
         ).acknowledge(request, require_task=True)
 
-    def close(self, request: CloseTaskRequest) -> ItemMutationResult:  # noqa: C901
+    def close(self, request: CloseTaskRequest) -> ItemMutationResult:
         if not request.note.strip():
             raise TaskLifecycleConflict("close note must be nonempty")
         superseded = request.outcome is TaskOutcome.SUPERSEDED
@@ -460,220 +649,71 @@ class TaskService:
             return _archive_metadata(active.metadata, request.outcome, request.note, now)
 
         def successor_matches(snapshot: FederatedSnapshot) -> bool:
-            if request.successor_id is None:
+            if not superseded:
                 return True
-            successor = _active(snapshot, request.successor_id)
-            if successor is None or not isinstance(successor.metadata, ActiveTask):
-                return False
-            link = Link(
-                relation=LinkRelation.SUPERSEDES,
-                target_store_id=selected_store_id(snapshot),
-                target=request.item_id,
-            )
-            if link not in successor.metadata.links or successor.body is None:
-                return False
-            assert request.expected_successor_revision is not None
-            source = validated_copy(
-                successor.metadata,
-                {"links": tuple(value for value in successor.metadata.links if value != link)},
-            )
-            assert isinstance(source, ActiveTask)
+            assert request.successor_id is not None
             return (
-                _canonical_revision(self._formatter, source, successor.body)
-                == request.expected_successor_revision
+                successor_source(
+                    self._formatter,
+                    _active(snapshot, request.successor_id),
+                    supersedes_link(selected_store_id(snapshot), request.item_id),
+                    request.expected_successor_revision,
+                )
+                is not None
+            )
+
+        def accepted_phase_base_matches(snapshot: FederatedSnapshot) -> bool:
+            active = _active(snapshot, request.item_id)
+            archive = _archive(snapshot, request.item_id)
+            successor = (
+                _active(snapshot, request.successor_id)
+                if request.successor_id is not None
+                else None
+            )
+            return accepted_close_base_matches(
+                self._executor,
+                self._formatter,
+                snapshot,
+                active=active,
+                archive=archive,
+                successor=successor,
+                successor_link=(
+                    supersedes_link(selected_store_id(snapshot), request.item_id)
+                    if superseded
+                    else None
+                ),
+                expected_successor_revision=request.expected_successor_revision,
+                expected_store_revision=request.expected_store_revision,
             )
 
         def validator(snapshot: FederatedSnapshot) -> tuple[Diagnostic, ...]:
-            active = _active(snapshot, request.item_id)
-            archive = _archive(snapshot, request.item_id)
-            if active is not None and archive is not None:
-                selected = snapshot.selected.__class__(
-                    snapshot.selected.location,
-                    snapshot.selected.store,
-                    snapshot.selected.registry,
-                    tuple(record for record in snapshot.selected.records if record is not active),
-                    snapshot.selected.load_diagnostics,
-                    tuple(
-                        value for value in snapshot.selected.raw_index if value.path != active.path
-                    ),
-                    snapshot.selected.store_revision,
-                    snapshot.selected.registry_revision,
-                    snapshot.selected.store_config_revision,
-                )
-                stores = tuple(
-                    selected if store is snapshot.selected else store for store in snapshot.stores
-                )
-                return validate_snapshot(
-                    FederatedSnapshot(selected, stores, snapshot.completeness),
-                    require_children=True,
-                )
-            if (
-                active is not None
-                and archive is None
-                and successor_matches(snapshot)
-                and superseded
-            ):
-                projected_archive = intended_archive(active)
-                projected_record = LoadedRecord(
-                    PurePosixPath("archive/tasks") / active.path.name,
-                    active.revision,
-                    projected_archive,
-                    active.body,
-                )
-                selected = snapshot.selected.__class__(
-                    snapshot.selected.location,
-                    snapshot.selected.store,
-                    snapshot.selected.registry,
-                    tuple(
-                        projected_record if record is active else record
-                        for record in snapshot.selected.records
-                    ),
-                    snapshot.selected.load_diagnostics,
-                    snapshot.selected.raw_index,
-                    snapshot.selected.store_revision,
-                    snapshot.selected.registry_revision,
-                    snapshot.selected.store_config_revision,
-                )
-                stores = tuple(
-                    selected if store is snapshot.selected else store for store in snapshot.stores
-                )
-                return validate_snapshot(
-                    FederatedSnapshot(selected, stores, snapshot.completeness),
-                    require_children=True,
-                )
-            return validate_snapshot(snapshot, require_children=True)
+            return _validate_close_snapshot(
+                snapshot,
+                request,
+                intended_archive=intended_archive,
+                successor_matches=successor_matches,
+            )
 
-        def guard(snapshot: FederatedSnapshot) -> None:  # noqa: C901
+        def guard(snapshot: FederatedSnapshot) -> None:
             nonlocal replay
-            active = _active(snapshot, request.item_id)
-            archive = _archive(snapshot, request.item_id)
-            if active is None:
-                if (
-                    archive is not None
-                    and isinstance(archive.metadata, ArchivedTask)
-                    and archive.body is not None
-                    and _canonical_revision(
-                        self._formatter,
-                        _active_source(archive.metadata),
-                        archive.body,
-                    )
-                    == request.expected_revision
-                    and archive.metadata.outcome is request.outcome
-                    and archive.metadata.close_note == request.note
-                    and successor_matches(snapshot)
-                ):
-                    planned.path, planned.metadata, planned.body = (
-                        archive.path,
-                        archive.metadata,
-                        archive.body,
-                    )
-                    replay = True
-                    return
-                raise TaskLifecycleConflict("final archive does not exactly match close request")
-            if not isinstance(active.metadata, ActiveTask) or active.body is None:
-                raise TaskLifecycleConflict("close requires an active task")
-            if archive is not None and not _semantic_source_matches(active, archive):
-                raise TaskLifecycleConflict("active/archive duplicate is divergent")
-            if active.revision != request.expected_revision:
-                raise RevisionConflict("task close revision is stale")
-            if (
-                snapshot.selected.store_revision != request.expected_store_revision
-                and archive is None
-                and not successor_matches(snapshot)
-            ):
-                raise RevisionConflict("task close store revision is stale")
-            if superseded:
-                assert (
-                    request.successor_id is not None
-                    and request.expected_successor_revision is not None
-                )
-                successor = _active(snapshot, request.successor_id)
-                if successor is None or successor.metadata.id == request.item_id:
-                    raise TaskLifecycleConflict(
-                        "successor must be a distinct active same-store task"
-                    )
-                if (
-                    successor.revision != request.expected_successor_revision
-                    and not successor_matches(snapshot)
-                ):
-                    raise RevisionConflict("successor revision is stale")
-            if archive is None:
-                graph_readiness = readiness(
-                    TaskRef(selected_store_id(snapshot), request.item_id), _graph_state(snapshot)
-                )
-                if request.outcome is TaskOutcome.DELIVERED and not graph_readiness.ready:
-                    raise TaskLifecycleConflict(
-                        "delivered close requires complete unblocked readiness"
-                    )
-                descendant_blockers = {
-                    "descendant-active",
-                    "descendant-undelivered",
-                }
-                if request.outcome is not TaskOutcome.DELIVERED and any(
-                    blocker.kind.value in descendant_blockers
-                    for blocker in graph_readiness.blockers
-                ):
-                    raise TaskLifecycleConflict("close outcome requires every descendant archived")
-                if request.outcome is TaskOutcome.CANCELLED and active.metadata.started_at is None:
-                    raise TaskLifecycleConflict(
-                        "cancelled close requires a previously started task"
-                    )
+            replay = _guard_close(
+                snapshot,
+                request,
+                planned,
+                self._formatter,
+                successor_matches=successor_matches,
+                accepted_base_matches=accepted_phase_base_matches,
+            )
 
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
-            if replay:
-                return IntendedMutation(replayed=True)
-            active = _active(snapshot, request.item_id)
-            assert (
-                active is not None
-                and isinstance(active.metadata, ActiveTask)
-                and active.body is not None
-            )
-            archive = _archive(snapshot, request.item_id)
-            archive_path = PurePosixPath("archive/tasks") / active.path.name
-            if archive is not None:
-                assert isinstance(archive.metadata, ArchivedTask) and archive.body is not None
-                if (
-                    archive.metadata.outcome is not request.outcome
-                    or archive.metadata.close_note != request.note
-                ):
-                    raise TaskLifecycleConflict("existing archive diverges from close request")
-                metadata = archive.metadata
-                planned.path, planned.metadata, planned.body = (
-                    archive.path,
-                    archive.metadata,
-                    archive.body,
-                )
-            else:
-                metadata = intended_archive(active)
-                planned.path, planned.metadata, planned.body = archive_path, metadata, active.body
-            replacements: list[FileReplacement] = []
-            if superseded and not successor_matches(snapshot):
-                assert request.successor_id is not None
-                successor = _active(snapshot, request.successor_id)
-                assert (
-                    successor is not None
-                    and isinstance(successor.metadata, ActiveTask)
-                    and successor.body is not None
-                )
-                link = Link(
-                    relation=LinkRelation.SUPERSEDES,
-                    target_store_id=selected_store_id(snapshot),
-                    target=request.item_id,
-                )
-                linked = validated_copy(
-                    successor.metadata, {"links": (*successor.metadata.links, link)}
-                )
-                replacements.append(
-                    FileReplacement(
-                        successor.path, self._formatter.item_bytes(linked, successor.body)
-                    )
-                )
-            if archive is None:
-                replacements.append(
-                    FileReplacement(archive_path, self._formatter.item_bytes(metadata, active.body))
-                )
-            return IntendedMutation(
-                replacements=tuple(replacements), deletions=(FileDeletion(active.path),)
+            return _build_close(
+                snapshot,
+                request,
+                planned,
+                self._formatter,
+                replay=replay,
+                intended_archive=intended_archive,
+                successor_matches=successor_matches,
             )
 
         receipt = execute_mutation(
@@ -714,7 +754,7 @@ class TaskService:
         def guard(snapshot: FederatedSnapshot) -> None:
             active = _active(snapshot, request.item_id)
             archive = _archive(snapshot, request.item_id)
-            if active is None or archive is None or not _semantic_source_matches(active, archive):
+            if active is None or archive is None or not semantic_source_matches(active, archive):
                 raise TaskLifecycleConflict(
                     "duplicate repair requires an exact semantic source projection"
                 )

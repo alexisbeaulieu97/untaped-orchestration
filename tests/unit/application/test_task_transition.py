@@ -14,8 +14,6 @@ from untaped_orchestration.application.items import (
     MutationExecutionScope,
     MutationScope,
     RevisionConflict,
-    UpdateTask,
-    UpdateTaskRequest,
 )
 from untaped_orchestration.application.mutations import InvalidMutationState, MutationExecutor
 from untaped_orchestration.application.results import (
@@ -33,6 +31,7 @@ from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.ids import Slug, StoreId, TaskId
 from untaped_orchestration.domain.models import Revision, TaskOutcome, TaskPriority, TaskStage
 from untaped_orchestration.domain.ordering import PlacementAnchor, PlacementAnchorKind
+from untaped_orchestration.domain.time import UtcTimestamp
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -239,29 +238,70 @@ def test_start_refuses_waiting_party_and_stale_parent_store_or_item_guards(tmp_p
         )
 
 
-def test_exact_final_transition_replays_but_divergent_stale_state_conflicts(tmp_path: Path) -> None:
+def test_stale_transition_conflicts_even_when_current_shape_is_requested_final_state(
+    tmp_path: Path,
+) -> None:
     repository, location, scope, executor, service = state(tmp_path)
     task = create(repository, location, scope, executor)
     before = repository.load_local(location, headers_only=False)
     request = transition_request(task, before.store_revision, TaskStage.PLANNED)
-    first = service.transition(request)
-    replay = service.transition(request)
-    assert replay.receipt.replayed
-    UpdateTask(executor, repository).execute(
-        scope, UpdateTaskRequest(first.record.metadata.id, first.record.revision, title="diverged")
+    service.transition(request)
+    with pytest.raises(RevisionConflict):
+        service.transition(request)
+
+
+def test_fresh_guard_reissue_of_exact_transition_target_is_idempotent_noop(
+    tmp_path: Path,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    current = repository.load_local(location, headers_only=False)
+    transitioned = service.transition(
+        transition_request(task, current.store_revision, TaskStage.PLANNED)
     )
     current = repository.load_local(location, headers_only=False)
-    changed = next(
-        record for record in current.records if record.metadata.id == first.record.metadata.id
+    rank = transitioned.record.metadata.rank
+    result = service.transition(
+        transition_request(transitioned, current.store_revision, TaskStage.PLANNED)
     )
-    path = location.real_root.joinpath(*changed.path.parts)
-    path.write_bytes(
-        repository.item_bytes(
-            changed.metadata.model_copy(update={"stage": TaskStage.INBOX}),
-            changed.body or b"",
+    assert not result.receipt.applied
+    assert not result.receipt.replayed
+    assert result.record.metadata.rank == rank
+
+
+@pytest.mark.parametrize(
+    "divergence",
+    ["title", "body", "tags", "waiting_on", "started_at", "rank"],
+)
+def test_stale_transition_never_hides_unrelated_or_lifecycle_divergence(
+    tmp_path: Path,
+    divergence: str,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    before = repository.load_local(location, headers_only=False)
+    request = transition_request(task, before.store_revision, TaskStage.PLANNED)
+    transitioned = service.transition(request)
+    path = location.real_root.joinpath(*transitioned.record.path.parts)
+    metadata = transitioned.record.metadata
+    body = transitioned.record.body or b""
+    if divergence == "title":
+        metadata = metadata.model_copy(update={"title": "diverged"})
+    elif divergence == "body":
+        body = b"diverged body"
+    elif divergence == "tags":
+        metadata = metadata.model_copy(update={"tags": (Slug("diverged"),)})
+    elif divergence == "waiting_on":
+        metadata = metadata.model_copy(update={"waiting_on": (Slug("team"),)})
+    elif divergence == "started_at":
+        metadata = metadata.model_copy(
+            update={"started_at": UtcTimestamp("2026-07-12T00:00:00.000Z")}
         )
-    )
-    with pytest.raises((TaskLifecycleConflict, RevisionConflict)):
+    else:
+        metadata = metadata.model_copy(update={"rank": metadata.rank + 1})
+    path.write_bytes(repository.item_bytes(metadata, body))
+
+    with pytest.raises(RevisionConflict):
         service.transition(request)
 
 

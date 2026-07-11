@@ -17,8 +17,18 @@ from untaped_orchestration.application.items import (
     CreateDecisionRequest,
     MutationExecutionScope,
     MutationScope,
+    RevisionConflict,
+    UpdateTask,
+    UpdateTaskRequest,
 )
-from untaped_orchestration.domain.ids import DecisionId
+from untaped_orchestration.application.mutations import InvalidMutationState
+from untaped_orchestration.application.results import (
+    Completeness,
+    FederatedSnapshot,
+    IncompleteStore,
+)
+from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.ids import DecisionId, StoreId
 from untaped_orchestration.domain.models import Decision
 from untaped_orchestration.domain.time import CalendarDate
 
@@ -150,3 +160,86 @@ def test_decision_curation_uses_selected_local_scope_without_recursive_resolutio
         AcknowledgeRequest(decision.record.metadata.id, decision.record.revision)
     )
     assert acknowledged.record.metadata.reviewed_at is not None
+
+
+@pytest.mark.parametrize("reason", ["missing", "invalid", "timeout"])
+def test_recursive_curate_next_fails_closed_but_local_ignores_unrelated_child_failure(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    normal = CurationService(executor, repository, Clock(), scope)
+    task = normal.snooze(
+        SnoozeRequest(task.record.metadata.id, CalendarDate("2026-07-11"), task.record.revision)
+    )
+    child_id = StoreId("sto_019f0000000070008000000000000099")
+
+    def incomplete_load() -> FederatedSnapshot:
+        selected = repository.load_local(location, headers_only=False)
+        incomplete = IncompleteStore(
+            child_id,
+            reason,  # type: ignore[arg-type]
+            Diagnostic(
+                code="ORC005",
+                severity="error",
+                path="registry.toml",
+                field="children",
+                message=f"child {reason}",
+                hint="restore the child",
+            ),
+        )
+        return FederatedSnapshot(selected, (selected,), Completeness((incomplete,)))
+
+    recursive = MutationExecutionScope((location,), location, incomplete_load)
+    service = CurationService(
+        executor,
+        repository,
+        Clock(),
+        MutationScope(recursive, scope.selected_local),
+    )
+    with pytest.raises(InvalidMutationState):
+        service.next(CurateNextRequest())
+    local = service.next(CurateNextRequest(local=True))
+    assert [entry.item_id for entry in local] == [task.record.metadata.id]
+
+
+def test_acknowledge_and_same_date_snooze_never_replay_stale_revision(tmp_path: Path) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    service = CurationService(executor, repository, Clock(), scope)
+    snooze_request = SnoozeRequest(
+        task.record.metadata.id,
+        CalendarDate("2026-07-20"),
+        task.record.revision,
+    )
+    snoozed = service.snooze(snooze_request)
+    with pytest.raises(RevisionConflict):
+        service.snooze(snooze_request)
+
+    acknowledge_request = AcknowledgeRequest(
+        snoozed.record.metadata.id,
+        snoozed.record.revision,
+    )
+    acknowledged = service.acknowledge(acknowledge_request)
+    assert acknowledged.record.metadata.reviewed_at is not None
+    with pytest.raises(RevisionConflict):
+        service.acknowledge(acknowledge_request)
+
+
+def test_curation_stale_revision_conflicts_after_unrelated_item_divergence(tmp_path: Path) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    UpdateTask(executor, repository).execute(
+        scope,
+        UpdateTaskRequest(task.record.metadata.id, task.record.revision, title="diverged"),
+    )
+    service = CurationService(executor, repository, Clock(), scope)
+    with pytest.raises(RevisionConflict):
+        service.snooze(
+            SnoozeRequest(
+                task.record.metadata.id,
+                CalendarDate("2026-07-20"),
+                task.record.revision,
+            )
+        )

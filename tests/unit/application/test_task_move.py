@@ -100,16 +100,68 @@ def test_move_rejects_parent_cycle_and_stale_explicit_none_assertion(tmp_path: P
         )
 
 
-def test_exact_final_move_replays_only_unchanged_final_state(tmp_path: Path) -> None:
+def test_stale_move_conflicts_even_when_current_shape_is_the_requested_final_state(
+    tmp_path: Path,
+) -> None:
     repository, location, scope, executor, service = state(tmp_path)
     child = create(repository, location, scope, executor, suffix=1)
     parent = create(repository, location, scope, executor, suffix=2)
     current = repository.load_local(location, headers_only=False)
     move = request(child, current.store_revision, parent=parent.record.metadata.id)
     service.move(move)
-    assert service.move(move).receipt.replayed
-    sibling = create(repository, location, scope, executor, suffix=3)
-    current = repository.load_local(location, headers_only=False)
-    service.move(request(sibling, current.store_revision, parent=parent.record.metadata.id))
-    with pytest.raises((TaskLifecycleConflict, RevisionConflict)):
+    with pytest.raises(RevisionConflict):
         service.move(move)
+
+
+def test_fresh_guard_reissue_of_exact_move_target_is_idempotent_noop(tmp_path: Path) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    child = create(repository, location, scope, executor, suffix=1)
+    parent = create(repository, location, scope, executor, suffix=2)
+    current = repository.load_local(location, headers_only=False)
+    moved = service.move(request(child, current.store_revision, parent=parent.record.metadata.id))
+    current = repository.load_local(location, headers_only=False)
+    rank = moved.record.metadata.rank
+    result = service.move(request(moved, current.store_revision, parent=parent.record.metadata.id))
+    assert not result.receipt.applied
+    assert not result.receipt.replayed
+    assert result.record.metadata.rank == rank
+
+
+def test_relative_move_requires_fresh_anchor_revision_even_for_exact_current_placement(
+    tmp_path: Path,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    anchor = create(repository, location, scope, executor, suffix=1)
+    primary = create(repository, location, scope, executor, suffix=2)
+    current = repository.load_local(location, headers_only=False)
+    moved = service.move(
+        request(
+            primary,
+            current.store_revision,
+            anchor=PlacementAnchor(PlacementAnchorKind.BEFORE, anchor.record.metadata.id),
+            anchor_revision=anchor.record.revision,
+        )
+    )
+    anchor_path = location.real_root.joinpath(*anchor.record.path.parts)
+    anchor_path.write_bytes(
+        repository.item_bytes(
+            anchor.record.metadata.model_copy(update={"title": "changed anchor"}),
+            anchor.record.body or b"",
+        )
+    )
+    current = repository.load_local(location, headers_only=False)
+    current_primary = next(
+        record for record in current.records if record.metadata.id == moved.record.metadata.id
+    )
+    with pytest.raises(TaskLifecycleConflict, match="anchor"):
+        service.move(
+            MoveTaskRequest(
+                current_primary.metadata.id,
+                current_primary.metadata.parent,
+                current_primary.metadata.parent,
+                current_primary.revision,
+                current.store_revision,
+                PlacementAnchor(PlacementAnchorKind.BEFORE, anchor.record.metadata.id),
+                anchor.record.revision,
+            )
+        )

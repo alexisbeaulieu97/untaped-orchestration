@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tests.unit.application.test_task_transition import create, state, transition_request
+from untaped_orchestration.application.items import RevisionConflict
 from untaped_orchestration.application.tasks import (
     CloseTaskRequest,
     RepairDuplicateRequest,
@@ -170,3 +171,41 @@ def test_duplicate_repair_refuses_divergent_active_copy(tmp_path: Path) -> None:
                 task.record.metadata.id, active.revision, archived.record.revision, True
             )
         )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [TaskOutcome.DELIVERED, TaskOutcome.DECLINED, TaskOutcome.CANCELLED],
+)
+def test_fresh_ordinary_close_always_requires_exact_store_revision(
+    tmp_path: Path,
+    outcome: TaskOutcome,
+) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    task = create(repository, location, scope, executor, suffix=1)
+    if outcome is TaskOutcome.CANCELLED:
+        current = repository.load_local(location, headers_only=False)
+        task = service.transition(
+            transition_request(task, current.store_revision, TaskStage.PLANNED)
+        )
+        current = repository.load_local(location, headers_only=False)
+        task = service.transition(
+            transition_request(task, current.store_revision, TaskStage.IN_PROGRESS)
+        )
+    guarded = repository.load_local(location, headers_only=False)
+    create(repository, location, scope, executor, suffix=2)
+
+    with pytest.raises(RevisionConflict):
+        service.close(close_request(task, guarded.store_revision, outcome))
+
+
+def test_final_close_replay_refuses_unrelated_store_divergence(tmp_path: Path) -> None:
+    repository, location, scope, executor, service = state(tmp_path)
+    task = create(repository, location, scope, executor, suffix=1)
+    guarded = repository.load_local(location, headers_only=False)
+    request = close_request(task, guarded.store_revision, TaskOutcome.DECLINED)
+    service.close(request)
+    create(repository, location, scope, executor, suffix=2)
+
+    with pytest.raises(RevisionConflict):
+        service.close(request)
