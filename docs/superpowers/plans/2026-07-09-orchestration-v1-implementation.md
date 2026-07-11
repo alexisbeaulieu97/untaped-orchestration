@@ -896,7 +896,16 @@ git commit -m "feat: implement task lifecycle recovery"
 
 - [ ] **Step 1: Write failing lifecycle, pin-order, and replay tests**
 
-Cover active/superseded/retired derivation, state-by-command mutation matrix, one successor per predecessor, multi-predecessor consolidation, same-store/kind requirements, retired-vs-superseded exclusion, required retirement note, predecessor and store guards, exact successor reuse after interruption, divergent incoming successor refusal, linked-successor-before-pins ordering, retirement-fields-before-pin-removal ordering, earliest-predecessor pin placement, unrelated pin order, duplicate removal, inactive-pin diagnostics, and acknowledgement loss after final fsync.
+Cover active/superseded/retired derivation, state-by-command mutation matrix,
+one successor per predecessor, order-independent multi-predecessor
+consolidation, same-store/kind requirements, retired-vs-superseded exclusion,
+required retirement note, predecessor and store guards, exact successor reuse
+only before pin replacement, stale-old-guard refusal after pin replacement,
+fresh-guard final no-op, divergent successor content/evidence/set refusal,
+linked-successor-before-pins ordering, retirement-fields-before-pin-removal
+ordering, earliest-predecessor pin placement, unrelated pin order, duplicate
+removal, inactive-pin diagnostics, acknowledgement loss after final fsync, and
+bounded recognition with a large predecessor set.
 
 - [ ] **Step 2: Run focused tests and observe missing decision service**
 
@@ -913,8 +922,13 @@ class DecisionService:
 Recognize only exact accepted phases from design section 12.2. The service
 validates the complete federated final snapshot before the first selected-store
 write, writes the successor or retirement fields first, then replaces
-`store.toml` pins, renders views through the shared finalizer, and returns
-replay only after proving the requested final content and predecessor set.
+`store.toml` pins and renders views through the shared finalizer. Supersede
+old-guard recovery is limited to the successor-only phase; after pin rewrite,
+destroyed pin history is not brute-forced from the one-way hash. A reread with
+fresh full guards may accept the exact final state as an idempotent no-op that
+observes but does not write derived views; stale views remain explicit for
+`render --write`.
+Retirement retains bounded reverse projection for its one known removed pin.
 
 - [ ] **Step 4: Run decision, validation, and fault suites**
 

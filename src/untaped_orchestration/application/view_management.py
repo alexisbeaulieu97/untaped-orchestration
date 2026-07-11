@@ -54,6 +54,8 @@ def apply_views(
     location: StoreLocation,
     renderer: ViewRenderer,
     snapshot: StoreSnapshot,
+    *,
+    write: bool = True,
 ) -> ViewState:
     managed = renderer.managed_paths()
     try:
@@ -66,6 +68,9 @@ def apply_views(
             False,
         )
     intended = tuple(path for path in managed if path in expected or not before[path])
+    if not write:
+        comparisons = tuple(PathComparison(path, before[path]) for path in managed)
+        return ViewState((), (), comparisons, all(before.values()))
     try:
         for path in managed:
             if before[path]:

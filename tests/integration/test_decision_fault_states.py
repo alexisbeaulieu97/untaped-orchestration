@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -131,11 +132,66 @@ def test_every_canonical_phase_recovers_and_final_ack_loss_replays(
     with pytest.raises(OSError, match="lost acknowledgement"):
         getattr(lifecycle, family)(request)
     armed = False
-    recovered = getattr(lifecycle, family)(request)
-    if stop_after == 2:
-        assert recovered.receipt.replayed
+    if stop_after == 2 and family == "supersede":
+        with pytest.raises(RevisionConflict, match="guarded base"):
+            lifecycle.supersede(request)
+        final = repository.load_local(location, headers_only=False)
+        recovered = lifecycle.supersede(
+            replace(request, expected_store_revision=final.store_revision)
+        )
+        assert not recovered.receipt.applied
+        assert not recovered.receipt.replayed
+        assert not recovered.receipt.views_current
     else:
-        assert recovered.receipt.canonical_applied
+        recovered = getattr(lifecycle, family)(request)
+        if stop_after == 2:
+            assert family == "retire"
+            assert recovered.receipt.replayed
+        else:
+            assert recovered.receipt.canonical_applied
+
+
+def test_successor_only_recovery_accepts_reversed_predecessor_order(tmp_path: Path) -> None:
+    armed = False
+
+    def hook(event: str) -> None:
+        if armed and event == "before-ack":
+            raise OSError("stop after successor")
+
+    repository, location, scope, _, _ = state(tmp_path)
+    repository = FilesystemStoreRepository(atomic=AtomicFilesystem(event_hook=hook))
+
+    def load():
+        selected = repository.load_local(location, headers_only=False)
+        return FederatedSnapshot(selected, (selected,), Completeness())
+
+    from untaped_orchestration.application.items import MutationExecutionScope, MutationScope
+
+    execution = MutationExecutionScope((location,), location, load)
+    scope = MutationScope(execution, execution)
+    executor = MutationExecutor(
+        repository,
+        repository,
+        FileLockManager(),
+        MarkdownViewRenderer(),
+        projector=repository,
+    )
+    first = create_decision(repository, location, scope, executor, 1)
+    second = create_decision(repository, location, scope, executor, 2)
+    pin(repository, location, first.record.metadata.id, second.record.metadata.id)
+    current = repository.load_local(location, headers_only=False)
+    request = supersede_request((first, second), current.store_revision)
+    lifecycle = DecisionService(executor, repository, Clock(), scope)
+    armed = True
+    with pytest.raises(OSError, match="stop after successor"):
+        lifecycle.supersede(request)
+    armed = False
+    reversed_request = replace(request, predecessors=tuple(reversed(request.predecessors)))
+    recovered = lifecycle.supersede(reversed_request)
+    assert recovered.receipt.canonical_applied
+    assert recovered.record.metadata.links == tuple(
+        sorted(recovered.record.metadata.links, key=lambda link: link.target.root)
+    )
 
 
 @pytest.mark.parametrize("family", ["supersede", "retire"])

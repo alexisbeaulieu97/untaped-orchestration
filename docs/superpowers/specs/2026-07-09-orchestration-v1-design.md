@@ -551,10 +551,25 @@ Allowed decision mutations by derived state:
 | `evidence remove`, generic link add/remove | Allowed | Refused |
 | `decision supersede` / `decision retire` | Allowed | Refused |
 
-Supersede retry with the same predecessor set and ruling content reuses one
-already-written exact successor before finishing pin maintenance; a divergent
-incoming successor refuses recovery. Retire retry accepts the same already
-written retirement fields only to finish pin removal.
+Predecessors are a set for successor identity: request order does not affect
+the canonical successor links or exact-content comparison. Supersede retry
+with the same predecessor set and ruling content reuses one already-written
+exact successor only while the original pin list is still durable, then
+finishes pin maintenance; a divergent incoming successor refuses recovery.
+Once pin replacement is durable, the old store guard conflicts because the
+original pinned predecessor subset and order were destroyed and cannot be
+reconstructed from a one-way store hash. After rereading, fresh full guards on
+the exact successor/predecessor set and a final pin list containing no
+predecessor IDs return an `applied=false`, `replayed=false` no-op. The successor
+may be pinned or unpinned in that caller-accepted final state. Retire retry
+accepts the same already written retirement fields to finish pin removal or
+replay the final state; its one known removed pin has at most eleven prior
+positions, so exact reverse projection remains bounded.
+
+This fresh-final no-op observes and reports whether derived views are current
+but does not write them; a stale view remains `views_current=false` and is
+repaired explicitly with `render --write`. This preserves the promised
+`applied=false` result after acknowledgement loss.
 
 ## 7. Relations and graph safety
 
@@ -1017,9 +1032,13 @@ use the fault-state protocol below.
   source. Superseded close writes the successor link first. An interruption
   can leave a semantically matched active/archive pair, never a missing task.
 - Decision supersession writes the linked successor before updating pins;
-  retirement writes the retirement fields before removing a pin. Retry accepts
-  an already-applied exact phase only when it matches the provided guarded
-  intent, then completes the remaining phase.
+  retirement writes the retirement fields before removing a pin. An old
+  supersede guard accepts only the exact successor-only phase, where deleting
+  the successor in projection reconstructs the complete guarded store, then
+  completes pin replacement from the still-original list. It never searches
+  possible destroyed pin histories or adds a journal, sidecar, hidden operation
+  ID, or caller source snapshot. Retirement retains its bounded exact reverse
+  projection because only one known pin can have been removed.
 - Rank rebalance uses the order-preserving protocol in section 5.2, finishes
   before the primary move/transition replacement, and is retryable from every
   replacement boundary with freshly read guards.
@@ -1033,7 +1052,7 @@ use the fault-state protocol below.
 | Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff and reread item/store/anchor revisions. The old stale request conflicts. Rerun with fresh full guards; an already exact final target is an `applied=false`, `replayed=false` idempotent no-op. |
 | Ordinary close | Complete archive exists with matching active source, or the active source is gone and the archive is final but acknowledgement was lost | `check` reports a duplicate pair; guarded retry/`repair duplicate` removes only a match. Retry of the same outcome/note against the final archive returns it with `replayed=true`; divergent closure conflicts. |
 | Superseded close | Exact successor link may exist before the close pair, or the linked successor/final archive remain after active deletion but acknowledgement is lost | `check` reports a successor pointing at an active predecessor; reread both revisions and retry. When predecessor archive, successor link, outcome, and note exactly match the requested final state, retry returns `replayed=true`; every divergence conflicts. |
-| Decision supersede | One exact linked successor may exist before pin replacement, or successor/pins are final before acknowledgement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement, or returns the final state with `replayed=true`. |
+| Decision supersede | One exact linked successor may exist before pin replacement; successor/pins may be final before acknowledgement, but the destroyed prior pin membership/order is not recoverable from the old hash | Inactive pin is reported during the successor-only phase; the same canonical predecessor set/content reuses that successor and finishes deterministic pin replacement. After pin replacement, the old stale request conflicts. Reread and pass fresh full guards: an exact successor/predecessor set with no predecessor IDs still pinned is an `applied=false`, `replayed=false` no-op, whether the successor is pinned or unpinned. |
 | Decision retire | Retirement fields may exist before pin removal, or retirement/pins are final before acknowledgement | Inactive pin is reported; same-note retry finishes removal or returns the final state with `replayed=true`. |
 | Import | Exact subset of the external manifest may exist | Generic `check` cannot infer intent; rerun the same manifest/`--if-clean`, which reconstructs the guarded base and writes the remainder. |
 | View render | Any subset of derived views may be stale after canonical success | `canonical_applied=true`, `views_current=false`; `render --write` replaces all applicable views deterministically. |

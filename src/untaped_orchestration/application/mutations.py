@@ -49,6 +49,7 @@ class IntendedMutation:
     replacements: tuple[FileReplacement, ...] = ()
     deletions: tuple[FileDeletion, ...] = ()
     replayed: bool = False
+    finalize_views: bool = True
 
 
 type SnapshotLoader = Callable[[], FederatedSnapshot]
@@ -260,7 +261,12 @@ class MutationExecutor:
                 )
 
             view_state = apply_views(
-                self._reader, self._writer, selected, self._views, selected_after
+                self._reader,
+                self._writer,
+                selected,
+                self._views,
+                selected_after,
+                write=intended.finalize_views,
             )
             changed.extend(view_state.changed_paths)
             intended_paths = tuple(

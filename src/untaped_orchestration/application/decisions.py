@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass
-from itertools import combinations, permutations
 from pathlib import PurePosixPath
 
+from untaped_orchestration.application.decision_recovery import (
+    SupersedePhase,
+    exact_successor_shape,
+    pins_after_supersede,
+    recognize_supersede_phase,
+    retirement_prior_configs,
+    store_with_pins,
+    supersedes_links,
+)
 from untaped_orchestration.application.item_support import (
     ItemMutationResult,
     ItemStateConflict,
@@ -27,15 +34,8 @@ from untaped_orchestration.application.ports import (
 from untaped_orchestration.application.results import FederatedSnapshot, LoadedRecord
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.domain.diagnostics import Diagnostic
-from untaped_orchestration.domain.ids import DecisionId, Slug, StoreId, item_filename
-from untaped_orchestration.domain.models import (
-    Decision,
-    ItemKind,
-    Link,
-    LinkRelation,
-    Revision,
-    StoreConfig,
-)
+from untaped_orchestration.domain.ids import DecisionId, Slug, item_filename
+from untaped_orchestration.domain.models import Decision, ItemKind, Link, LinkRelation, Revision
 from untaped_orchestration.domain.time import UtcTimestamp
 
 
@@ -89,69 +89,6 @@ def _incoming(snapshot: FederatedSnapshot, item_id: DecisionId) -> tuple[LoadedR
     )
 
 
-def _links(store_id: StoreId, predecessors: tuple[DecisionGuard, ...]) -> tuple[Link, ...]:
-    return tuple(
-        Link(relation=LinkRelation.SUPERSEDES, target_store_id=store_id, target=value.item_id)
-        for value in predecessors
-    )
-
-
-def _pins_after_supersede(
-    pins: tuple[DecisionId, ...], predecessors: frozenset[DecisionId], successor: DecisionId
-) -> tuple[DecisionId, ...]:
-    predecessor_positions = [index for index, value in enumerate(pins) if value in predecessors]
-    stripped = [value for value in pins if value not in predecessors and value != successor]
-    if not predecessor_positions:
-        return tuple(stripped)
-    earliest = min(predecessor_positions)
-    insertion = sum(
-        1 for value in pins[:earliest] if value not in predecessors and value != successor
-    )
-    stripped.insert(insertion, successor)
-    return tuple(stripped)
-
-
-def _store_with_pins(config: StoreConfig, pins: tuple[DecisionId, ...]) -> StoreConfig:
-    return config.model_copy(
-        update={"brief": config.brief.model_copy(update={"pinned_decisions": pins})}
-    )
-
-
-def _projected_revision(
-    executor: MutationExecutor,
-    snapshot: FederatedSnapshot,
-    replacements: tuple[FileReplacement, ...] = (),
-    deletions: tuple[FileDeletion, ...] = (),
-) -> Revision:
-    return executor.project(snapshot, replacements, deletions).snapshot.selected.store_revision
-
-
-def _prior_pin_candidates(
-    final: tuple[DecisionId, ...], predecessors: tuple[DecisionId, ...], successor: DecisionId
-) -> Iterator[tuple[DecisionId, ...]]:
-    unrelated = tuple(value for value in final if value != successor and value not in predecessors)
-    if successor not in final:
-        yield unrelated
-        return
-    capacity = 10 - len(unrelated)
-    for count in range(1, min(capacity, len(predecessors)) + 1):
-        for subset in combinations(predecessors, count):
-            for ordered in permutations(subset):
-                for positions in combinations(range(len(unrelated) + count), count):
-                    position_set = set(positions)
-                    unrelated_values = iter(unrelated)
-                    ordered_values = iter(ordered)
-                    candidate = tuple(
-                        next(ordered_values) if index in position_set else next(unrelated_values)
-                        for index in range(len(unrelated) + count)
-                    )
-                    if (
-                        _pins_after_supersede(candidate, frozenset(predecessors), successor)
-                        == final
-                    ):
-                        yield candidate
-
-
 def _phase_validator(
     snapshot: FederatedSnapshot, allowed_inactive_pins: frozenset[DecisionId]
 ) -> tuple[Diagnostic, ...]:
@@ -175,6 +112,298 @@ def _phase_validator(
     )
 
 
+def _projected_revision(
+    executor: MutationExecutor,
+    snapshot: FederatedSnapshot,
+    replacements: tuple[FileReplacement, ...] = (),
+    deletions: tuple[FileDeletion, ...] = (),
+) -> Revision:
+    return executor.project(snapshot, replacements, deletions).snapshot.selected.store_revision
+
+
+def _validate_supersede_request(request: SupersedeDecisionRequest) -> tuple[DecisionId, ...]:
+    if not request.predecessors:
+        raise DecisionLifecycleConflict("decision supersede requires at least one predecessor")
+    predecessor_ids = tuple(value.item_id for value in request.predecessors)
+    if len(set(predecessor_ids)) != len(predecessor_ids):
+        raise DecisionLifecycleConflict("decision supersede predecessors must be distinct")
+    if request.successor_id in predecessor_ids:
+        raise DecisionLifecycleConflict("successor must be distinct from every predecessor")
+    return predecessor_ids
+
+
+class _SupersedeOperation:
+    def __init__(
+        self,
+        executor: MutationExecutor,
+        formatter: CanonicalFormatter,
+        clock: Clock,
+        scope: MutationScope,
+        request: SupersedeDecisionRequest,
+    ) -> None:
+        self.executor = executor
+        self.formatter = formatter
+        self.clock = clock
+        self.scope = scope
+        self.request = request
+        self.predecessor_ids = _validate_supersede_request(request)
+        self.predecessor_set = frozenset(self.predecessor_ids)
+        self.links: tuple[Link, ...] = ()
+        self.phase: SupersedePhase | None = None
+        self.planned = PlannedRecord()
+
+    def execute(self) -> ItemMutationResult:
+        receipt = execute_mutation(
+            self.executor,
+            self.scope.recursive,
+            self.guard,
+            self.build,
+            validator=lambda snapshot: _phase_validator(snapshot, self.predecessor_set),
+        )
+        return record_result(self.planned, receipt)
+
+    def _guard_predecessors(self, snapshot: FederatedSnapshot) -> None:
+        for guarded in self.request.predecessors:
+            record = _decision(snapshot, guarded.item_id)
+            if record is None or record.body is None:
+                raise DecisionLifecycleConflict("predecessor must be a local decision")
+            metadata = record.metadata
+            assert isinstance(metadata, Decision)
+            if record.revision != guarded.expected_revision:
+                raise RevisionConflict("decision predecessor revision is stale")
+            if metadata.retired_at is not None:
+                raise DecisionLifecycleConflict("decision supersede requires active predecessors")
+
+    def _guard_initial(self, snapshot: FederatedSnapshot) -> None:
+        if any(_incoming(snapshot, item_id) for item_id in self.predecessor_ids):
+            raise DecisionLifecycleConflict("decision supersede requires active predecessors")
+        if snapshot.selected.store_revision != self.request.expected_store_revision:
+            raise RevisionConflict("decision supersede store revision is stale")
+
+    def _reverse_successor_revision(
+        self, snapshot: FederatedSnapshot, successor: LoadedRecord
+    ) -> Revision:
+        return _projected_revision(
+            self.executor,
+            snapshot,
+            deletions=(FileDeletion(successor.path),),
+        )
+
+    def _guard_existing(
+        self, snapshot: FederatedSnapshot, successor: LoadedRecord
+    ) -> SupersedePhase:
+        if successor.body is None or not exact_successor_shape(
+            successor,
+            title=self.request.title,
+            body=self.request.body,
+            tags=self.request.tags,
+            links=self.links,
+        ):
+            raise DecisionLifecycleConflict("existing successor diverges from caller-owned content")
+        if any(
+            _incoming(snapshot, guarded.item_id) != (successor,)
+            for guarded in self.request.predecessors
+        ):
+            raise DecisionLifecycleConflict("predecessor has a divergent incoming successor")
+        config = snapshot.selected.store
+        assert config is not None
+        phase = recognize_supersede_phase(
+            current_revision=snapshot.selected.store_revision,
+            expected_revision=self.request.expected_store_revision,
+            pins=config.brief.pinned_decisions,
+            predecessor_ids=self.predecessor_ids,
+            reverse_revision=lambda: self._reverse_successor_revision(snapshot, successor),
+        )
+        if phase is None:
+            raise RevisionConflict("decision supersede phase cannot reconstruct guarded base")
+        return phase
+
+    def guard(self, snapshot: FederatedSnapshot) -> None:
+        self.links = supersedes_links(selected_store_id(snapshot), self.predecessor_ids)
+        self._guard_predecessors(snapshot)
+        successor = _decision(snapshot, self.request.successor_id)
+        if successor is None:
+            self._guard_initial(snapshot)
+            self.phase = None
+            return
+        self.phase = self._guard_existing(snapshot, successor)
+        self.planned.path = successor.path
+        self.planned.metadata = successor.metadata
+        self.planned.body = successor.body
+
+    def _successor_replacement(self) -> FileReplacement:
+        metadata = Decision(
+            schema="untaped.orchestration.decision/v1",
+            id=self.request.successor_id,
+            kind=ItemKind.DECISION,
+            title=self.request.title,
+            created_at=UtcTimestamp.from_datetime(self.clock.now()),
+            tags=self.request.tags,
+            links=self.links,
+        )
+        path = PurePosixPath("decisions") / item_filename(
+            self.request.successor_id, self.request.title
+        )
+        self.planned.path = path
+        self.planned.metadata = metadata
+        self.planned.body = self.request.body
+        return FileReplacement(path, self.formatter.item_bytes(metadata, self.request.body))
+
+    def build(self, snapshot: FederatedSnapshot) -> IntendedMutation:
+        if self.phase is SupersedePhase.FRESH_FINAL:
+            return IntendedMutation(finalize_views=False)
+        config = snapshot.selected.store
+        assert config is not None
+        replacements: list[FileReplacement] = []
+        successor = _decision(snapshot, self.request.successor_id)
+        if successor is None:
+            replacements.append(self._successor_replacement())
+        pins = pins_after_supersede(
+            config.brief.pinned_decisions,
+            self.predecessor_set,
+            self.request.successor_id,
+        )
+        if pins != config.brief.pinned_decisions:
+            replacements.append(
+                FileReplacement(
+                    PurePosixPath("store.toml"),
+                    self.formatter.store_bytes(store_with_pins(config, pins)),
+                )
+            )
+        replayed = self.phase is SupersedePhase.SUCCESSOR_ONLY and not replacements
+        return IntendedMutation(replacements=tuple(replacements), replayed=replayed)
+
+
+class _RetireOperation:
+    def __init__(
+        self,
+        executor: MutationExecutor,
+        formatter: CanonicalFormatter,
+        clock: Clock,
+        scope: MutationScope,
+        request: RetireDecisionRequest,
+    ) -> None:
+        self.executor = executor
+        self.formatter = formatter
+        self.clock = clock
+        self.scope = scope
+        self.request = request
+        self.phase = "initial"
+        self.planned = PlannedRecord()
+
+    def execute(self) -> ItemMutationResult:
+        receipt = execute_mutation(
+            self.executor,
+            self.scope.recursive,
+            self.guard,
+            self.build,
+            validator=lambda snapshot: _phase_validator(
+                snapshot, frozenset({self.request.item_id})
+            ),
+        )
+        return record_result(self.planned, receipt)
+
+    def _reverse_item(self, record: LoadedRecord) -> FileReplacement:
+        metadata = record.metadata
+        assert isinstance(metadata, Decision) and record.body is not None
+        active = validated_copy(metadata, {"retired_at": None, "retire_note": None})
+        return FileReplacement(record.path, self.formatter.item_bytes(active, record.body))
+
+    def _reverse_matches(self, snapshot: FederatedSnapshot, record: LoadedRecord) -> bool:
+        item = self._reverse_item(record)
+        if (
+            _projected_revision(self.executor, snapshot, (item,))
+            == self.request.expected_store_revision
+        ):
+            return True
+        config = snapshot.selected.store
+        if config is None:
+            return False
+        return any(
+            _projected_revision(
+                self.executor,
+                snapshot,
+                (
+                    item,
+                    FileReplacement(PurePosixPath("store.toml"), self.formatter.store_bytes(prior)),
+                ),
+            )
+            == self.request.expected_store_revision
+            for prior in retirement_prior_configs(config, self.request.item_id)
+        )
+
+    def _guard_active(self, snapshot: FederatedSnapshot, record: LoadedRecord) -> None:
+        if _incoming(snapshot, self.request.item_id):
+            raise DecisionLifecycleConflict("superseded decisions cannot be retired")
+        if record.revision != self.request.expected_revision:
+            raise RevisionConflict("decision revision is stale")
+        if snapshot.selected.store_revision != self.request.expected_store_revision:
+            raise RevisionConflict("decision retirement store revision is stale")
+        self.phase = "initial"
+
+    def _guard_retired(self, snapshot: FederatedSnapshot, record: LoadedRecord) -> None:
+        metadata = record.metadata
+        assert isinstance(metadata, Decision)
+        if metadata.retire_note != self.request.note:
+            raise DecisionLifecycleConflict("retirement note diverges from durable phase")
+        if not self._reverse_matches(snapshot, record):
+            raise RevisionConflict("decision retirement phase cannot reconstruct guarded base")
+        config = snapshot.selected.store
+        assert config is not None
+        self.phase = (
+            "final" if self.request.item_id not in config.brief.pinned_decisions else "retired"
+        )
+
+    def guard(self, snapshot: FederatedSnapshot) -> None:
+        record = _decision(snapshot, self.request.item_id)
+        if record is None or record.body is None:
+            raise DecisionLifecycleConflict("retirement requires a local decision")
+        metadata = record.metadata
+        assert isinstance(metadata, Decision)
+        if metadata.retired_at is None:
+            self._guard_active(snapshot, record)
+        else:
+            self._guard_retired(snapshot, record)
+        self.planned.path = record.path
+        self.planned.metadata = record.metadata
+        self.planned.body = record.body
+
+    def _retirement_replacement(self, record: LoadedRecord) -> FileReplacement:
+        metadata = record.metadata
+        assert isinstance(metadata, Decision) and record.body is not None
+        retired = validated_copy(
+            metadata,
+            {
+                "retired_at": UtcTimestamp.from_datetime(self.clock.now()),
+                "retire_note": self.request.note,
+            },
+        )
+        self.planned.metadata = retired
+        return FileReplacement(record.path, self.formatter.item_bytes(retired, record.body))
+
+    def build(self, snapshot: FederatedSnapshot) -> IntendedMutation:
+        if self.phase == "final":
+            return IntendedMutation(replayed=True)
+        record = _decision(snapshot, self.request.item_id)
+        assert record is not None
+        config = snapshot.selected.store
+        assert config is not None
+        replacements: list[FileReplacement] = []
+        if self.phase == "initial":
+            replacements.append(self._retirement_replacement(record))
+        pins = tuple(
+            value for value in config.brief.pinned_decisions if value != self.request.item_id
+        )
+        if pins != config.brief.pinned_decisions:
+            replacements.append(
+                FileReplacement(
+                    PurePosixPath("store.toml"),
+                    self.formatter.store_bytes(store_with_pins(config, pins)),
+                )
+            )
+        return IntendedMutation(replacements=tuple(replacements))
+
+
 class DecisionService:
     def __init__(
         self,
@@ -188,275 +417,14 @@ class DecisionService:
         self._clock = clock
         self._scope = scope
 
-    def supersede(self, request: SupersedeDecisionRequest) -> ItemMutationResult:  # noqa: C901
-        if not request.predecessors:
-            raise DecisionLifecycleConflict("decision supersede requires at least one predecessor")
-        predecessor_ids = tuple(value.item_id for value in request.predecessors)
-        if len(set(predecessor_ids)) != len(predecessor_ids):
-            raise DecisionLifecycleConflict("decision supersede predecessors must be distinct")
-        if request.successor_id in predecessor_ids:
-            raise DecisionLifecycleConflict("successor must be distinct from every predecessor")
+    def supersede(self, request: SupersedeDecisionRequest) -> ItemMutationResult:
+        return _SupersedeOperation(
+            self._executor, self._formatter, self._clock, self._scope, request
+        ).execute()
 
-        planned = PlannedRecord()
-        phase = "initial"
-        links: tuple[Link, ...] = ()
-
-        def exact_successor(snapshot: FederatedSnapshot, record: LoadedRecord) -> bool:
-            return (
-                isinstance(record.metadata, Decision)
-                and record.body == request.body
-                and record.metadata.title == request.title
-                and record.metadata.tags
-                == tuple(sorted(request.tags, key=lambda value: value.root))
-                and record.metadata.links == links
-                and record.metadata.reviewed_at is None
-                and record.metadata.review_on is None
-                and record.metadata.retired_at is None
-            )
-
-        def recognized_phase(snapshot: FederatedSnapshot, successor: LoadedRecord) -> str | None:
-            if (
-                _projected_revision(
-                    self._executor, snapshot, deletions=(FileDeletion(successor.path),)
-                )
-                == request.expected_store_revision
-            ):
-                config = snapshot.selected.store
-                assert config is not None
-                planned_pins = _pins_after_supersede(
-                    config.brief.pinned_decisions,
-                    frozenset(predecessor_ids),
-                    request.successor_id,
-                )
-                return "final" if planned_pins == config.brief.pinned_decisions else "successor"
-            config = snapshot.selected.store
-            if config is None:
-                return None
-            for pins in _prior_pin_candidates(
-                config.brief.pinned_decisions, predecessor_ids, request.successor_id
-            ):
-                prior = _store_with_pins(config, pins)
-                if (
-                    _projected_revision(
-                        self._executor,
-                        snapshot,
-                        (
-                            FileReplacement(
-                                PurePosixPath("store.toml"), self._formatter.store_bytes(prior)
-                            ),
-                        ),
-                        (FileDeletion(successor.path),),
-                    )
-                    == request.expected_store_revision
-                ):
-                    return "final"
-            return None
-
-        def guard(snapshot: FederatedSnapshot) -> None:
-            nonlocal phase, links
-            links = _links(selected_store_id(snapshot), request.predecessors)
-            predecessors = []
-            for guarded in request.predecessors:
-                record = _decision(snapshot, guarded.item_id)
-                if record is None or record.body is None:
-                    raise DecisionLifecycleConflict("predecessor must be a local decision")
-                assert isinstance(record.metadata, Decision)
-                if record.revision != guarded.expected_revision:
-                    raise RevisionConflict("decision predecessor revision is stale")
-                predecessors.append(record)
-            successor = _decision(snapshot, request.successor_id)
-            if successor is None:
-                for guarded, record in zip(request.predecessors, predecessors, strict=True):
-                    metadata = record.metadata
-                    assert isinstance(metadata, Decision)
-                    if metadata.retired_at is not None or _incoming(snapshot, guarded.item_id):
-                        raise DecisionLifecycleConflict(
-                            "decision supersede requires active predecessors"
-                        )
-                if snapshot.selected.store_revision != request.expected_store_revision:
-                    raise RevisionConflict("decision supersede store revision is stale")
-                phase = "initial"
-                return
-            if successor.body is None or not exact_successor(snapshot, successor):
-                raise DecisionLifecycleConflict(
-                    "existing successor diverges from caller-owned content"
-                )
-            if any(
-                _incoming(snapshot, value.item_id) != (successor,) for value in request.predecessors
-            ):
-                raise DecisionLifecycleConflict("predecessor has a divergent incoming successor")
-            recognized = recognized_phase(snapshot, successor)
-            if recognized is None:
-                raise RevisionConflict("decision supersede phase cannot reconstruct guarded base")
-            phase = recognized
-            planned.path, planned.metadata, planned.body = (
-                successor.path,
-                successor.metadata,
-                successor.body,
-            )
-
-        def build(snapshot: FederatedSnapshot) -> IntendedMutation:
-            config = snapshot.selected.store
-            assert config is not None
-            if phase == "final":
-                return IntendedMutation(replayed=True)
-            replacements: list[FileReplacement] = []
-            successor = _decision(snapshot, request.successor_id)
-            if successor is None:
-                metadata = Decision(
-                    schema="untaped.orchestration.decision/v1",
-                    id=request.successor_id,
-                    kind=ItemKind.DECISION,
-                    title=request.title,
-                    created_at=UtcTimestamp.from_datetime(self._clock.now()),
-                    tags=request.tags,
-                    links=links,
-                )
-                path = PurePosixPath("decisions") / item_filename(
-                    request.successor_id, request.title
-                )
-                planned.path, planned.metadata, planned.body = path, metadata, request.body
-                replacements.append(
-                    FileReplacement(path, self._formatter.item_bytes(metadata, request.body))
-                )
-            else:
-                planned.path, planned.metadata, planned.body = (
-                    successor.path,
-                    successor.metadata,
-                    successor.body,
-                )
-            pins = _pins_after_supersede(
-                config.brief.pinned_decisions, frozenset(predecessor_ids), request.successor_id
-            )
-            if pins != config.brief.pinned_decisions:
-                replacements.append(
-                    FileReplacement(
-                        PurePosixPath("store.toml"),
-                        self._formatter.store_bytes(_store_with_pins(config, pins)),
-                    )
-                )
-            return IntendedMutation(replacements=tuple(replacements))
-
-        receipt = execute_mutation(
-            self._executor,
-            self._scope.recursive,
-            guard,
-            build,
-            validator=lambda snapshot: _phase_validator(snapshot, frozenset(predecessor_ids)),
-        )
-        return record_result(planned, receipt)
-
-    def retire(self, request: RetireDecisionRequest) -> ItemMutationResult:  # noqa: C901
+    def retire(self, request: RetireDecisionRequest) -> ItemMutationResult:
         if not request.note.strip():
             raise DecisionLifecycleConflict("retirement note must be nonempty")
-        planned = PlannedRecord()
-        phase = "initial"
-
-        def reverse_item(record: LoadedRecord) -> FileReplacement:
-            assert isinstance(record.metadata, Decision) and record.body is not None
-            active = validated_copy(record.metadata, {"retired_at": None, "retire_note": None})
-            return FileReplacement(record.path, self._formatter.item_bytes(active, record.body))
-
-        def reverse_matches(snapshot: FederatedSnapshot, record: LoadedRecord) -> bool:
-            item = reverse_item(record)
-            if (
-                _projected_revision(self._executor, snapshot, (item,))
-                == request.expected_store_revision
-            ):
-                return True
-            config = snapshot.selected.store
-            if config is None or request.item_id in config.brief.pinned_decisions:
-                return False
-            for index in range(len(config.brief.pinned_decisions) + 1):
-                pins = list(config.brief.pinned_decisions)
-                pins.insert(index, request.item_id)
-                prior = _store_with_pins(config, tuple(pins))
-                if (
-                    _projected_revision(
-                        self._executor,
-                        snapshot,
-                        (
-                            item,
-                            FileReplacement(
-                                PurePosixPath("store.toml"), self._formatter.store_bytes(prior)
-                            ),
-                        ),
-                    )
-                    == request.expected_store_revision
-                ):
-                    return True
-            return False
-
-        def guard(snapshot: FederatedSnapshot) -> None:
-            nonlocal phase
-            record = _decision(snapshot, request.item_id)
-            if record is None or record.body is None:
-                raise DecisionLifecycleConflict("retirement requires a local decision")
-            metadata = record.metadata
-            assert isinstance(metadata, Decision)
-            if metadata.retired_at is None:
-                if _incoming(snapshot, request.item_id):
-                    raise DecisionLifecycleConflict("superseded decisions cannot be retired")
-                if record.revision != request.expected_revision:
-                    raise RevisionConflict("decision revision is stale")
-                if snapshot.selected.store_revision != request.expected_store_revision:
-                    raise RevisionConflict("decision retirement store revision is stale")
-                phase = "initial"
-            else:
-                if metadata.retire_note != request.note:
-                    raise DecisionLifecycleConflict("retirement note diverges from durable phase")
-                if not reverse_matches(snapshot, record):
-                    raise RevisionConflict(
-                        "decision retirement phase cannot reconstruct guarded base"
-                    )
-                config = snapshot.selected.store
-                assert config is not None
-                phase = (
-                    "final" if request.item_id not in config.brief.pinned_decisions else "retired"
-                )
-            planned.path, planned.metadata, planned.body = record.path, record.metadata, record.body
-
-        def build(snapshot: FederatedSnapshot) -> IntendedMutation:
-            record = _decision(snapshot, request.item_id)
-            assert (
-                record is not None
-                and isinstance(record.metadata, Decision)
-                and record.body is not None
-            )
-            config = snapshot.selected.store
-            assert config is not None
-            if phase == "final":
-                return IntendedMutation(replayed=True)
-            replacements: list[FileReplacement] = []
-            if phase == "initial":
-                retired = validated_copy(
-                    record.metadata,
-                    {
-                        "retired_at": UtcTimestamp.from_datetime(self._clock.now()),
-                        "retire_note": request.note,
-                    },
-                )
-                planned.metadata = retired
-                replacements.append(
-                    FileReplacement(record.path, self._formatter.item_bytes(retired, record.body))
-                )
-            pins = tuple(
-                value for value in config.brief.pinned_decisions if value != request.item_id
-            )
-            if pins != config.brief.pinned_decisions:
-                replacements.append(
-                    FileReplacement(
-                        PurePosixPath("store.toml"),
-                        self._formatter.store_bytes(_store_with_pins(config, pins)),
-                    )
-                )
-            return IntendedMutation(replacements=tuple(replacements))
-
-        receipt = execute_mutation(
-            self._executor,
-            self._scope.recursive,
-            guard,
-            build,
-            validator=lambda snapshot: _phase_validator(snapshot, frozenset({request.item_id})),
-        )
-        return record_result(planned, receipt)
+        return _RetireOperation(
+            self._executor, self._formatter, self._clock, self._scope, request
+        ).execute()

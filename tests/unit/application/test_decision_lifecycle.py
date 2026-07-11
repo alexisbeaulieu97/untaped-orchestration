@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 from tests.unit.application.test_task_transition import Clock, state
+from untaped_orchestration.application.decision_recovery import (
+    SupersedePhase,
+    recognize_supersede_phase,
+)
 from untaped_orchestration.application.decisions import (
     DecisionGuard,
     DecisionLifecycleConflict,
@@ -21,9 +25,11 @@ from untaped_orchestration.application.items import (
 from untaped_orchestration.application.ports import FileReplacement
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
 from untaped_orchestration.application.validation import _graph_state
+from untaped_orchestration.domain.evidence import Evidence, EvidenceReference, EvidenceRelation
 from untaped_orchestration.domain.graph import DecisionRef, DecisionState, decision_state
 from untaped_orchestration.domain.ids import DecisionId, Slug
-from untaped_orchestration.domain.models import Decision, LinkRelation
+from untaped_orchestration.domain.models import Decision, LinkRelation, Revision
+from untaped_orchestration.domain.time import CalendarDate
 
 
 def create_decision(repository, location, scope, executor, suffix: int):
@@ -265,7 +271,9 @@ def test_retire_sets_pair_then_removes_pin_and_refuses_empty_or_superseded(tmp_p
         )
 
 
-def test_exact_final_states_replay_but_divergence_and_stale_base_conflict(tmp_path: Path) -> None:
+def test_pinned_final_supersede_rejects_old_guard_and_fresh_guard_is_noop(
+    tmp_path: Path,
+) -> None:
     repository, location, scope, executor, _ = state(tmp_path)
     predecessor = create_decision(repository, location, scope, executor, 1)
     pin(repository, location, predecessor.record.metadata.id)
@@ -273,7 +281,15 @@ def test_exact_final_states_replay_but_divergence_and_stale_base_conflict(tmp_pa
     lifecycle = service(executor, repository, scope)
     request = supersede_request((predecessor,), current.store_revision)
     lifecycle.supersede(request)
-    assert lifecycle.supersede(request).receipt.replayed
+    with pytest.raises(RevisionConflict, match="guarded base"):
+        lifecycle.supersede(request)
+
+    final = repository.load_local(location, headers_only=False)
+    fresh = replace(request, expected_store_revision=final.store_revision)
+    noop = lifecycle.supersede(fresh)
+    assert not noop.receipt.applied
+    assert not noop.receipt.replayed
+    assert noop.receipt.views_current
 
     successor = next(
         r
@@ -287,7 +303,7 @@ def test_exact_final_states_replay_but_divergence_and_stale_base_conflict(tmp_pa
         )
     )
     with pytest.raises((DecisionLifecycleConflict, RevisionConflict)):
-        lifecycle.supersede(request)
+        lifecycle.supersede(replace(fresh, expected_store_revision=final.store_revision))
 
 
 def test_retire_final_state_replays_only_from_exact_reverse_projection(tmp_path: Path) -> None:
@@ -327,3 +343,66 @@ def test_unpinned_supersede_has_no_admin_write_and_final_state_replays(
     applied = lifecycle.supersede(request)
     assert PurePosixPath("store.toml") not in applied.receipt.changed_paths
     assert lifecycle.supersede(request).receipt.replayed
+
+
+@pytest.mark.parametrize("divergence", ["evidence", "reviewed_at", "review_on"])
+def test_existing_successor_requires_empty_evidence_and_default_lifecycle_fields(
+    tmp_path: Path, divergence: str
+) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    predecessor = create_decision(repository, location, scope, executor, 1)
+    current = repository.load_local(location, headers_only=False)
+    request = supersede_request((predecessor,), current.store_revision)
+    lifecycle = service(executor, repository, scope)
+    lifecycle.supersede(request)
+    successor = next(
+        value
+        for value in repository.load_local(location, headers_only=False).records
+        if value.metadata.id == request.successor_id
+    )
+    path = location.real_root.joinpath(*successor.path.parts)
+    updates: dict[str, object]
+    if divergence == "evidence":
+        updates = {
+            "evidence": (
+                Evidence(
+                    relation=EvidenceRelation.TRACKED_BY,
+                    reference=EvidenceReference("github-issue:owner/repo#1"),
+                ),
+            )
+        }
+    elif divergence == "reviewed_at":
+        updates = {"reviewed_at": successor.metadata.created_at}
+    else:
+        updates = {"review_on": CalendarDate("2026-07-20")}
+    path.write_bytes(
+        repository.item_bytes(
+            successor.metadata.model_copy(update=updates),
+            successor.body or b"",
+        )
+    )
+    with pytest.raises(DecisionLifecycleConflict, match="caller-owned content"):
+        lifecycle.supersede(request)
+
+
+def test_fresh_exact_final_recognition_is_bounded_for_one_thousand_predecessors() -> None:
+    predecessor_ids = tuple(
+        DecisionId(f"dec_019f0000000070008000{index:012x}") for index in range(1000, 2000)
+    )
+    projections = 0
+
+    def reverse_revision() -> Revision:
+        nonlocal projections
+        projections += 1
+        return Revision("sha256:" + "1" * 64)
+
+    revision = Revision("sha256:" + "0" * 64)
+    phase = recognize_supersede_phase(
+        current_revision=revision,
+        expected_revision=revision,
+        pins=(),
+        predecessor_ids=predecessor_ids,
+        reverse_revision=reverse_revision,
+    )
+    assert phase is SupersedePhase.FRESH_FINAL
+    assert projections == 0
