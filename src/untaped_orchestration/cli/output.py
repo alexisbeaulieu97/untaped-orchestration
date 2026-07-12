@@ -60,6 +60,12 @@ class EncodedOutput:
     truncated: bool = False
 
 
+def result_exit_code(diagnostics: tuple[Diagnostic, ...], fallback: int) -> int:
+    if any(value.code == "ORC007" and value.severity == "error" for value in diagnostics):
+        return 4
+    return fallback
+
+
 def _value(value: object) -> object:  # noqa: C901
     if isinstance(value, ItemMutationResult):
         return _value(value.receipt)
@@ -514,10 +520,8 @@ def _error_diagnostics(error: Exception) -> tuple[Diagnostic, ...]:
 def _exit_code(error: Exception) -> int:
     name = error.__class__.__name__.lower()
     diagnostics = getattr(error, "diagnostics", ())
-    if any(
-        isinstance(value, Diagnostic) and value.code == "ORC007" and value.severity == "error"
-        for value in diagnostics
-    ):
+    typed_diagnostics = tuple(value for value in diagnostics if isinstance(value, Diagnostic))
+    if result_exit_code(typed_diagnostics, 0) == 4:
         return 4
     if "incomplete" in name or any(
         isinstance(value, Diagnostic) and value.code == "ORC005" and value.severity == "error"

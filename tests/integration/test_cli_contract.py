@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +12,13 @@ import untaped_orchestration.application.curation as curation_module
 from tests.builders import CHILD_STORE_ID, DECISION_ID, STORE_ID, TASK_ID, task_bytes
 from tests.cli_fixtures import initialized_repository
 from untaped_orchestration.__main__ import main
+from untaped_orchestration.application.maintenance import (
+    RecursiveCheckResult,
+    RecursiveFormatResult,
+)
+from untaped_orchestration.application.results import StoreLocation
+from untaped_orchestration.cli import maintenance_commands
+from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -276,6 +285,54 @@ path = "../../missing/.untaped/orchestration"
     assert raised.value.code == 1
     required = json.loads(capsys.readouterr().out)
     assert {value["severity"] for value in required["diagnostics"]} == {"error"}
+
+
+@pytest.mark.parametrize("fmt", ["json", "table"])
+@pytest.mark.parametrize("local", [False, True], ids=["recursive", "local"])
+@pytest.mark.parametrize("command", ["check", "fmt-check"])
+def test_read_only_maintenance_orc007_result_exits_four_through_actual_cli(
+    command: str,
+    local: bool,
+    fmt: str,
+    monkeypatch,
+    capsys,
+) -> None:
+    conflict = Diagnostic(
+        code="ORC007",
+        severity="error",
+        path="registry.toml",
+        field="revision",
+        message="federation changed",
+        hint="retry",
+    )
+
+    class Maintenance:
+        def check(self, request):
+            del request
+            return RecursiveCheckResult(False, False, (), (conflict,))
+
+        def fmt_check(self, request):
+            del request
+            return RecursiveFormatResult((), False, (conflict,))
+
+    context = SimpleNamespace(
+        location=StoreLocation(Path("/tmp/store"), Path("/tmp/store")),
+        maintenance=lambda: Maintenance(),
+    )
+    monkeypatch.setattr(maintenance_commands.CliContext, "resolve", lambda store: context)
+    tokens = ["check"] if command == "check" else ["fmt", "--check"]
+    if local:
+        tokens.append("--local")
+    tokens.extend(("--format", fmt))
+    monkeypatch.setattr("sys.argv", ["untaped-orchestration", *tokens])
+
+    with pytest.raises(SystemExit) as raised:
+        main()
+
+    assert raised.value.code == 4
+    captured = capsys.readouterr()
+    assert "ORC007" in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
 
 
 def test_cli_binary_recovery_and_json_base64_matrix(tmp_path, monkeypatch, capfdbinary) -> None:

@@ -20,7 +20,7 @@ from untaped_orchestration.application.results import MaintenanceResult
 from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, usage_value
-from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.cli.output import CommandResult, result_exit_code, run_command
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import Revision
 from untaped_orchestration.domain.time import CalendarDate, IanaTimezone
@@ -52,7 +52,7 @@ def _format_result(result: RecursiveFormatResult | MaintenanceResult) -> Command
         complete=result.complete if isinstance(result, RecursiveFormatResult) else True,
         diagnostics=result.diagnostics,
         pipe_kind="orchestration.store",
-        exit_code=0 if result.matches else 1,
+        exit_code=result_exit_code(result.diagnostics, 0 if result.matches else 1),
     )
 
 
@@ -126,7 +126,7 @@ def register(app: App) -> None:  # noqa: C901
                 result.checks,
                 complete=result.complete,
                 diagnostics=result.diagnostics,
-                exit_code=0 if result.valid else 1,
+                exit_code=result_exit_code(result.diagnostics, 0 if result.valid else 1),
             )
 
         run_command("check", action, fmt=format, allowed=("table", "json"), columns=columns)

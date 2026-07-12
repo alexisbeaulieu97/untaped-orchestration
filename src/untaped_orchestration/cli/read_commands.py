@@ -28,7 +28,7 @@ from untaped_orchestration.cli.options import (
     usage_value,
     validate_limit,
 )
-from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.cli.output import CommandResult, result_exit_code, run_command
 from untaped_orchestration.domain.graph import DecisionState
 from untaped_orchestration.domain.ids import DecisionId, TaskId
 from untaped_orchestration.domain.models import ItemKind, TaskOutcome, TaskStage
@@ -59,21 +59,13 @@ def _result[T](
 
 
 def _curation_result(value: CurationPage) -> CommandResult:
-    exit_code = (
-        4
-        if any(
-            diagnostic.code == "ORC007" and diagnostic.severity == "error"
-            for diagnostic in value.diagnostics
-        )
-        else 0
-    )
     return CommandResult(
         "curate next",
         value.entries,
         complete=value.complete,
         truncated=value.truncated,
         diagnostics=value.diagnostics,
-        exit_code=exit_code,
+        exit_code=result_exit_code(value.diagnostics, 0),
     )
 
 
