@@ -24,3 +24,17 @@ def test_packaged_skill_contains_all_agent_safety_rules() -> None:
 
     for rule in required_rules:
         assert rule in skill
+
+
+def test_packaged_skill_operationalizes_safe_retries_and_readiness() -> None:
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+
+    assert skill.index("brief --format json") < skill.index("show")
+    assert "caller-stable" in skill
+    assert "same ID" in skill
+    assert "expected revision" in skill
+    assert "complete=false" in skill
+    assert "truncated=true" in skill
+    assert "Do not scan" in skill
+    assert "Do not use `--force-current`" in skill
+    assert "Do not create or move tasks into a public store" in skill

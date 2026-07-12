@@ -61,6 +61,7 @@ max-complexity = 12
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["S101", "PLC0415"]
 "**/cli/*.py" = ["B008"]
+"tests/unit/test_release_workflow.py" = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -34,7 +34,3 @@ def test_ci_cancels_superseded_branch_runs() -> None:
     assert "concurrency:" in workflow
     assert "group: ${{ github.workflow }}-${{ github.ref }}" in workflow
     assert "cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}" in workflow
-
-
-def test_release_workflow_is_deferred() -> None:
-    assert not CI_WORKFLOW.with_name("release.yml").exists()
