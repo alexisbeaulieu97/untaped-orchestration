@@ -82,6 +82,8 @@ def _regular_external_file(path: Path, *, label: str) -> bytes:
 
 
 def _manifest_record_file(root: Path, relative: str) -> bytes:
+    if root.is_symlink():
+        raise ImportConflict("manifest record root cannot be a symlink")
     relative_path = PurePosixPath(relative)
     candidate = root.joinpath(*relative_path.parts)
     try:
@@ -103,6 +105,8 @@ def _manifest_record_file(root: Path, relative: str) -> bytes:
 
 def _load_manifest(request: ImportRequest) -> ImportManifest:
     try:
+        if request.manifest.parent.is_symlink():
+            raise ValueError("manifest parent cannot be a symlink")
         raw = _regular_external_file(request.manifest, label="manifest")
         return ImportManifest.model_validate(tomllib.loads(raw.decode("utf-8")))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValidationError, ValueError) as error:
@@ -240,12 +244,24 @@ class ImportService:
                     relation=EvidenceRelation.TRACKED_BY,
                     reference=entry.source_ref,
                 )
+                conflicting_provenance = tuple(
+                    evidence
+                    for evidence in metadata.evidence
+                    if evidence.reference == entry.source_ref
+                    and evidence.relation is not EvidenceRelation.TRACKED_BY
+                )
+                if conflicting_provenance:
+                    raise ImportConflict(
+                        "manifest source_ref already exists under a different evidence relation"
+                    )
                 if provenance not in metadata.evidence:
                     metadata = validated_copy(
                         metadata,
                         {"evidence": (*metadata.evidence, provenance)},
                     )
                 content = self._repository.item_bytes(metadata, parsed_body)
+            except ImportConflict:
+                raise
             except (ValidationError, ValueError) as error:
                 raise ImportConflict(f"invalid manifest record: {path.as_posix()}") from error
             revision = Revision(f"sha256:{sha256(content).hexdigest()}")

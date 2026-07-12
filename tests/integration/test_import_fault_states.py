@@ -4,7 +4,11 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from tests.unit.application.test_import import _fixture, _manifest
+from tests.unit.application.test_import import (
+    _append_decision_record,
+    _fixture,
+    _manifest,
+)
 from untaped_orchestration.application.maintenance import ImportConflict, ImportRequest
 from untaped_orchestration.application.ports import FileReplacement
 
@@ -118,3 +122,60 @@ def test_first_clean_apply_requires_current_views(tmp_path: Path) -> None:
 
     with pytest.raises(ImportConflict, match="current views"):
         service.execute(ImportRequest(location, manifest, apply=True, if_clean=True))
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_multi_record_source_conflict_refuses_apply_and_exact_subset_resume(
+    tmp_path: Path, resume: bool
+) -> None:
+    repository, location, service = _fixture(tmp_path)
+    base = repository.load_local(location, headers_only=False).store_revision
+    safe_manifest = _manifest(tmp_path, base.root)
+    preview = service.execute(ImportRequest(location, safe_manifest))
+    first = preview.records[0]
+    target = location.real_root.joinpath(*first.path.parts)
+    if resume:
+        target.parent.mkdir()
+        target.write_bytes(first.content)
+
+    conflicting = _append_decision_record(
+        tmp_path,
+        safe_manifest,
+        source_ref="url:https://example.com/source",
+    )
+    second_frontmatter = tmp_path / "records" / "decision-2.toml"
+    second_frontmatter.write_bytes(
+        second_frontmatter.read_bytes()
+        + b'\n[[evidence]]\nrelation = "implemented-by"\n'
+        + b'reference = "url:https://EXAMPLE.com/source"\n'
+    )
+
+    with pytest.raises(ImportConflict, match="source_ref"):
+        service.execute(ImportRequest(location, safe_manifest, apply=True, if_clean=True))
+
+    if resume:
+        assert target.read_bytes() == first.content
+    else:
+        assert not target.exists()
+    assert not location.real_root.joinpath(*conflicting.parts).exists()
+
+
+def test_symlinked_manifest_parent_and_records_root_are_rejected(tmp_path: Path) -> None:
+    repository, location, service = _fixture(tmp_path)
+    base = repository.load_local(location, headers_only=False).store_revision
+
+    real = tmp_path / "real-input"
+    real.mkdir()
+    manifest = _manifest(real, base.root)
+    linked = tmp_path / "linked-input"
+    linked.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ImportConflict, match="manifest"):
+        service.execute(ImportRequest(location, linked / manifest.name))
+
+    manifest = _manifest(tmp_path, base.root)
+    records = tmp_path / "records"
+    relocated = tmp_path / "real-records"
+    records.rename(relocated)
+    records.symlink_to(relocated, target_is_directory=True)
+    with pytest.raises(ImportConflict, match="manifest"):
+        service.execute(ImportRequest(location, manifest))

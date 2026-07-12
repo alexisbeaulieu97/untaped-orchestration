@@ -95,6 +95,37 @@ source_ref = "git:abc123:orchestration/DECISIONS.md#sha256:{"a" * 64}"
     return manifest
 
 
+def _append_decision_record(
+    tmp_path: Path,
+    manifest: Path,
+    *,
+    item_id: str = "dec_019f0000000070008000000000000002",
+    source_ref: str | None = None,
+) -> PurePosixPath:
+    raw = (
+        decision_bytes()
+        .replace(DECISION_ID.encode(), item_id.encode())
+        .replace(
+            b"Use TOML front matter and opaque Markdown bodies",
+            b"Second imported decision",
+        )
+    )
+    records = tmp_path / "records"
+    records.joinpath("decision-2.toml").write_bytes(_frontmatter(raw))
+    records.joinpath("decision-2.md").write_bytes(_body(raw))
+    reference = source_ref or f"git:def456:DECISIONS.md#sha256:{'b' * 64}"
+    with manifest.open("a", encoding="utf-8") as stream:
+        stream.write(
+            f'''\n[[records]]
+destination = "decisions"
+frontmatter_file = "records/decision-2.toml"
+body_file = "records/decision-2.md"
+source_ref = "{reference}"
+'''
+        )
+    return PurePosixPath(f"decisions/{item_id}-second-imported-decision.md")
+
+
 def test_manifest_is_the_only_revision_authority_and_import_defaults_to_dry_run(
     tmp_path: Path,
 ) -> None:
@@ -207,3 +238,83 @@ def test_import_runs_full_graph_validation(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError):
         service.execute(ImportRequest(location, manifest))
+
+
+@pytest.mark.parametrize(
+    ("relation", "existing_reference", "manifest_reference"),
+    [
+        (
+            relation,
+            existing,
+            canonical,
+        )
+        for relation in ("implemented-by", "verified-by", "released-as")
+        for existing, canonical in (
+            ("url:https://EXAMPLE.com/Source", "url:https://example.com/Source"),
+            ("github-pr:Owner/Repo#7", "github-pr:owner/repo#7"),
+        )
+    ],
+)
+@pytest.mark.parametrize("apply", [False, True])
+def test_import_rejects_canonical_source_reference_under_any_other_relation_before_write(
+    tmp_path: Path,
+    relation: str,
+    existing_reference: str,
+    manifest_reference: str,
+    apply: bool,
+) -> None:
+    repository, location, service = _fixture(tmp_path)
+    base = repository.load_local(location, headers_only=False).store_revision
+    manifest = _manifest(tmp_path, base.root)
+    frontmatter = tmp_path / "records" / "decision.toml"
+    frontmatter.write_bytes(
+        frontmatter.read_bytes()
+        + f'\n[[evidence]]\nrelation = "{relation}"\n'.encode()
+        + f'reference = "{existing_reference}"\n'.encode()
+    )
+    manifest.write_text(
+        manifest.read_text().replace(
+            f"git:abc123:orchestration/DECISIONS.md#sha256:{'a' * 64}",
+            manifest_reference,
+        )
+    )
+    destination = location.real_root / "decisions"
+
+    with pytest.raises(ImportConflict, match="source_ref"):
+        service.execute(ImportRequest(location, manifest, apply=apply, if_clean=apply))
+
+    assert not destination.exists()
+
+
+def test_exact_tracked_by_canonical_source_is_idempotent_across_multi_record_import(
+    tmp_path: Path,
+) -> None:
+    repository, location, service = _fixture(tmp_path)
+    base = repository.load_local(location, headers_only=False).store_revision
+    manifest = _manifest(tmp_path, base.root)
+    frontmatter = tmp_path / "records" / "decision.toml"
+    frontmatter.write_bytes(
+        frontmatter.read_bytes()
+        + b'\n[[evidence]]\nrelation = "tracked-by"\n'
+        + b'reference = "url:https://EXAMPLE.com/Source"\n'
+    )
+    manifest.write_text(
+        manifest.read_text().replace(
+            f"git:abc123:orchestration/DECISIONS.md#sha256:{'a' * 64}",
+            "url:https://example.com/Source",
+        )
+    )
+    second = _append_decision_record(tmp_path, manifest)
+
+    result = service.execute(ImportRequest(location, manifest, apply=True, if_clean=True))
+
+    assert len(result.records) == 2
+    assert location.real_root.joinpath(*second.parts).is_file()
+    first = repository.load_local(location, headers_only=False).records[0]
+    matching = [
+        evidence
+        for evidence in first.metadata.evidence
+        if evidence.reference.root == "url:https://example.com/Source"
+    ]
+    assert len(matching) == 1
+    assert matching[0].relation is EvidenceRelation.TRACKED_BY

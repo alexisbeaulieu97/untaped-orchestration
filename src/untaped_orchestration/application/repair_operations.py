@@ -75,7 +75,7 @@ class RepairFrontmatterResult:
 
 
 def _regular_external_file(path: Path, *, label: str) -> bytes:
-    if path.is_symlink() or not path.is_file():
+    if path.parent.is_symlink() or path.is_symlink() or not path.is_file():
         raise ValueError(f"{label} must be a regular nonsymlink file")
     return path.read_bytes()
 

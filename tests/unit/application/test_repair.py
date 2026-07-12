@@ -175,3 +175,29 @@ def test_duplicate_repair_facade_delegates_exact_guarded_request(tmp_path: Path)
     )
     assert service.duplicate(request) is sentinel
     assert delegate.received is request
+
+
+@pytest.mark.parametrize("external", ["frontmatter", "body"])
+def test_repair_rejects_inputs_under_a_symlinked_lexical_root(
+    tmp_path: Path, external: str
+) -> None:
+    _, location, service, item = _fixture(tmp_path)
+    real = tmp_path / "real-input"
+    real.mkdir()
+    (real / "frontmatter.toml").write_bytes(_metadata(decision_bytes()))
+    (real / "body.md").write_bytes(b"explicit body\n")
+    linked = tmp_path / "linked-input"
+    linked.symlink_to(real, target_is_directory=True)
+    broken = b"not an envelope"
+    if external == "body":
+        item.write_bytes(broken)
+
+    request = RepairFrontmatterRequest(
+        location,
+        PATH,
+        linked / "frontmatter.toml" if external == "frontmatter" else real / "frontmatter.toml",
+        file_revision(broken if external == "body" else item.read_bytes()),
+        body_file=linked / "body.md" if external == "body" else None,
+    )
+    with pytest.raises(RepairConflict):
+        service.frontmatter(request)
