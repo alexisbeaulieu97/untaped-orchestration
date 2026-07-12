@@ -4,6 +4,21 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from untaped_orchestration.application.federation import FederationService
+from untaped_orchestration.application.import_operations import (
+    ImportConflict as ImportConflict,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportedRecord as ImportedRecord,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportRequest as ImportRequest,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportResult as ImportResult,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportService as ImportService,
+)
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
     FileReplacement,
@@ -12,6 +27,18 @@ from untaped_orchestration.application.ports import (
     StoreReader,
     StoreWriter,
     ViewRenderer,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairConflict as RepairConflict,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairFrontmatterRequest as RepairFrontmatterRequest,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairFrontmatterResult as RepairFrontmatterResult,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairService as RepairService,
 )
 from untaped_orchestration.application.results import (
     CheckResult,

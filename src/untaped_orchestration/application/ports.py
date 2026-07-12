@@ -55,6 +55,7 @@ __all__ = [
     "StoreReader",
     "StoreSnapshot",
     "StoreWriter",
+    "UnprovableBodyBoundary",
     "ViewRenderer",
 ]
 
@@ -64,6 +65,10 @@ MANAGED_VIEW_PATHS = (
     PurePosixPath("views/inbox.md"),
     PurePosixPath("views/decisions.md"),
 )
+
+
+class UnprovableBodyBoundary(ValueError):
+    pass
 
 
 class Clock(Protocol):

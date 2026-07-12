@@ -18,6 +18,7 @@ from untaped_orchestration.application.ports import (
     StoreReader,
     StoreSnapshot,
     StoreWriter,
+    UnprovableBodyBoundary,
 )
 from untaped_orchestration.domain.canonical import CanonicalItem
 from untaped_orchestration.domain.diagnostics import Diagnostic, sort_diagnostics
@@ -219,6 +220,40 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
 
     def item_bytes(self, metadata: CanonicalItem, body: bytes) -> bytes:
         return self._items.canonical_bytes(ItemDocument(metadata=metadata, body=body, original=b""))
+
+    def parse_item_parts(
+        self,
+        frontmatter: bytes,
+        body: bytes,
+        *,
+        relative_path: PurePosixPath,
+    ) -> tuple[CanonicalItem, bytes]:
+        raw = b"+++\n" + frontmatter.rstrip(b"\n") + b"\n+++\n" + body
+        document = self._items.parse(raw, relative_path=relative_path)
+        return document.metadata, document.body
+
+    def repaired_item_bytes(
+        self,
+        *,
+        relative_path: PurePosixPath,
+        current: bytes,
+        replacement_frontmatter: bytes,
+        replacement_body: bytes | None,
+    ) -> bytes:
+        if replacement_body is None:
+            try:
+                replacement_body = self._items.proven_body(
+                    current,
+                    relative_path=relative_path,
+                )
+            except CodecError as error:
+                raise UnprovableBodyBoundary from error
+        return self._items.repaired_bytes(
+            relative_path=relative_path,
+            current=current,
+            replacement_frontmatter=replacement_frontmatter,
+            replacement_body=replacement_body,
+        )
 
     def project(
         self,

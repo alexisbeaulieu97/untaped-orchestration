@@ -594,6 +594,28 @@ class ItemCodec:
         _validate_item_path(metadata, relative_path=relative_path)
         return metadata
 
+    def repaired_bytes(
+        self,
+        *,
+        relative_path: PurePosixPath,
+        current: bytes,
+        replacement_frontmatter: bytes,
+        replacement_body: bytes | None,
+    ) -> bytes:
+        metadata = self.parse_replacement_frontmatter(
+            replacement_frontmatter,
+            relative_path=relative_path,
+        )
+        if replacement_body is None:
+            _, body = _split_item(current, relative_path=relative_path)
+        else:
+            body = replacement_body
+        return self.canonical_bytes(ItemDocument(metadata=metadata, body=body, original=b""))
+
+    def proven_body(self, raw: bytes, *, relative_path: PurePosixPath) -> bytes:
+        _, body = _split_item(raw, relative_path=relative_path)
+        return body
+
 
 class StoreConfigCodec:
     def parse(self, raw: bytes) -> StoreConfig:
