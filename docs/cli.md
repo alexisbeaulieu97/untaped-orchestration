@@ -20,6 +20,11 @@ and `--debug` follow the complete command path.
 task and decision lifecycles, relations, evidence, curation, child registry,
 provider-neutral import, validation, format, render, and targeted repair.
 
+`brief` enforces the selected store's configured `brief.max_total_bytes` on
+the final encoded JSON or table output, including its trailing LF. `curate
+next` and recursive `fmt --check` preserve completeness, truncation, and
+ordered diagnostics in the top-level output contract.
+
 Federation is explicit in `registry.toml`. Reads recurse by default and
 `--local` restricts them; writes modify only the selected store. Partial reads
 may return `complete=false`. `next`, readiness/delivery, and structural changes

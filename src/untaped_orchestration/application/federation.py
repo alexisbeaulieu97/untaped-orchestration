@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -20,6 +20,7 @@ from untaped_orchestration.application.results import (
     AdministrativeState,
     Completeness,
     FederatedSnapshot,
+    FederationAnchor,
     IncompletenessReason,
     IncompleteStore,
     ItemRevision,
@@ -125,6 +126,12 @@ class _Resolution:
     entries: list[IncompleteStore]
 
 
+@dataclass(frozen=True, slots=True)
+class FederationRead:
+    snapshot: FederatedSnapshot
+    reader: StoreReader | None
+
+
 def _path_key(path: Path) -> str:
     return os.path.normcase(str(path)).casefold()
 
@@ -215,7 +222,22 @@ class FederationService:
         local: bool,
         headers_only: bool,
     ) -> FederatedSnapshot:
-        selected = self._reader.load_local(location, headers_only=headers_only)
+        return self.run(
+            location,
+            local=local,
+            headers_only=headers_only,
+            action=lambda lease: lease.snapshot,
+        )
+
+    def run[T](
+        self,
+        location: StoreLocation,
+        *,
+        local: bool,
+        headers_only: bool = True,
+        action: Callable[[FederationRead], T],
+    ) -> T:
+        selected = self._reader.load_local(location, headers_only=True)
         selected_id = _identity(selected)
         if selected_id is None:
             raise UnidentifiedStoreError(location)
@@ -232,7 +254,7 @@ class FederationService:
             self._resolve_children(
                 participant,
                 resolution,
-                headers_only=headers_only,
+                headers_only=True,
                 ancestor_ids=frozenset({selected_id.root}),
                 ancestor_paths=frozenset({key}),
             )
@@ -241,15 +263,29 @@ class FederationService:
             (value.snapshot.location for value in resolution.participants.values()),
             key=_location_sort_key,
         )
+        unavailable: FederatedSnapshot | None = None
         try:
             with self._locks.acquire(ordered, timeout=self._lock_timeout):
                 self._reread_under_lock(
                     resolution,
                     headers_only=headers_only,
                 )
+                snapshot = self._snapshot(resolution, key)
+                if any(entry.reason == "changed" for entry in resolution.entries):
+                    unavailable = snapshot
+                else:
+                    return action(FederationRead(snapshot, self._reader))
         except StoreLockTimeout as error:
             self._record_timeout(error, resolution)
+        return action(
+            FederationRead(
+                unavailable or self._snapshot(resolution, key),
+                None,
+            )
+        )
 
+    @staticmethod
+    def _snapshot(resolution: _Resolution, selected_key: str) -> FederatedSnapshot:
         snapshots = tuple(
             participant.snapshot
             for participant in sorted(
@@ -261,11 +297,23 @@ class FederationService:
                 key=lambda value: _location_sort_key(value.snapshot.location),
             )
         )
-        selected_snapshot = resolution.participants[key].snapshot
+        selected_snapshot = resolution.participants[selected_key].snapshot
+        anchors = tuple(
+            FederationAnchor(
+                participant.snapshot.location,
+                participant.snapshot.store_config_revision,
+                participant.snapshot.registry_revision,
+            )
+            for participant in sorted(
+                resolution.participants.values(),
+                key=lambda value: _location_sort_key(value.snapshot.location),
+            )
+        )
         return FederatedSnapshot(
             selected=selected_snapshot,
             stores=snapshots,
             completeness=Completeness(_sorted_entries(resolution.entries)),
+            participants=anchors,
         )
 
     def _registry_is_traversable(
@@ -760,10 +808,15 @@ class FederationRegistryService:
         proposed: FederatedSnapshot | None,
         registry: Registry,
     ) -> MutationReceipt:
-        by_path = {_path_key(value.location.real_root): value.location for value in current.stores}
+        by_path = {
+            _path_key(value.location.real_root): value.location for value in current.participants
+        }
         if proposed is not None:
             by_path.update(
-                {_path_key(value.location.real_root): value.location for value in proposed.stores}
+                {
+                    _path_key(value.location.real_root): value.location
+                    for value in proposed.participants
+                }
             )
         locations = tuple(sorted(by_path.values(), key=_location_sort_key))
         optimistic = {
@@ -773,7 +826,7 @@ class FederationRegistryService:
             )
             for federation in (current, proposed)
             if federation is not None
-            for store in federation.stores
+            for store in federation.participants
         }
         with self._locks.acquire(locations, timeout=self._lock_timeout):
             self._reread_locked(locations, optimistic)

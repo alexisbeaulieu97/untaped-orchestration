@@ -106,8 +106,31 @@ def test_curate_next_uses_each_store_context_and_local_scope(tmp_path: Path) -> 
     )
     local = service.next(CurateNextRequest(local=True))
     recursive = service.next(CurateNextRequest(local=False))
-    assert [entry.item_id for entry in local] == [task.record.metadata.id]
+    assert [entry.item_id for entry in local.entries] == [task.record.metadata.id]
     assert recursive == local
+
+
+def test_curate_next_returns_typed_truncated_page_for_51_at_limit_50(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import untaped_orchestration.application.curation as curation_module
+
+    repository, location, scope, executor, _ = state(tmp_path)
+    task = create(repository, location, scope, executor)
+    service = CurationService(executor, repository, Clock(), scope)
+    service.snooze(
+        SnoozeRequest(task.record.metadata.id, CalendarDate("2026-07-11"), task.record.revision)
+    )
+    entry = service.next(CurateNextRequest(local=True)).entries[0]
+    monkeypatch.setattr(curation_module, "curation_queue", lambda *args, **kwargs: (entry,) * 51)
+
+    page = service.next(CurateNextRequest(local=True, limit=50))
+
+    assert len(page.entries) == 50
+    assert page.complete
+    assert page.truncated
+    assert page.diagnostics == ()
 
 
 def test_inactive_decision_curation_is_refused(tmp_path: Path) -> None:
@@ -208,7 +231,7 @@ def test_recursive_curate_next_fails_closed_but_local_ignores_unrelated_child_fa
     with pytest.raises(InvalidMutationState):
         service.next(CurateNextRequest())
     local = service.next(CurateNextRequest(local=True))
-    assert [entry.item_id for entry in local] == [task.record.metadata.id]
+    assert [entry.item_id for entry in local.entries] == [task.record.metadata.id]
 
 
 @pytest.mark.parametrize(
@@ -332,7 +355,7 @@ def test_local_curate_next_ignores_unrelated_child_error_but_rejects_selected_er
         MutationScope(recursive, scope.selected_local),
     )
 
-    assert service.next(CurateNextRequest(local=True)) == ()
+    assert service.next(CurateNextRequest(local=True)).entries == ()
     with pytest.raises(InvalidMutationState) as recursive_failure:
         service.next(CurateNextRequest())
     assert {value.code for value in recursive_failure.value.diagnostics} == {"ORC009"}

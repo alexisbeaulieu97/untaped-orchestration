@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
+from untaped_orchestration.application.ports import StoreReader
 from untaped_orchestration.application.results import FederatedSnapshot
 from untaped_orchestration.domain.curation import CurationEntry
 from untaped_orchestration.domain.diagnostics import Diagnostic
@@ -29,6 +30,12 @@ DEFAULT_LIMIT = 50
 class QueryScope:
     recursive: Callable[[], FederatedSnapshot]
     local: Callable[[], FederatedSnapshot]
+    recursive_run: (
+        Callable[[Callable[[FederatedSnapshot, StoreReader | None], object]], object] | None
+    ) = None
+    local_run: (
+        Callable[[Callable[[FederatedSnapshot, StoreReader | None], object]], object] | None
+    ) = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,3 +253,4 @@ class BriefData:
     missing_store_count: int
     inactive_ruling_count: int
     globally_ready: bool
+    max_total_bytes: int

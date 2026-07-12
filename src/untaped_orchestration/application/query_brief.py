@@ -68,7 +68,9 @@ def _indexes(
 
 
 def _pins(
-    projection: SafeProjection, reader: StoreReader, local: dict[DecisionId, list[LoadedRecord]]
+    projection: SafeProjection,
+    reader: StoreReader | None,
+    local: dict[DecisionId, list[LoadedRecord]],
 ) -> _Pins:
     selected = projection.snapshot.selected
     config = selected.store
@@ -88,6 +90,9 @@ def _pins(
         revisions.append((item_id.root, record.revision))
         if state is not DecisionState.ACTIVE:
             inactive.append(InactiveRuling(config.id, item_id, state))
+            continue
+        if reader is None:
+            truncated = True
             continue
         body = reader.read_item_body(selected.location, record.path)
         body, cut = _truncate(body, min(config.brief.max_decision_body_bytes, remaining))
@@ -143,7 +148,7 @@ def _tasks(
 
 
 def assemble_brief(
-    projection: SafeProjection, reader: StoreReader
+    projection: SafeProjection, reader: StoreReader | None
 ) -> tuple[BriefData, bool, tuple[tuple[str, Revision], ...], int]:
     selected = projection.snapshot.selected
     config = selected.store
@@ -181,6 +186,7 @@ def assemble_brief(
         len(missing),
         len(inactive),
         projection.complete and bool(ready),
+        config.brief.max_total_bytes,
     )
     truncated = pins.truncated or any(
         value > cap

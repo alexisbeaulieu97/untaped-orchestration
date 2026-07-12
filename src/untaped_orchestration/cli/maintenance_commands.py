@@ -10,11 +10,13 @@ from untaped_orchestration.application.import_operations import ImportRequest, I
 from untaped_orchestration.application.maintenance import (
     RecursiveCheckRequest,
     RecursiveFormatRequest,
+    RecursiveFormatResult,
 )
 from untaped_orchestration.application.repair_operations import (
     RepairFrontmatterRequest,
     RepairService,
 )
+from untaped_orchestration.application.results import MaintenanceResult
 from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, usage_value
@@ -41,6 +43,17 @@ def _task_id(value: str) -> TaskId:
 
 def _item_id(value: str) -> TaskId | DecisionId:
     return usage_value(lambda: TaskId(value) if value.startswith("tsk_") else DecisionId(value))
+
+
+def _format_result(result: RecursiveFormatResult | MaintenanceResult) -> CommandResult:
+    return CommandResult(
+        "fmt",
+        result,
+        complete=result.complete if isinstance(result, RecursiveFormatResult) else True,
+        diagnostics=result.diagnostics,
+        pipe_kind="orchestration.store",
+        exit_code=0 if result.matches else 1,
+    )
 
 
 def _guard(value: str | None, force_current: bool) -> tuple[Revision | None, bool]:
@@ -148,7 +161,7 @@ def register(app: App) -> None:  # noqa: C901
                     request, expected_store_revision=_revision(if_store_revision)
                 )
             )
-            return CommandResult("fmt", result, exit_code=0 if result.matches else 1)
+            return _format_result(result)
 
         run_command("fmt", action, fmt=format, allowed=("table", "json"), columns=columns)
 

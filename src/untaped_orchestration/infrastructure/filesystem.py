@@ -329,6 +329,17 @@ def _is_writable_canonical_path(relative_path: PurePosixPath) -> bool:
     )
 
 
+def _is_canonical_atomic_temporary(relative_path: PurePosixPath) -> bool:
+    marker = ".untaped-tmp-"
+    name = relative_path.name
+    if not name.startswith(".") or marker not in name:
+        return False
+    target_name, suffix = name[1:].split(marker, 1)
+    if not target_name or not suffix:
+        return False
+    return _is_writable_canonical_path(relative_path.parent / target_name)
+
+
 def safe_write_path(location: StoreLocation, relative_path: PurePosixPath) -> Path:
     _validate_location(location)
     _assert_relative(relative_path)
@@ -344,7 +355,9 @@ def safe_write_path(location: StoreLocation, relative_path: PurePosixPath) -> Pa
 def safe_delete_path(location: StoreLocation, relative_path: PurePosixPath) -> Path:
     _validate_location(location)
     _assert_relative(relative_path)
-    if not _is_writable_canonical_path(relative_path):
+    if not (
+        _is_writable_canonical_path(relative_path) or _is_canonical_atomic_temporary(relative_path)
+    ):
         raise PathSafetyError(relative_path, "deletes are restricted to canonical store paths")
     absolute = _walk_existing_components(location.real_root, relative_path)
     if not _is_regular_nonsymlink(absolute):

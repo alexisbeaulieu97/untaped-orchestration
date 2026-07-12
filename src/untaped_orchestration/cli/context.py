@@ -75,7 +75,7 @@ class CliContext:
         override = Path(store) if store is not None else None
         location = repository.discover(Path.cwd(), override)
         federation = FederationService(repository, locks)
-        recursive_snapshot = federation.load(location, local=False, headers_only=False)
+        recursive_snapshot = federation.load(location, local=False, headers_only=True)
         unlocked_federation = FederationService(repository, AlreadyLocked())
 
         def recursive() -> FederatedSnapshot:
@@ -108,9 +108,19 @@ class CliContext:
         return QueryService(
             QueryScope(
                 recursive=lambda: self.federation.load(
-                    self.location, local=False, headers_only=False
+                    self.location, local=False, headers_only=True
                 ),
-                local=lambda: self.federation.load(self.location, local=True, headers_only=False),
+                local=lambda: self.federation.load(self.location, local=True, headers_only=True),
+                recursive_run=lambda action: self.federation.run(
+                    self.location,
+                    local=False,
+                    action=lambda lease: action(lease.snapshot, lease.reader),
+                ),
+                local_run=lambda action: self.federation.run(
+                    self.location,
+                    local=True,
+                    action=lambda lease: action(lease.snapshot, lease.reader),
+                ),
             ),
             self.repository,
             self.clock,
@@ -153,14 +163,14 @@ class CliContext:
         formatter = FormatStore(
             self.repository,
             self.repository,
-            self.locks,
+            AlreadyLocked(),
             self.views,
             self.repository,
         )
         renderer = RenderStore(
             self.repository,
             self.repository,
-            self.locks,
+            AlreadyLocked(),
             self.views,
         )
         return RecursiveMaintenanceService(

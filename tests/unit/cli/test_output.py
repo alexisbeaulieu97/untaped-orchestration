@@ -7,15 +7,19 @@ from pathlib import PurePosixPath
 import pytest
 
 from tests.builders import TASK_ID
+from untaped_orchestration.application.curation import CurationPage
 from untaped_orchestration.application.item_support import RevisionConflict
+from untaped_orchestration.application.maintenance import RecursiveFormatResult
 from untaped_orchestration.application.queries import QueryIncompleteError
 from untaped_orchestration.application.results import RawRecord
+from untaped_orchestration.cli.maintenance_commands import _format_result
 from untaped_orchestration.cli.output import (
     CommandResult,
     encode_binary_recovery,
     encode_result,
     run_command,
 )
+from untaped_orchestration.cli.read_commands import _curation_result
 from untaped_orchestration.domain.curation import CurationEntry, CurationKind
 from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.ids import StoreId, TaskId
@@ -101,6 +105,58 @@ def test_curation_rows_project_stable_id_and_dynamic_pipe_kind() -> None:
         "orchestration.task",
         "orchestration.status",
     ]
+
+
+def test_curation_page_propagates_warning_and_truncation_to_json_and_pipe() -> None:
+    entry = CurationEntry(
+        StoreId("sto_019f0000000070008000000000000000"),
+        CurationKind.TASK,
+        TaskId(TASK_ID),
+        CalendarDate("2026-07-12"),
+    )
+    warning = Diagnostic(
+        code="ORC005",
+        severity="warning",
+        path="registry.toml",
+        field="children",
+        message="child unavailable",
+        hint="restore child",
+    )
+    result = _curation_result(CurationPage((entry,), False, True, (warning,)))
+
+    payload = json.loads(encode_result(result, fmt="json").stdout)
+    assert payload["complete"] is False
+    assert payload["truncated"] is True
+    assert payload["diagnostics"][0]["code"] == "ORC005"
+    records = [json.loads(line) for line in encode_result(result, fmt="pipe").stdout.splitlines()]
+    assert [record["kind"] for record in records] == [
+        "orchestration.task",
+        "orchestration.diagnostic",
+        "orchestration.status",
+    ]
+    assert records[-1]["record"] == {"complete": False, "truncated": True}
+
+
+def test_recursive_fmt_propagates_incomplete_warning_to_every_encoder() -> None:
+    warning = Diagnostic(
+        code="ORC005",
+        severity="warning",
+        path="registry.toml",
+        field="children",
+        message="child unavailable",
+        hint="restore child",
+    )
+    result = _format_result(RecursiveFormatResult((), False, (warning,)))
+    assert result.exit_code == 0
+
+    payload = json.loads(encode_result(result, fmt="json").stdout)
+    assert payload["complete"] is False
+    assert payload["diagnostics"][0]["code"] == "ORC005"
+    pipe = [json.loads(line) for line in encode_result(result, fmt="pipe").stdout.splitlines()]
+    assert pipe[-2]["kind"] == "orchestration.diagnostic"
+    assert pipe[-1]["record"] == {"complete": False, "truncated": False}
+    table = encode_result(result, fmt="table")
+    assert table.stderr.startswith(b"ORC005: registry.toml")
 
 
 def test_pipe_emits_data_and_diagnostic_records_for_partial_results() -> None:
@@ -209,7 +265,8 @@ def test_binary_and_json_recovery_preserve_invalid_utf8_exactly() -> None:
     assert payload["data"]["content"] == base64.b64encode(content).decode()
 
 
-def test_brief_serialization_never_exceeds_32768_encoded_bytes() -> None:
+@pytest.mark.parametrize("byte_limit", [4096, 32768])
+def test_brief_serialization_respects_configured_encoded_byte_limit(byte_limit: int) -> None:
     data = {
         "store_id": "sto_019f0000000070008000000000000000",
         "store_revision": REVISION.root,
@@ -220,13 +277,35 @@ def test_brief_serialization_never_exceeds_32768_encoded_bytes() -> None:
         "ready": [{"id": TASK_ID, "title": "雪" * 5000}] * 10,
         "diagnostic_count": 1000,
         "missing_store_count": 1000,
+        "max_total_bytes": byte_limit,
     }
     for fmt in ("json", "table"):
         encoded = encode_result(CommandResult("brief", data), fmt=fmt)
-        assert len(encoded.stdout) <= 32768
+        assert len(encoded.stdout) <= byte_limit
         assert encoded.truncated is True
         if fmt == "json":
             assert json.loads(encoded.stdout)["truncated"] is True
+
+
+def test_ambiguous_raw_failure_names_every_path_and_writes_zero_stdout(capfd) -> None:
+    from untaped_orchestration.application.queries import RawAmbiguityError
+
+    def fail() -> CommandResult:
+        raise RawAmbiguityError(("tasks/one.md", "tasks/two.md"))
+
+    with pytest.raises(SystemExit) as raised:
+        run_command(
+            "show",
+            fail,
+            fmt="raw",
+            allowed=("raw",),
+            binary_recovery=True,
+        )
+    assert raised.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "ORC003: tasks/one.md" in captured.err
+    assert "ORC003: tasks/two.md" in captured.err
 
 
 @pytest.mark.parametrize(

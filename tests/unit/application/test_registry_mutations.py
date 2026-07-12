@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tests.builders import CHILD_STORE_ID, STORE_ID, write_store
+from tests.builders import CHILD_STORE_ID, STORE_ID, registry_bytes, store_bytes, write_store
 from untaped_orchestration.application.federation import (
     AddChildRequest,
     FederationRegistryService,
@@ -136,6 +136,49 @@ def test_force_current_does_not_bypass_invalid_child_identity(tmp_path: Path) ->
                 force_current=True,
             )
         )
+
+
+def test_remove_locks_invalid_child_and_conflicts_if_identity_is_repaired(tmp_path: Path) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id="sto_019f0000000070008000000000000099")
+    parent.joinpath("registry.toml").write_text(
+        f'''schema = "untaped.orchestration.registry/v1"
+store_id = "{STORE_ID}"
+
+[[children]]
+id = "{CHILD_STORE_ID}"
+path = "{_relative(parent, child)}"
+''',
+        encoding="utf-8",
+    )
+    repository = FilesystemStoreRepository()
+    location = location_from_root(parent)
+    revision = repository.load_local(location, headers_only=True).registry_revision
+    assert revision is not None
+    locked: list[Path] = []
+
+    class RepairOnLock:
+        @contextmanager
+        def acquire(self, locations, *, timeout):
+            del timeout
+            locked.extend(value.real_root for value in locations)
+            child.joinpath("store.toml").write_bytes(store_bytes(store_id=CHILD_STORE_ID))
+            child.joinpath("registry.toml").write_bytes(registry_bytes(store_id=CHILD_STORE_ID))
+            yield
+
+    service = FederationRegistryService(
+        repository,
+        repository,
+        RepairOnLock(),
+        MarkdownViewRenderer(),
+        repository,
+    )
+
+    with pytest.raises(RegistryRevisionConflict):
+        service.remove_child(RemoveChildRequest(location, CHILD_STORE_ID, revision))
+
+    assert child.resolve() in locked
+    assert CHILD_STORE_ID in parent.joinpath("registry.toml").read_text()
 
 
 def test_invalid_absolute_child_path_is_rejected_before_any_store_io(tmp_path: Path) -> None:

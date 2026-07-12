@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import base64
 import json
+from contextlib import contextmanager
 
 import pytest
 
-from tests.builders import CHILD_STORE_ID, DECISION_ID, STORE_ID, TASK_ID
+from tests.builders import CHILD_STORE_ID, DECISION_ID, STORE_ID, TASK_ID, task_bytes
 from tests.cli_fixtures import initialized_repository
 from untaped_orchestration.__main__ import main
 from untaped_orchestration.infrastructure.filesystem import location_from_root
+from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
 from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
 
@@ -53,6 +55,49 @@ def _invoke(monkeypatch, capsys, *tokens: str) -> tuple[dict[str, object], str]:
     assert raised.value.code == 0
     captured = capsys.readouterr()
     return json.loads(captured.out), captured.err
+
+
+def test_cli_list_is_header_bounded_and_show_reads_body_inside_lock(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    root = initialized_repository(tmp_path)
+    task = root / "tasks" / f"{TASK_ID}-bounded.md"
+    task.parent.mkdir()
+    task.write_bytes(task_bytes().replace(b"Opaque Markdown body.", b"x" * 500_000))
+    active = False
+    original_acquire = FileLockManager.acquire
+    original_read = FilesystemStoreRepository.read_item_body
+
+    @contextmanager
+    def tracked_acquire(self, locations, *, timeout):
+        nonlocal active
+        with original_acquire(self, locations, timeout=timeout):
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    def guarded_read(self, location, relative_path):
+        assert active, "body read escaped federation lock lease"
+        return original_read(self, location, relative_path)
+
+    monkeypatch.setattr(FileLockManager, "acquire", tracked_acquire)
+    monkeypatch.setattr(FilesystemStoreRepository, "read_item_body", guarded_read)
+
+    listed, _ = _invoke(monkeypatch, capsys, "list", "--store", str(root), "--format", "json")
+    assert listed["data"][0]["id"] == TASK_ID
+    shown, _ = _invoke(
+        monkeypatch,
+        capsys,
+        "show",
+        TASK_ID,
+        "--store",
+        str(root),
+        "--format",
+        "json",
+    )
+    assert shown["data"]["body"].endswith("x" * 100 + "\n")
 
 
 def test_real_store_read_mutation_and_maintenance_families(tmp_path, monkeypatch, capsys) -> None:

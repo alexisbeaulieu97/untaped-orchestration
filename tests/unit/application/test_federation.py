@@ -158,8 +158,70 @@ def test_local_load_locks_and_rereads_only_the_selected_store_with_default_timeo
     assert result.completeness.complete
     assert result.stores == (selected,)
     assert reader.discovers == [root]
-    assert reader.loads == [(root, False), (root, False)]
+    assert reader.loads == [(root, True), (root, False)]
     assert locks.calls == [((selected.location,), 10.0)]
+
+
+def test_run_exposes_file_reader_only_inside_the_ordered_lock_lease() -> None:
+    root = Path("/work/root")
+    selected = _snapshot(root, STORE_ID)
+    reader = ScriptedReader((selected,))
+    active = False
+
+    class LeaseLocks:
+        @contextmanager
+        def acquire(self, locations, *, timeout):
+            nonlocal active
+            del locations, timeout
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    def action(lease):
+        assert active
+        assert lease.reader is reader
+        return lease.snapshot
+
+    result = FederationService(reader, LeaseLocks()).run(
+        selected.location,
+        local=True,
+        action=action,
+    )
+
+    assert result.selected.location == selected.location
+    assert reader.loads == [(root, True), (root, True)]
+    assert not active
+
+
+def test_timeout_and_changed_anchor_never_expose_a_file_reader() -> None:
+    root = Path("/work/root")
+    selected = _snapshot(root, STORE_ID)
+    timeout_reader = ScriptedReader((selected,))
+    timeout = FederationService(
+        timeout_reader,
+        RecordingLocks(timeout_location=selected.location),
+    ).run(
+        selected.location,
+        local=True,
+        action=lambda lease: lease,
+    )
+    assert timeout.reader is None
+    assert not timeout.snapshot.completeness.complete
+
+    changed_reader = ScriptedReader((selected,))
+
+    def change_anchor() -> None:
+        changed_reader.set_snapshot(replace(selected, registry_revision=_revision("c")))
+
+    changed = FederationService(changed_reader, RecordingLocks(on_enter=change_anchor)).run(
+        selected.location,
+        local=True,
+        action=lambda lease: lease,
+    )
+    assert changed.reader is None
+    assert not changed.snapshot.completeness.complete
 
 
 def test_recursive_resolution_uses_explicit_depth_first_and_global_lock_order() -> None:

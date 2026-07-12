@@ -28,6 +28,7 @@ from untaped_orchestration.domain.curation import (
     StoreCurationContext,
     curation_queue,
 )
+from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.ids import DecisionId, TaskId
 from untaped_orchestration.domain.models import ActiveTask, Decision, Revision
 from untaped_orchestration.domain.time import CalendarDate, UtcTimestamp
@@ -37,6 +38,14 @@ from untaped_orchestration.domain.time import CalendarDate, UtcTimestamp
 class CurateNextRequest:
     local: bool = False
     limit: int = 50
+
+
+@dataclass(frozen=True, slots=True)
+class CurationPage:
+    entries: tuple[CurationEntry, ...]
+    complete: bool
+    truncated: bool
+    diagnostics: tuple[Diagnostic, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +76,7 @@ class CurationService:
         self._clock = clock
         self._scope = scope
 
-    def next(self, request: CurateNextRequest) -> tuple[CurationEntry, ...]:
+    def next(self, request: CurateNextRequest) -> CurationPage:
         if not 1 <= request.limit <= 200:
             raise ValueError("limit must be in range 1..200")
         snapshot = (self._scope.selected_local if request.local else self._scope.recursive).load()
@@ -88,11 +97,17 @@ class CurationService:
                 StoreCurationContext(store.store.id, store.store.timezone, store.store.curation)
             )
         graph = _graph_state(scoped)
-        return curation_queue(
+        queue = curation_queue(
             graph,
             now=UtcTimestamp.from_datetime(self._clock.now()),
             contexts=tuple(contexts),
-        )[: request.limit]
+        )
+        return CurationPage(
+            queue[: request.limit],
+            scoped.completeness.complete,
+            len(queue) > request.limit,
+            diagnostics,
+        )
 
     def acknowledge(
         self, request: AcknowledgeRequest, *, require_task: bool = False

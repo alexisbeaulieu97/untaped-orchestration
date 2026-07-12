@@ -5,13 +5,23 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from tests.builders import CHILD_STORE_ID, STORE_ID, TASK_ID, task_bytes, write_store
+from tests.builders import (
+    CHILD_STORE_ID,
+    DECISION_ID,
+    STORE_ID,
+    TASK_ID,
+    decision_bytes,
+    task_bytes,
+    write_store,
+)
 from untaped_orchestration.application.federation import FederationService
 from untaped_orchestration.application.maintenance import (
     RecursiveCheckRequest,
     RecursiveFormatRequest,
     RecursiveMaintenanceService,
 )
+from untaped_orchestration.application.scaffold import AGENTS_BYTES
+from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -93,6 +103,8 @@ def test_recursive_check_reports_all_invalid_children_but_missing_is_warning_by_
 ) -> None:
     parent = write_store(tmp_path / "parent", store_id=STORE_ID)
     child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    parent.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
+    child.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
     _registry(parent, child)
     _render_local(parent)
     bad = child / "tasks" / f"{TASK_ID}-bad.md"
@@ -159,6 +171,63 @@ def test_recursive_fmt_check_is_read_only_and_fmt_write_requires_local(tmp_path:
         service.fmt_write(
             RecursiveFormatRequest(location, local=False), expected_store_revision=None
         )
+
+
+@pytest.mark.integration
+def test_local_fmt_and_render_validate_resolved_cross_store_navigation(tmp_path: Path) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    parent.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
+    child.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
+    _registry(parent, child)
+    decision = child / "decisions" / f"{DECISION_ID}-ruling.md"
+    decision.parent.mkdir()
+    decision.write_bytes(decision_bytes())
+    task = parent / "tasks" / f"{TASK_ID}-task.md"
+    task.parent.mkdir()
+    linked = task_bytes().replace(
+        b"waiting_on = []\n+++",
+        (
+            "waiting_on = []\n\n"
+            "[[links]]\n"
+            'relation = "governed-by"\n'
+            f'target_store_id = "{CHILD_STORE_ID}"\n'
+            f'target = "{DECISION_ID}"\n'
+            "+++"
+        ).encode(),
+    )
+    task.write_bytes(linked.replace(b"+++\n", b"+++\n# hand edit\n", 1))
+    location = location_from_root(parent)
+    context = CliContext.resolve(str(parent))
+
+    checked = context.maintenance().fmt_check(RecursiveFormatRequest(location, local=True))
+    assert not any(value.code == "ORC004" for value in checked.diagnostics)
+    revision = context.repository.load_local(location, headers_only=True).store_revision
+    written = context.maintenance().fmt_write(
+        RecursiveFormatRequest(location, local=True),
+        expected_store_revision=revision,
+    )
+    assert written.matches
+
+    rendered = context.maintenance().render_write(location)
+    assert rendered.views_current
+    assert context.maintenance().render_check(location).matches
+
+    child.rename(tmp_path / "missing-child")
+    task.write_bytes(task.read_bytes().replace(b"+++\n", b"+++\n# second hand edit\n", 1))
+    missing_context = CliContext.resolve(str(parent))
+    unresolved = missing_context.maintenance().fmt_check(
+        RecursiveFormatRequest(location, local=True)
+    )
+    assert not any(value.code == "ORC004" for value in unresolved.diagnostics)
+    assert any(value.code == "ORC005" for value in unresolved.diagnostics)
+    revision = missing_context.repository.load_local(location, headers_only=True).store_revision
+    repaired = missing_context.maintenance().fmt_write(
+        RecursiveFormatRequest(location, local=True),
+        expected_store_revision=revision,
+    )
+    assert repaired.matches
+    assert missing_context.maintenance().render_write(location).views_current
 
 
 @pytest.mark.integration

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 from untaped_orchestration.application.ports import Clock, StoreReader
 from untaped_orchestration.application.query_brief import assemble_brief
 from untaped_orchestration.application.query_models import (
@@ -67,6 +70,23 @@ class QueryIncompleteError(ValueError):
         super().__init__("query requires a complete federation; retry locally or restore children")
 
 
+class RawAmbiguityError(ValueError):
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        self.paths = paths
+        self.diagnostics = tuple(
+            Diagnostic(
+                code="ORC003",
+                severity="error",
+                path=path,
+                field="path",
+                message="raw item filename prefix is ambiguous",
+                hint="Select one exact relative path with inspect --raw.",
+            )
+            for path in paths
+        )
+        super().__init__("raw item filename prefix is ambiguous")
+
+
 def _limit(value: int) -> int:
     if not 1 <= value <= MAX_LIMIT:
         raise ValueError("limit must be in range 1..200")
@@ -101,6 +121,16 @@ class QueryService:
 
     def _load(self, local: bool) -> FederatedSnapshot:
         return (self._scope.local if local else self._scope.recursive)()
+
+    def _within[T](
+        self,
+        local: bool,
+        action: Callable[[FederatedSnapshot, StoreReader | None], T],
+    ) -> T:
+        runner = self._scope.local_run if local else self._scope.recursive_run
+        if runner is None:
+            return action(self._load(local), self._reader)
+        return cast(T, runner(action))
 
     def _project(self, snapshot: FederatedSnapshot, local: bool) -> SafeProjection:
         return project_safely(
@@ -167,55 +197,84 @@ class QueryService:
         )
 
     def show(self, request: ShowRequest) -> QueryResult[ItemDetail]:
-        snapshot = self._load(request.local)
-        store, record = _find(snapshot, request.item_id, request.local)
-        assert store.store is not None
-        body = self._reader.read_item_body(store.location, record.path)
-        projection = self._project(snapshot, request.local)
-        detail = detail_for(projection, store, record, body)
-        return self._result(
-            snapshot,
-            detail,
-            local=request.local,
-            revisions=((record.metadata.id.root, record.revision),),
-            retained=1,
-        )
+        def action(
+            snapshot: FederatedSnapshot, reader: StoreReader | None
+        ) -> QueryResult[ItemDetail]:
+            if reader is None:
+                raise QueryIncompleteError(snapshot.completeness.diagnostics)
+            store, record = _find(snapshot, request.item_id, request.local)
+            assert store.store is not None
+            body = reader.read_item_body(store.location, record.path)
+            projection = self._project(snapshot, request.local)
+            detail = detail_for(projection, store, record, body)
+            return self._result(
+                snapshot,
+                detail,
+                local=request.local,
+                revisions=((record.metadata.id.root, record.revision),),
+                retained=1,
+            )
+
+        return self._within(request.local, action)
 
     def show_raw(self, request: RawShowRequest) -> QueryResult[RawRecord]:
-        snapshot = self._load(True)
-        prefix = request.item_id.root
-        matches = tuple(
-            value
-            for value in snapshot.selected.raw_index
-            if value.path.name.startswith(f"{prefix}-")
-        )
-        if len(matches) != 1:
-            raise ValueError("raw item filename prefix does not resolve uniquely in selected store")
-        raw = self._reader.read_raw(snapshot.selected.location, matches[0].path)
-        return self._result(
-            snapshot,
-            raw,
-            local=True,
-            revisions=((prefix, raw.revision),),
-            retained=1,
-        )
+        def action(
+            snapshot: FederatedSnapshot, reader: StoreReader | None
+        ) -> QueryResult[RawRecord]:
+            if reader is None:
+                raise QueryIncompleteError(snapshot.completeness.diagnostics)
+            prefix = request.item_id.root
+            matches = tuple(
+                value
+                for value in snapshot.selected.raw_index
+                if value.path.name.startswith(f"{prefix}-")
+            )
+            if len(matches) != 1:
+                if matches:
+                    raise RawAmbiguityError(
+                        tuple(sorted(value.path.as_posix() for value in matches))
+                    )
+                raise ValueError("raw item filename prefix does not resolve in selected store")
+            raw = reader.read_raw(snapshot.selected.location, matches[0].path)
+            return self._result(
+                snapshot,
+                raw,
+                local=True,
+                revisions=((prefix, raw.revision),),
+                retained=1,
+            )
+
+        return self._within(True, action)
 
     def search(self, request: SearchRequest) -> QueryResult[tuple[SearchHit, ...]]:
         limit = _limit(request.limit)
         if not request.query:
             raise ValueError("search query must be nonempty")
-        snapshot = self._load(request.local)
-        projection = self._project(snapshot, request.local)
-        hits, total = stream_search(
-            projection,
-            self._reader,
-            request.query,
-            limit=limit,
-            archived=request.history,
-        )
-        return self._result(
-            snapshot, tuple(hits), local=request.local, truncated=total > limit, retained=len(hits)
-        )
+
+        def action(
+            snapshot: FederatedSnapshot, reader: StoreReader | None
+        ) -> QueryResult[tuple[SearchHit, ...]]:
+            projection = self._project(snapshot, request.local)
+            hits, total = (
+                stream_search(
+                    projection,
+                    reader,
+                    request.query,
+                    limit=limit,
+                    archived=request.history,
+                )
+                if reader is not None
+                else ((), 0)
+            )
+            return self._result(
+                snapshot,
+                tuple(hits),
+                local=request.local,
+                truncated=total > limit,
+                retained=len(hits),
+            )
+
+        return self._within(request.local, action)
 
     def next(self, request: NextRequest) -> QueryResult[tuple[NextItem, ...]]:
         limit = _limit(request.limit)
@@ -343,46 +402,62 @@ class QueryService:
         limit = _limit(request.limit)
         if not request.query:
             raise ValueError("search query must be nonempty")
-        snapshot = self._load(request.local)
-        projection = self._project(snapshot, request.local)
-        hits, total = stream_search(
-            projection,
-            self._reader,
-            request.query,
-            limit=limit,
-            archived=True,
-        )
-        return self._result(
-            snapshot,
-            hits,
-            local=request.local,
-            truncated=total > limit,
-            revisions=tuple((hit.row.item_id.root, hit.row.revision) for hit in hits),
-            retained=len(hits),
-        )
+
+        def action(
+            snapshot: FederatedSnapshot, reader: StoreReader | None
+        ) -> QueryResult[tuple[SearchHit, ...]]:
+            projection = self._project(snapshot, request.local)
+            hits, total = (
+                stream_search(
+                    projection,
+                    reader,
+                    request.query,
+                    limit=limit,
+                    archived=True,
+                )
+                if reader is not None
+                else ((), 0)
+            )
+            return self._result(
+                snapshot,
+                hits,
+                local=request.local,
+                truncated=total > limit,
+                revisions=tuple((hit.row.item_id.root, hit.row.revision) for hit in hits),
+                retained=len(hits),
+            )
+
+        return self._within(request.local, action)
 
     def history_show(self, request: HistoryShowRequest) -> QueryResult[ItemDetail]:
-        snapshot = self._load(request.local)
-        matches = [
-            (store, record)
-            for store in selected_stores(snapshot, request.local)
-            for record in store.records
-            if isinstance(record.metadata, ArchivedTask) and record.metadata.id == request.item_id
-        ]
-        if len(matches) != 1:
-            raise ValueError("archived item does not resolve uniquely")
-        store, record = matches[0]
-        assert store.store is not None
-        body = self._reader.read_item_body(store.location, record.path)
-        projection = self._project(snapshot, request.local)
-        detail = detail_for(projection, store, record, body)
-        return self._result(
-            snapshot,
-            detail,
-            local=request.local,
-            revisions=((record.metadata.id.root, record.revision),),
-            retained=1,
-        )
+        def action(
+            snapshot: FederatedSnapshot, reader: StoreReader | None
+        ) -> QueryResult[ItemDetail]:
+            if reader is None:
+                raise QueryIncompleteError(snapshot.completeness.diagnostics)
+            matches = [
+                (store, record)
+                for store in selected_stores(snapshot, request.local)
+                for record in store.records
+                if isinstance(record.metadata, ArchivedTask)
+                and record.metadata.id == request.item_id
+            ]
+            if len(matches) != 1:
+                raise ValueError("archived item does not resolve uniquely")
+            store, record = matches[0]
+            assert store.store is not None
+            body = reader.read_item_body(store.location, record.path)
+            projection = self._project(snapshot, request.local)
+            detail = detail_for(projection, store, record, body)
+            return self._result(
+                snapshot,
+                detail,
+                local=request.local,
+                revisions=((record.metadata.id.root, record.revision),),
+                retained=1,
+            )
+
+        return self._within(request.local, action)
 
     def trace(self, request: TraceRequest) -> QueryResult[TraceData]:
         limit = _limit(request.limit)
@@ -400,14 +475,18 @@ class QueryService:
         return self._result(snapshot, data, local=request.local, truncated=truncated)
 
     def brief(self, request: BriefRequest) -> QueryResult[BriefData]:
-        snapshot = self._load(request.local)
-        projection = self._project(snapshot, request.local)
-        data, truncated, revisions, retained = assemble_brief(projection, self._reader)
-        return self._result(
-            snapshot,
-            data,
-            local=request.local,
-            truncated=truncated,
-            revisions=revisions,
-            retained=retained,
-        )
+        def action(
+            snapshot: FederatedSnapshot, reader: StoreReader | None
+        ) -> QueryResult[BriefData]:
+            projection = self._project(snapshot, request.local)
+            data, truncated, revisions, retained = assemble_brief(projection, reader)
+            return self._result(
+                snapshot,
+                data,
+                local=request.local,
+                truncated=truncated,
+                revisions=revisions,
+                retained=retained,
+            )
+
+        return self._within(request.local, action)

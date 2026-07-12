@@ -24,6 +24,7 @@ REVISION = f"sha256:{'a' * 64}"
 @dataclass(frozen=True)
 class _UniversalResult:
     data: tuple[()] = ()
+    entries: tuple[()] = ()
     complete: bool = True
     truncated: bool = False
     diagnostics: tuple[()] = ()

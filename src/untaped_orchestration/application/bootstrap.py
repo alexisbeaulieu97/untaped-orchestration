@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 import tomli_w
 
 from untaped_orchestration.application.ports import (
+    FileDeletion,
     FileReplacement,
     LockManager,
     StoreReader,
@@ -71,6 +72,16 @@ def _ignored(path: PurePosixPath) -> bool:
         or name.endswith(("~", ".swp", ".swo", ".tmp"))
         or name.startswith((".#", "#"))
     )
+
+
+def _temporary_target(
+    path: PurePosixPath, expected: dict[PurePosixPath, bytes]
+) -> PurePosixPath | None:
+    for target in expected:
+        prefix = f".{target.name}.untaped-tmp-"
+        if path.parent == target.parent and path.name.startswith(prefix):
+            return target
+    return None
 
 
 class InitializeStore:
@@ -143,6 +154,22 @@ class InitializeStore:
 
         with self._locks.acquire((location,), timeout=self._lock_timeout):
             entries = self._reader.list_entries(location)
+            anchored = any(entry.path == STORE_PATH for entry in entries)
+            temporaries = tuple(entry for entry in entries if ".untaped-tmp-" in entry.path.name)
+            for entry in temporaries:
+                target = _temporary_target(entry.path, expected)
+                if (
+                    anchored
+                    or entry.kind != "file"
+                    or target is None
+                    or self._reader.read_file(location, entry.path).content != expected[target]
+                ):
+                    raise InitConflictError(
+                        f"unrelated or divergent init temporary: {entry.path.as_posix()}"
+                    )
+                self._writer.delete(location, FileDeletion(entry.path))
+            if temporaries:
+                entries = self._reader.list_entries(location)
             unsafe = next(
                 (
                     entry

@@ -27,8 +27,6 @@ from untaped_orchestration.domain.curation import CurationEntry
 from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.models import Revision
 
-MAX_BRIEF_BYTES = 32768
-
 
 class OutputEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, serialize_by_alias=True)
@@ -321,6 +319,9 @@ def _bounded_brief(  # noqa: C901
 ) -> EncodedOutput:
     normalized = _value(result.data)
     assert isinstance(normalized, dict)
+    limit = normalized.get("max_total_bytes")
+    if not isinstance(limit, int) or not 4096 <= limit <= 32768:
+        raise ValueError("brief result has an invalid max_total_bytes")
     data = copy.deepcopy(normalized)
     diagnostics = list(result.diagnostics)
     renderer = _json_bytes if fmt == "json" else lambda value: _table_bytes(value, columns)
@@ -347,7 +348,7 @@ def _bounded_brief(  # noqa: C901
         pipe_kind=result.pipe_kind,
     )
     encoded = renderer(candidate_initial)
-    if len(encoded) <= MAX_BRIEF_BYTES:
+    if len(encoded) <= limit:
         return EncodedOutput(
             encoded,
             _diagnostic_stderr(tuple(diagnostics)),
@@ -364,7 +365,7 @@ def _bounded_brief(  # noqa: C901
             if isinstance(section, list) and section:
                 section.pop()
                 encoded = rendered()
-                if len(encoded) <= MAX_BRIEF_BYTES:
+                if len(encoded) <= limit:
                     return EncodedOutput(encoded, _diagnostic_stderr(tuple(diagnostics)), True)
         if diagnostics:
             diagnostics.pop()
@@ -372,13 +373,13 @@ def _bounded_brief(  # noqa: C901
             if isinstance(embedded, list) and embedded:
                 embedded.pop()
             encoded = rendered()
-            if len(encoded) <= MAX_BRIEF_BYTES:
+            if len(encoded) <= limit:
                 return EncodedOutput(encoded, _diagnostic_stderr(tuple(diagnostics)), True)
         missing = data.get("missing_store_ids")
         if isinstance(missing, list) and missing:
             missing.pop()
             encoded = rendered()
-            if len(encoded) <= MAX_BRIEF_BYTES:
+            if len(encoded) <= limit:
                 return EncodedOutput(encoded, _diagnostic_stderr(tuple(diagnostics)), True)
 
     pinned = data.get("pinned_decisions")
@@ -391,7 +392,7 @@ def _bounded_brief(  # noqa: C901
                 body = body[: len(body) // 2]
                 decision["body"] = body
                 encoded = rendered()
-                if len(encoded) <= MAX_BRIEF_BYTES:
+                if len(encoded) <= limit:
                     return EncodedOutput(encoded, _diagnostic_stderr(tuple(diagnostics)), True)
 
     human_fields: list[tuple[dict[str, object], str]] = []
@@ -422,7 +423,7 @@ def _bounded_brief(  # noqa: C901
             text = text[: len(text) // 2]
             owner[key] = text
             encoded = rendered()
-            if len(encoded) <= MAX_BRIEF_BYTES:
+            if len(encoded) <= limit:
                 return EncodedOutput(encoded, _diagnostic_stderr(tuple(diagnostics)), True)
 
     for name in ("in_progress", "ready", "blockers", "due"):
@@ -436,12 +437,12 @@ def _bounded_brief(  # noqa: C901
                 else:
                     data[name] = summary
         encoded = rendered()
-        if len(encoded) <= MAX_BRIEF_BYTES:
+        if len(encoded) <= limit:
             return EncodedOutput(encoded, _diagnostic_stderr(tuple(diagnostics)), True)
 
     minimal = _minimal_brief(candidate())
     encoded = renderer(minimal)
-    if len(encoded) > MAX_BRIEF_BYTES:
+    if len(encoded) > limit:
         raise ValueError("minimal brief exceeds output byte ceiling")
     return EncodedOutput(encoded, b"", True)
 

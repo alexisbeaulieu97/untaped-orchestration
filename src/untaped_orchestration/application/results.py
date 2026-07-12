@@ -110,10 +110,18 @@ class Completeness:
 
 
 @dataclass(frozen=True, slots=True)
+class FederationAnchor:
+    location: StoreLocation
+    store_config_revision: Revision
+    registry_revision: Revision | None
+
+
+@dataclass(frozen=True, slots=True)
 class FederatedSnapshot:
     selected: StoreSnapshot
     stores: tuple[StoreSnapshot, ...]
     completeness: Completeness
+    participants: tuple[FederationAnchor, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

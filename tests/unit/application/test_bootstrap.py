@@ -267,6 +267,39 @@ def test_pre_anchor_failure_removes_only_its_validated_temporary(
     assert tuple(path for path in root.rglob("*") if path.is_file() and path.name != ".lock") == ()
 
 
+def test_init_recovers_only_matching_pre_anchor_temporary(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    _service().execute(_request(reference))
+    expected = _files(reference)[PurePosixPath("store.toml")]
+
+    target = tmp_path / "target"
+    root = target / ".untaped" / "orchestration"
+    root.mkdir(parents=True)
+    temporary = root / ".store.toml.untaped-tmp-crash"
+    temporary.write_bytes(expected)
+
+    result = _service().execute(_request(target))
+
+    assert result.applied
+    assert not temporary.exists()
+    assert len(_files(target)) == 8
+
+
+def test_init_refuses_unrelated_pre_anchor_temporary(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    root = target / ".untaped" / "orchestration"
+    root.mkdir(parents=True)
+    temporary = root / ".store.toml.untaped-tmp-unrelated"
+    temporary.write_bytes(b"unrelated")
+
+    with pytest.raises(InitConflictError, match="unrelated or divergent"):
+        _service().execute(_request(target))
+
+    assert temporary.read_bytes() == b"unrelated"
+    assert not root.joinpath("store.toml").exists()
+
+
 class _AcknowledgementLost(RuntimeError):
     pass
 

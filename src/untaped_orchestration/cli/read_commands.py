@@ -5,7 +5,7 @@ from typing import Literal
 
 from cyclopts import App
 
-from untaped_orchestration.application.curation import CurateNextRequest
+from untaped_orchestration.application.curation import CurateNextRequest, CurationPage
 from untaped_orchestration.application.query_models import (
     BriefRequest,
     HistoryListRequest,
@@ -55,6 +55,16 @@ def _result[T](
         truncated=value.truncated,
         diagnostics=value.diagnostics,
         pipe_kind=kind,
+    )
+
+
+def _curation_result(value: CurationPage) -> CommandResult:
+    return CommandResult(
+        "curate next",
+        value.entries,
+        complete=value.complete,
+        truncated=value.truncated,
+        diagnostics=value.diagnostics,
     )
 
 
@@ -289,9 +299,8 @@ def register(app: App) -> None:  # noqa: C901
         del debug
         run_command(
             "curate next",
-            lambda: CommandResult(
-                "curate next",
-                CliContext.resolve(store).curation().next(CurateNextRequest(local, _limit(limit))),
+            lambda: _curation_result(
+                CliContext.resolve(store).curation().next(CurateNextRequest(local, _limit(limit)))
             ),
             fmt=format,
             allowed=("table", "json", "pipe", "raw"),
