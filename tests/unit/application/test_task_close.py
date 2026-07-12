@@ -43,6 +43,7 @@ def test_close_and_repair_requests_are_typed_and_do_not_own_unrelated_fields() -
         "expected_store_revision",
         "successor_id",
         "expected_successor_revision",
+        "force_current",
     ]
     assert [field.name for field in fields(RepairDuplicateRequest)] == [
         "item_id",

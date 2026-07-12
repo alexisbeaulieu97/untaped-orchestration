@@ -1,0 +1,1 @@
+{"schema":"untaped.orchestration.output/v1","command":"id new","complete":true,"truncated":false,"data":{"kind":"decision","id":"dec_<uuidv7>"},"diagnostics":[]}

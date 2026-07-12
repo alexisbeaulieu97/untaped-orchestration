@@ -36,6 +36,7 @@ def test_move_request_has_explicit_current_and_target_parent_plus_guards() -> No
         "expected_store_revision",
         "placement",
         "expected_anchor_revision",
+        "force_current",
     ]
 
 

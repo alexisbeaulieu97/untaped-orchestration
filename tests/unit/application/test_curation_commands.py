@@ -36,13 +36,18 @@ from untaped_orchestration.domain.time import CalendarDate
 
 
 def test_curation_requests_are_kind_agnostic_and_frozen() -> None:
-    assert [field.name for field in fields(AcknowledgeRequest)] == ["item_id", "expected_revision"]
+    assert [field.name for field in fields(AcknowledgeRequest)] == [
+        "item_id",
+        "expected_revision",
+        "force_current",
+    ]
     assert [field.name for field in fields(SnoozeRequest)] == [
         "item_id",
         "until",
         "expected_revision",
+        "force_current",
     ]
-    assert [field.name for field in fields(CurateNextRequest)] == ["local"]
+    assert [field.name for field in fields(CurateNextRequest)] == ["local", "limit"]
 
 
 def test_generic_acknowledge_and_snooze_route_tasks_and_decisions_without_caller_kind(

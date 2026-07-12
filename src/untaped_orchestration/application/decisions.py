@@ -19,9 +19,11 @@ from untaped_orchestration.application.item_support import (
     PlannedRecord,
     RevisionConflict,
     execute_mutation,
+    guard_revision,
     record_result,
     selected_record,
     selected_store_id,
+    validate_force_current,
     validated_copy,
 )
 from untaped_orchestration.application.mutations import IntendedMutation, MutationExecutor
@@ -46,7 +48,7 @@ class DecisionLifecycleConflict(ItemStateConflict):
 @dataclass(frozen=True, slots=True)
 class DecisionGuard:
     item_id: DecisionId
-    expected_revision: Revision
+    expected_revision: Revision | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,15 +58,17 @@ class SupersedeDecisionRequest:
     body: bytes
     tags: tuple[Slug, ...]
     predecessors: tuple[DecisionGuard, ...]
-    expected_store_revision: Revision
+    expected_store_revision: Revision | None
+    force_current: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class RetireDecisionRequest:
     item_id: DecisionId
     note: str
-    expected_revision: Revision
-    expected_store_revision: Revision
+    expected_revision: Revision | None
+    expected_store_revision: Revision | None
+    force_current: bool = False
 
 
 def _decision(snapshot: FederatedSnapshot, item_id: DecisionId) -> LoadedRecord | None:
@@ -129,6 +133,13 @@ def _validate_supersede_request(request: SupersedeDecisionRequest) -> tuple[Deci
         raise DecisionLifecycleConflict("decision supersede predecessors must be distinct")
     if request.successor_id in predecessor_ids:
         raise DecisionLifecycleConflict("successor must be distinct from every predecessor")
+    validate_force_current(
+        request.force_current,
+        (
+            request.expected_store_revision,
+            *(value.expected_revision for value in request.predecessors),
+        ),
+    )
     return predecessor_ids
 
 
@@ -169,16 +180,24 @@ class _SupersedeOperation:
                 raise DecisionLifecycleConflict("predecessor must be a local decision")
             metadata = record.metadata
             assert isinstance(metadata, Decision)
-            if record.revision != guarded.expected_revision:
-                raise RevisionConflict("decision predecessor revision is stale")
+            guard_revision(
+                record.revision,
+                guarded.expected_revision,
+                force_current=self.request.force_current,
+                message="decision predecessor revision is stale",
+            )
             if metadata.retired_at is not None:
                 raise DecisionLifecycleConflict("decision supersede requires active predecessors")
 
     def _guard_initial(self, snapshot: FederatedSnapshot) -> None:
         if any(_incoming(snapshot, item_id) for item_id in self.predecessor_ids):
             raise DecisionLifecycleConflict("decision supersede requires active predecessors")
-        if snapshot.selected.store_revision != self.request.expected_store_revision:
-            raise RevisionConflict("decision supersede store revision is stale")
+        guard_revision(
+            snapshot.selected.store_revision,
+            self.request.expected_store_revision,
+            force_current=self.request.force_current,
+            message="decision supersede store revision is stale",
+        )
 
     def _reverse_successor_revision(
         self, snapshot: FederatedSnapshot, successor: LoadedRecord
@@ -207,6 +226,18 @@ class _SupersedeOperation:
             raise DecisionLifecycleConflict("predecessor has a divergent incoming successor")
         config = snapshot.selected.store
         assert config is not None
+        if self.request.force_current:
+            return (
+                SupersedePhase.FRESH_FINAL
+                if pins_after_supersede(
+                    config.brief.pinned_decisions,
+                    self.predecessor_set,
+                    self.request.successor_id,
+                )
+                == config.brief.pinned_decisions
+                else SupersedePhase.SUCCESSOR_ONLY
+            )
+        assert self.request.expected_store_revision is not None
         phase = recognize_supersede_phase(
             current_revision=snapshot.selected.store_revision,
             expected_revision=self.request.expected_store_revision,
@@ -310,6 +341,7 @@ class _RetireOperation:
         return FileReplacement(record.path, self.formatter.item_bytes(active, record.body))
 
     def _reverse_matches(self, snapshot: FederatedSnapshot, record: LoadedRecord) -> bool:
+        assert self.request.expected_store_revision is not None
         item = self._reverse_item(record)
         if (
             _projected_revision(self.executor, snapshot, (item,))
@@ -335,10 +367,18 @@ class _RetireOperation:
     def _guard_active(self, snapshot: FederatedSnapshot, record: LoadedRecord) -> None:
         if _incoming(snapshot, self.request.item_id):
             raise DecisionLifecycleConflict("superseded decisions cannot be retired")
-        if record.revision != self.request.expected_revision:
-            raise RevisionConflict("decision revision is stale")
-        if snapshot.selected.store_revision != self.request.expected_store_revision:
-            raise RevisionConflict("decision retirement store revision is stale")
+        guard_revision(
+            record.revision,
+            self.request.expected_revision,
+            force_current=self.request.force_current,
+            message="decision revision is stale",
+        )
+        guard_revision(
+            snapshot.selected.store_revision,
+            self.request.expected_store_revision,
+            force_current=self.request.force_current,
+            message="decision retirement store revision is stale",
+        )
         self.phase = "initial"
 
     def _guard_retired(self, snapshot: FederatedSnapshot, record: LoadedRecord) -> None:
@@ -346,7 +386,7 @@ class _RetireOperation:
         assert isinstance(metadata, Decision)
         if metadata.retire_note != self.request.note:
             raise DecisionLifecycleConflict("retirement note diverges from durable phase")
-        if not self._reverse_matches(snapshot, record):
+        if not self.request.force_current and not self._reverse_matches(snapshot, record):
             raise RevisionConflict("decision retirement phase cannot reconstruct guarded base")
         config = snapshot.selected.store
         assert config is not None
@@ -423,6 +463,10 @@ class DecisionService:
         ).execute()
 
     def retire(self, request: RetireDecisionRequest) -> ItemMutationResult:
+        validate_force_current(
+            request.force_current,
+            (request.expected_revision, request.expected_store_revision),
+        )
         if not request.note.strip():
             raise DecisionLifecycleConflict("retirement note must be nonempty")
         return _RetireOperation(

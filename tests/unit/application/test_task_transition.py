@@ -104,6 +104,7 @@ def test_transition_request_is_frozen_and_owns_only_lifecycle_and_placement_guar
         "placement",
         "revisit_when",
         "expected_anchor_revision",
+        "force_current",
     ]
     request = TransitionTaskRequest(
         TaskId("tsk_019f0000000070008000000000000001"),

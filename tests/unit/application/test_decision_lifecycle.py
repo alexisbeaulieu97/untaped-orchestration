@@ -82,12 +82,14 @@ def test_requests_are_narrow_frozen_lifecycle_contracts() -> None:
         "tags",
         "predecessors",
         "expected_store_revision",
+        "force_current",
     ]
     assert [value.name for value in fields(RetireDecisionRequest)] == [
         "item_id",
         "note",
         "expected_revision",
         "expected_store_revision",
+        "force_current",
     ]
 
 

@@ -19,6 +19,7 @@ from untaped_orchestration.application.item_support import (
     UpdateTaskRequest,
     decision_inactive,
     execute_mutation,
+    guard_revision,
     record_result,
     replacement,
     selected_record,
@@ -253,8 +254,12 @@ class UpdateTask:
                 raise ItemStateConflict("task does not exist in the selected store")
             if not isinstance(record.metadata, ActiveTask) or record.body is None:
                 raise ItemStateConflict("task update requires an active task")
-            if record.revision != request.expected_revision:
-                raise RevisionConflict("task revision is stale")
+            guard_revision(
+                record.revision,
+                request.expected_revision,
+                force_current=request.force_current,
+                message="task revision is stale",
+            )
 
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
             record = selected_record(snapshot, request.item_id)
@@ -290,8 +295,12 @@ class UpdateDecision:
             record = selected_record(snapshot, request.item_id)
             if record is None or not isinstance(record.metadata, Decision) or record.body is None:
                 raise ItemStateConflict("decision update requires a decision")
-            if record.revision != request.expected_revision:
-                raise RevisionConflict("decision revision is stale")
+            guard_revision(
+                record.revision,
+                request.expected_revision,
+                force_current=request.force_current,
+                message="decision revision is stale",
+            )
 
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
             record = selected_record(snapshot, request.item_id)

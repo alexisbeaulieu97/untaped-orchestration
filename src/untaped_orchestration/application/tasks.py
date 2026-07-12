@@ -12,8 +12,10 @@ from untaped_orchestration.application.item_support import (
     PlannedRecord,
     RevisionConflict,
     execute_mutation,
+    guard_revision,
     record_result,
     selected_store_id,
+    validate_force_current,
     validated_copy,
 )
 from untaped_orchestration.application.mutations import (
@@ -67,11 +69,12 @@ class TransitionTaskRequest:
     item_id: TaskId
     to_stage: TaskStage
     expected_parent: TaskId | None
-    expected_revision: Revision
-    expected_store_revision: Revision
+    expected_revision: Revision | None
+    expected_store_revision: Revision | None
     placement: PlacementAnchor
     revisit_when: str | None = None
     expected_anchor_revision: Revision | None = None
+    force_current: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,10 +82,11 @@ class MoveTaskRequest:
     item_id: TaskId
     parent: TaskId | None
     expected_parent: TaskId | None
-    expected_revision: Revision
-    expected_store_revision: Revision
+    expected_revision: Revision | None
+    expected_store_revision: Revision | None
     placement: PlacementAnchor
     expected_anchor_revision: Revision | None = None
+    force_current: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,10 +94,11 @@ class CloseTaskRequest:
     item_id: TaskId
     outcome: TaskOutcome
     note: str
-    expected_revision: Revision
-    expected_store_revision: Revision
+    expected_revision: Revision | None
+    expected_store_revision: Revision | None
     successor_id: TaskId | None = None
     expected_successor_revision: Revision | None = None
+    force_current: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,19 +188,22 @@ def _guard_anchor(
     placement: PlacementAnchor,
     expected_revision: Revision | None,
     scope: RankScope,
+    *,
+    force_current: bool,
 ) -> None:
     relative = placement.kind in {PlacementAnchorKind.BEFORE, PlacementAnchorKind.AFTER}
     if not relative:
         if expected_revision is not None:
             raise TaskLifecycleConflict("first/last placement rejects an anchor revision")
         return
-    if expected_revision is None or placement.task_id is None:
-        raise TaskLifecycleConflict("relative placement requires an anchor revision")
+    if placement.task_id is None or (expected_revision is None and not force_current):
+        raise TaskLifecycleConflict("relative placement requires an anchor identity and revision")
+    validate_force_current(force_current, (expected_revision,))
     anchor = _active(snapshot, placement.task_id)
     anchor_metadata = anchor.metadata if anchor is not None else None
     if (
         anchor is None
-        or anchor.revision != expected_revision
+        or (not force_current and anchor.revision != expected_revision)
         or not isinstance(anchor_metadata, ActiveTask)
         or anchor_metadata.parent != scope.parent
         or anchor_metadata.stage is not scope.stage
@@ -298,10 +306,18 @@ def _guard_transition(
     record = _active(snapshot, request.item_id)
     if record is None or not isinstance(record.metadata, ActiveTask) or record.body is None:
         raise TaskLifecycleConflict("transition requires an active task")
-    if record.revision != request.expected_revision:
-        raise RevisionConflict("task transition revision is stale")
-    if snapshot.selected.store_revision != request.expected_store_revision:
-        raise RevisionConflict("task transition store revision is stale")
+    guard_revision(
+        record.revision,
+        request.expected_revision,
+        force_current=request.force_current,
+        message="task transition revision is stale",
+    )
+    guard_revision(
+        snapshot.selected.store_revision,
+        request.expected_store_revision,
+        force_current=request.force_current,
+        message="task transition store revision is stale",
+    )
     if record.metadata.parent != request.expected_parent:
         raise TaskLifecycleConflict("current parent assertion failed")
     target = RankScope(request.expected_parent, request.to_stage)
@@ -314,7 +330,13 @@ def _guard_transition(
         if request.expected_anchor_revision is not None:
             raise TaskLifecycleConflict("same-stage backlog transition is trigger-only")
     else:
-        _guard_anchor(snapshot, request.placement, request.expected_anchor_revision, target)
+        _guard_anchor(
+            snapshot,
+            request.placement,
+            request.expected_anchor_revision,
+            target,
+            force_current=request.force_current,
+        )
     if request.to_stage is not TaskStage.INBOX and _transition_target_matches(
         snapshot, record.metadata, request
     ):
@@ -336,10 +358,18 @@ def _guard_move(
     record = _active(snapshot, request.item_id)
     if record is None or not isinstance(record.metadata, ActiveTask) or record.body is None:
         raise TaskLifecycleConflict("move requires an active task")
-    if record.revision != request.expected_revision:
-        raise RevisionConflict("task move revision is stale")
-    if snapshot.selected.store_revision != request.expected_store_revision:
-        raise RevisionConflict("task move store revision is stale")
+    guard_revision(
+        record.revision,
+        request.expected_revision,
+        force_current=request.force_current,
+        message="task move revision is stale",
+    )
+    guard_revision(
+        snapshot.selected.store_revision,
+        request.expected_store_revision,
+        force_current=request.force_current,
+        message="task move store revision is stale",
+    )
     if record.metadata.parent != request.expected_parent:
         raise TaskLifecycleConflict("current parent assertion failed")
     if request.parent == request.item_id:
@@ -359,7 +389,13 @@ def _guard_move(
             else None
         )
     target = RankScope(request.parent, record.metadata.stage)
-    _guard_anchor(snapshot, request.placement, request.expected_anchor_revision, target)
+    _guard_anchor(
+        snapshot,
+        request.placement,
+        request.expected_anchor_revision,
+        target,
+        force_current=request.force_current,
+    )
     if not _placement_matches(snapshot, record.metadata, target, request.placement):
         return False
     planned.path, planned.metadata, planned.body = record.path, record.metadata, record.body
@@ -389,7 +425,7 @@ def _validate_close_preconditions(
         raise TaskLifecycleConflict("cancelled close requires a previously started task")
 
 
-def _guard_close(
+def _guard_close(  # noqa: C901
     snapshot: FederatedSnapshot,
     request: CloseTaskRequest,
     planned: PlannedRecord,
@@ -401,6 +437,9 @@ def _guard_close(
     active = _active(snapshot, request.item_id)
     archive = _archive(snapshot, request.item_id)
     if active is None:
+        if request.force_current:
+            raise RevisionConflict("--force-current cannot recover a close with no active source")
+        assert request.expected_revision is not None
         if not (
             archive is not None
             and isinstance(archive.metadata, ArchivedTask)
@@ -420,9 +459,20 @@ def _guard_close(
         raise TaskLifecycleConflict("close requires an active task")
     if archive is not None and not semantic_source_matches(active, archive):
         raise TaskLifecycleConflict("active/archive duplicate is divergent")
-    if active.revision != request.expected_revision:
-        raise RevisionConflict("task close revision is stale")
-    if (
+    guard_revision(
+        active.revision,
+        request.expected_revision,
+        force_current=request.force_current,
+        message="task close revision is stale",
+    )
+    if request.force_current:
+        guard_revision(
+            snapshot.selected.store_revision,
+            request.expected_store_revision,
+            force_current=True,
+            message="task close store revision is stale",
+        )
+    elif (
         snapshot.selected.store_revision != request.expected_store_revision
         and not accepted_base_matches(snapshot)
     ):
@@ -431,7 +481,14 @@ def _guard_close(
         successor = _active(snapshot, request.successor_id)
         if successor is None or successor.metadata.id == request.item_id:
             raise TaskLifecycleConflict("successor must be a distinct active same-store task")
-        if successor.revision != request.expected_successor_revision and not successor_matches(
+        if request.force_current:
+            guard_revision(
+                successor.revision,
+                request.expected_successor_revision,
+                force_current=True,
+                message="successor revision is stale",
+            )
+        elif successor.revision != request.expected_successor_revision and not successor_matches(
             snapshot
         ):
             raise RevisionConflict("successor revision is stale")
@@ -554,6 +611,18 @@ class TaskService:
         self._scope = scope
 
     def transition(self, request: TransitionTaskRequest) -> ItemMutationResult:
+        validate_force_current(
+            request.force_current,
+            (request.expected_revision, request.expected_store_revision),
+        )
+        relative = request.placement.kind in {
+            PlacementAnchorKind.BEFORE,
+            PlacementAnchorKind.AFTER,
+        }
+        if relative:
+            validate_force_current(request.force_current, (request.expected_anchor_revision,))
+        elif request.expected_anchor_revision is not None:
+            raise TaskLifecycleConflict("first/last placement rejects an anchor revision")
         planned = PlannedRecord()
         idempotent = False
 
@@ -604,6 +673,18 @@ class TaskService:
         return record_result(planned, receipt)
 
     def move(self, request: MoveTaskRequest) -> ItemMutationResult:
+        validate_force_current(
+            request.force_current,
+            (request.expected_revision, request.expected_store_revision),
+        )
+        relative = request.placement.kind in {
+            PlacementAnchorKind.BEFORE,
+            PlacementAnchorKind.AFTER,
+        }
+        if relative:
+            validate_force_current(request.force_current, (request.expected_anchor_revision,))
+        elif request.expected_anchor_revision is not None:
+            raise TaskLifecycleConflict("first/last placement rejects an anchor revision")
         planned = PlannedRecord()
         idempotent = False
 
@@ -644,15 +725,24 @@ class TaskService:
             self._executor, self._formatter, self._clock, self._scope
         ).acknowledge(request, require_task=True)
 
-    def close(self, request: CloseTaskRequest) -> ItemMutationResult:
+    def close(self, request: CloseTaskRequest) -> ItemMutationResult:  # noqa: C901
         if not request.note.strip():
             raise TaskLifecycleConflict("close note must be nonempty")
         superseded = request.outcome is TaskOutcome.SUPERSEDED
         has_successor = request.successor_id is not None
         has_successor_guard = request.expected_successor_revision is not None
-        if (superseded and not (has_successor and has_successor_guard)) or (
-            not superseded and (has_successor or has_successor_guard)
-        ):
+        validate_force_current(
+            request.force_current,
+            (request.expected_revision, request.expected_store_revision),
+        )
+        if superseded:
+            if not has_successor:
+                raise TaskLifecycleConflict("superseded close requires a successor")
+            validate_force_current(
+                request.force_current,
+                (request.expected_successor_revision,),
+            )
+        elif has_successor or has_successor_guard:
             raise TaskLifecycleConflict("superseded close alone requires successor and revision")
         planned = PlannedRecord()
         replay = False
@@ -666,6 +756,13 @@ class TaskService:
             if not superseded:
                 return True
             assert request.successor_id is not None
+            if request.force_current:
+                successor = _active(snapshot, request.successor_id)
+                return (
+                    successor is not None
+                    and supersedes_link(selected_store_id(snapshot), request.item_id)
+                    in successor.metadata.links
+                )
             return (
                 successor_source(
                     self._formatter,
@@ -677,6 +774,9 @@ class TaskService:
             )
 
         def accepted_phase_base_matches(snapshot: FederatedSnapshot) -> bool:
+            if request.force_current:
+                return False
+            assert request.expected_store_revision is not None
             active = _active(snapshot, request.item_id)
             archive = _archive(snapshot, request.item_id)
             successor = (

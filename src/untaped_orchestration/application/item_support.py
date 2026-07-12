@@ -50,6 +50,28 @@ class RelationConflict(ItemMutationConflict):
     pass
 
 
+def validate_force_current(
+    force_current: bool,
+    revisions: tuple[Revision | None, ...],
+) -> None:
+    if force_current and any(value is not None for value in revisions):
+        raise RevisionConflict("--force-current is mutually exclusive with revision guards")
+    if not force_current and any(value is None for value in revisions):
+        raise RevisionConflict("revision guards are required without --force-current")
+
+
+def guard_revision(
+    current: Revision,
+    expected: Revision | None,
+    *,
+    force_current: bool,
+    message: str,
+) -> None:
+    validate_force_current(force_current, (expected,))
+    if not force_current and current != expected:
+        raise RevisionConflict(message)
+
+
 @dataclass(frozen=True, slots=True)
 class MutationExecutionScope:
     locations: tuple[StoreLocation, ...]
@@ -86,7 +108,8 @@ class CreateDecisionRequest:
 @dataclass(frozen=True, slots=True)
 class UpdateTaskRequest:
     item_id: TaskId
-    expected_revision: Revision
+    expected_revision: Revision | None
+    force_current: bool = False
     title: str | None = None
     body: bytes | None = None
     priority: TaskPriority | None = None
@@ -97,7 +120,8 @@ class UpdateTaskRequest:
 @dataclass(frozen=True, slots=True)
 class UpdateDecisionRequest:
     item_id: DecisionId
-    expected_revision: Revision
+    expected_revision: Revision | None
+    force_current: bool = False
     title: str | None = None
     body: bytes | None = None
     tags: tuple[Slug, ...] | None = None
@@ -109,7 +133,8 @@ class LinkRequest:
     relation: LinkRelation
     target_store_id: StoreId
     target_id: TaskId | DecisionId
-    expected_revision: Revision
+    expected_revision: Revision | None
+    force_current: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +142,8 @@ class EvidenceRequest:
     item_id: TaskId | DecisionId
     relation: EvidenceRelation
     reference: EvidenceReference
-    expected_revision: Revision
+    expected_revision: Revision | None
+    force_current: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,9 +10,9 @@ from untaped_orchestration.application.item_support import (
     MutationScope,
     PlannedRecord,
     RelationConflict,
-    RevisionConflict,
     decision_inactive,
     execute_mutation,
+    guard_revision,
     record_result,
     replacement,
     selected_record,
@@ -65,8 +65,12 @@ def _validate_generic_link(snapshot: FederatedSnapshot, request: LinkRequest) ->
         raise RelationConflict("generic links require an active task source")
     if not isinstance(source.metadata, ActiveTask):
         raise RelationConflict("generic links require an active task source")
-    if source.revision != request.expected_revision:
-        raise RevisionConflict("link source revision is stale")
+    guard_revision(
+        source.revision,
+        request.expected_revision,
+        force_current=request.force_current,
+        message="link source revision is stale",
+    )
     selected_id = selected_store_id(snapshot)
     if request.relation is LinkRelation.DEPENDS_ON and request.target_store_id != selected_id:
         raise RelationConflict("depends-on is a same-store relation")
@@ -169,8 +173,12 @@ class ChangeEvidence:
             record = selected_record(snapshot, request.item_id)
             if record is None or record.body is None:
                 raise ItemStateConflict("evidence owner does not exist")
-            if record.revision != request.expected_revision:
-                raise RevisionConflict("evidence owner revision is stale")
+            guard_revision(
+                record.revision,
+                request.expected_revision,
+                force_current=request.force_current,
+                message="evidence owner revision is stale",
+            )
             if not add and isinstance(record.metadata, ArchivedTask):
                 raise ItemStateConflict("archived task evidence is append-only")
             if (

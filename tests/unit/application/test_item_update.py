@@ -67,6 +67,7 @@ def test_update_request_types_expose_exact_owned_fields_only() -> None:
     assert [field.name for field in fields(UpdateTaskRequest)] == [
         "item_id",
         "expected_revision",
+        "force_current",
         "title",
         "body",
         "priority",
@@ -76,6 +77,7 @@ def test_update_request_types_expose_exact_owned_fields_only() -> None:
     assert [field.name for field in fields(UpdateDecisionRequest)] == [
         "item_id",
         "expected_revision",
+        "force_current",
         "title",
         "body",
         "tags",

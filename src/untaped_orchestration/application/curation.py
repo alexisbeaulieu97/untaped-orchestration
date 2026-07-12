@@ -7,9 +7,9 @@ from untaped_orchestration.application.item_support import (
     ItemStateConflict,
     MutationScope,
     PlannedRecord,
-    RevisionConflict,
     decision_inactive,
     execute_mutation,
+    guard_revision,
     record_result,
     selected_record,
     validated_copy,
@@ -36,19 +36,22 @@ from untaped_orchestration.domain.time import CalendarDate, UtcTimestamp
 @dataclass(frozen=True, slots=True)
 class CurateNextRequest:
     local: bool = False
+    limit: int = 50
 
 
 @dataclass(frozen=True, slots=True)
 class AcknowledgeRequest:
     item_id: TaskId | DecisionId
-    expected_revision: Revision
+    expected_revision: Revision | None
+    force_current: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class SnoozeRequest:
     item_id: TaskId | DecisionId
     until: CalendarDate
-    expected_revision: Revision
+    expected_revision: Revision | None
+    force_current: bool = False
 
 
 class CurationService:
@@ -65,6 +68,8 @@ class CurationService:
         self._scope = scope
 
     def next(self, request: CurateNextRequest) -> tuple[CurationEntry, ...]:
+        if not 1 <= request.limit <= 200:
+            raise ValueError("limit must be in range 1..200")
         snapshot = (self._scope.selected_local if request.local else self._scope.recursive).load()
         scoped = (
             FederatedSnapshot(snapshot.selected, (snapshot.selected,), Completeness())
@@ -87,7 +92,7 @@ class CurationService:
             graph,
             now=UtcTimestamp.from_datetime(self._clock.now()),
             contexts=tuple(contexts),
-        )
+        )[: request.limit]
 
     def acknowledge(
         self, request: AcknowledgeRequest, *, require_task: bool = False
@@ -95,6 +100,7 @@ class CurationService:
         return self._change(
             request.item_id,
             request.expected_revision,
+            request.force_current,
             {"reviewed_at": UtcTimestamp.from_datetime(self._clock.now()), "review_on": None},
             require_task=require_task,
         )
@@ -103,6 +109,7 @@ class CurationService:
         return self._change(
             request.item_id,
             request.expected_revision,
+            request.force_current,
             {"review_on": request.until},
             require_task=False,
         )
@@ -110,7 +117,8 @@ class CurationService:
     def _change(
         self,
         item_id: TaskId | DecisionId,
-        expected_revision: Revision,
+        expected_revision: Revision | None,
+        force_current: bool,
         updates: dict[str, object],
         *,
         require_task: bool,
@@ -139,8 +147,12 @@ class CurationService:
                 snapshot, record.metadata.id
             ):
                 raise ItemStateConflict("inactive decision cannot be curated")
-            if record.revision != expected_revision:
-                raise RevisionConflict("curation revision is stale")
+            guard_revision(
+                record.revision,
+                expected_revision,
+                force_current=force_current,
+                message="curation revision is stale",
+            )
 
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
             record = selected_record(snapshot, item_id)

@@ -85,12 +85,14 @@ def test_link_and_evidence_requests_own_only_their_named_fields() -> None:
         "target_store_id",
         "target_id",
         "expected_revision",
+        "force_current",
     ]
     assert [field.name for field in fields(EvidenceRequest)] == [
         "item_id",
         "relation",
         "reference",
         "expected_revision",
+        "force_current",
     ]
 
 
