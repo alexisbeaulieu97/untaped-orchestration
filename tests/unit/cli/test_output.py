@@ -137,6 +137,23 @@ def test_curation_page_propagates_warning_and_truncation_to_json_and_pipe() -> N
     assert records[-1]["record"] == {"complete": False, "truncated": True}
 
 
+def test_curation_page_lock_conflict_preserves_partial_payload_and_exits_four() -> None:
+    conflict = Diagnostic(
+        code="ORC007",
+        severity="error",
+        path=".untaped/.lock",
+        field="lock",
+        message="lock unavailable",
+        hint="retry",
+    )
+
+    result = _curation_result(CurationPage((), False, False, (conflict,)))
+
+    assert result.data == ()
+    assert not result.complete
+    assert result.exit_code == 4
+
+
 def test_recursive_fmt_propagates_incomplete_warning_to_every_encoder() -> None:
     warning = Diagnostic(
         code="ORC005",
@@ -306,6 +323,42 @@ def test_ambiguous_raw_failure_names_every_path_and_writes_zero_stdout(capfd) ->
     assert captured.out == ""
     assert "ORC003: tasks/one.md" in captured.err
     assert "ORC003: tasks/two.md" in captured.err
+
+
+@pytest.mark.parametrize("fmt", ["json", "table", "pipe"])
+@pytest.mark.parametrize(("code", "expected_exit"), [("ORC007", 4), ("ORC005", 3)])
+def test_error_diagnostic_code_has_stable_exit_priority_without_traceback(
+    fmt: str,
+    code: str,
+    expected_exit: int,
+    capfd,
+) -> None:
+    class ReportedFailure(ValueError):
+        def __init__(self) -> None:
+            self.diagnostics = (
+                Diagnostic(
+                    code=code,
+                    severity="error",
+                    path="registry.toml",
+                    field="lock" if code == "ORC007" else "children",
+                    message="reported failure",
+                    hint="retry",
+                ),
+            )
+            super().__init__("incomplete read")
+
+    with pytest.raises(SystemExit) as raised:
+        run_command(
+            "list",
+            lambda: (_ for _ in ()).throw(ReportedFailure()),
+            fmt=fmt,  # type: ignore[arg-type]
+            allowed=("json", "table", "pipe"),
+        )
+    assert raised.value.code == expected_exit
+    captured = capfd.readouterr()
+    combined = captured.out + captured.err
+    assert code in combined
+    assert "Traceback" not in combined
 
 
 @pytest.mark.parametrize(

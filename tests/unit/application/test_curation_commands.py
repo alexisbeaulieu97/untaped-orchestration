@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import fields
 from pathlib import Path, PurePosixPath
 
@@ -9,9 +10,11 @@ from tests.unit.application.test_task_transition import Clock, create, state
 from untaped_orchestration.application.curation import (
     AcknowledgeRequest,
     CurateNextRequest,
+    CurationReadService,
     CurationService,
     SnoozeRequest,
 )
+from untaped_orchestration.application.federation import FederationRead
 from untaped_orchestration.application.items import (
     CreateDecision,
     CreateDecisionRequest,
@@ -22,6 +25,7 @@ from untaped_orchestration.application.items import (
     UpdateTaskRequest,
 )
 from untaped_orchestration.application.mutations import InvalidMutationState
+from untaped_orchestration.application.ports import StoreReader
 from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
@@ -33,6 +37,53 @@ from untaped_orchestration.domain.diagnostics import Diagnostic
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import ActiveTask, Decision
 from untaped_orchestration.domain.time import CalendarDate
+
+
+class _ScopeFederation:
+    def __init__(self, scope: MutationScope, repository: StoreReader) -> None:
+        self._scope = scope
+        self._repository = repository
+
+    def run[T](
+        self,
+        location: StoreLocation,
+        *,
+        local: bool,
+        headers_only: bool = True,
+        action: Callable[[FederationRead], T],
+    ) -> T:
+        del location, headers_only
+        execution = self._scope.selected_local if local else self._scope.recursive
+        return action(FederationRead(execution.load(), self._repository))
+
+
+def _curation_reader(
+    repository: StoreReader,
+    location: StoreLocation,
+    scope: MutationScope,
+) -> CurationReadService:
+    federation = _ScopeFederation(scope, repository)
+    return CurationReadService(
+        federation,  # type: ignore[arg-type]
+        location,
+        Clock(),
+    )
+
+
+class _UnavailableFederation:
+    def __init__(self, snapshot: FederatedSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def run[T](
+        self,
+        location: StoreLocation,
+        *,
+        local: bool,
+        headers_only: bool = True,
+        action: Callable[[FederationRead], T],
+    ) -> T:
+        del location, local, headers_only
+        return action(FederationRead(self._snapshot, None))
 
 
 def test_curation_requests_are_kind_agnostic_and_frozen() -> None:
@@ -48,6 +99,45 @@ def test_curation_requests_are_kind_agnostic_and_frozen() -> None:
         "force_current",
     ]
     assert [field.name for field in fields(CurateNextRequest)] == ["local", "limit"]
+
+
+@pytest.mark.parametrize("reason", ["timeout", "changed"])
+def test_curate_next_returns_partial_page_when_federation_lease_is_unavailable(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    repository, location, _, _, _ = state(tmp_path)
+    selected = repository.load_local(location, headers_only=True)
+    assert selected.store is not None
+    incomplete = IncompleteStore(
+        selected.store.id,
+        reason,  # type: ignore[arg-type]
+        Diagnostic(
+            code="ORC007",
+            severity="error",
+            path=".untaped/.lock",
+            field="lock" if reason == "timeout" else "revision",
+            message=f"federation {reason}",
+            hint="retry",
+        ),
+    )
+    snapshot = FederatedSnapshot(
+        selected,
+        (selected,),
+        Completeness((incomplete,)),
+    )
+    service = CurationReadService(
+        _UnavailableFederation(snapshot),  # type: ignore[arg-type]
+        location,
+        Clock(),
+    )
+
+    page = service.next(CurateNextRequest())
+
+    assert page.entries == ()
+    assert not page.complete
+    assert not page.truncated
+    assert [value.code for value in page.diagnostics] == ["ORC007"]
 
 
 def test_generic_acknowledge_and_snooze_route_tasks_and_decisions_without_caller_kind(
@@ -104,8 +194,9 @@ def test_curate_next_uses_each_store_context_and_local_scope(tmp_path: Path) -> 
     task = service.snooze(
         SnoozeRequest(task.record.metadata.id, CalendarDate("2026-07-11"), task.record.revision)
     )
-    local = service.next(CurateNextRequest(local=True))
-    recursive = service.next(CurateNextRequest(local=False))
+    reader = _curation_reader(repository, location, scope)
+    local = reader.next(CurateNextRequest(local=True))
+    recursive = reader.next(CurateNextRequest(local=False))
     assert [entry.item_id for entry in local.entries] == [task.record.metadata.id]
     assert recursive == local
 
@@ -122,10 +213,11 @@ def test_curate_next_returns_typed_truncated_page_for_51_at_limit_50(
     service.snooze(
         SnoozeRequest(task.record.metadata.id, CalendarDate("2026-07-11"), task.record.revision)
     )
-    entry = service.next(CurateNextRequest(local=True)).entries[0]
+    reader = _curation_reader(repository, location, scope)
+    entry = reader.next(CurateNextRequest(local=True)).entries[0]
     monkeypatch.setattr(curation_module, "curation_queue", lambda *args, **kwargs: (entry,) * 51)
 
-    page = service.next(CurateNextRequest(local=True, limit=50))
+    page = reader.next(CurateNextRequest(local=True, limit=50))
 
     assert len(page.entries) == 50
     assert page.complete
@@ -222,15 +314,11 @@ def test_recursive_curate_next_fails_closed_but_local_ignores_unrelated_child_fa
         return FederatedSnapshot(selected, (selected,), Completeness((incomplete,)))
 
     recursive = MutationExecutionScope((location,), location, incomplete_load)
-    service = CurationService(
-        executor,
-        repository,
-        Clock(),
-        MutationScope(recursive, scope.selected_local),
-    )
+    curation_scope = MutationScope(recursive, scope.selected_local)
+    reader = _curation_reader(repository, location, curation_scope)
     with pytest.raises(InvalidMutationState):
-        service.next(CurateNextRequest())
-    local = service.next(CurateNextRequest(local=True))
+        reader.next(CurateNextRequest())
+    local = reader.next(CurateNextRequest(local=True))
     assert [entry.item_id for entry in local.entries] == [task.record.metadata.id]
 
 
@@ -305,15 +393,11 @@ def test_recursive_curate_next_rejects_complete_but_semantically_invalid_federat
     )
     federation = FederatedSnapshot(invalid, (invalid,), Completeness())
     recursive = MutationExecutionScope((location,), location, lambda: federation)
-    service = CurationService(
-        executor,
-        repository,
-        Clock(),
-        MutationScope(recursive, scope.selected_local),
-    )
+    curation_scope = MutationScope(recursive, scope.selected_local)
+    reader = _curation_reader(repository, location, curation_scope)
 
     with pytest.raises(InvalidMutationState) as failure:
-        service.next(CurateNextRequest())
+        reader.next(CurateNextRequest())
 
     assert expected_code in {value.code for value in failure.value.diagnostics}
 
@@ -348,16 +432,12 @@ def test_local_curate_next_ignores_unrelated_child_error_but_rejects_selected_er
     )
     federation = FederatedSnapshot(selected, (selected, child), Completeness())
     recursive = MutationExecutionScope((location, child_location), location, lambda: federation)
-    service = CurationService(
-        executor,
-        repository,
-        Clock(),
-        MutationScope(recursive, scope.selected_local),
-    )
+    curation_scope = MutationScope(recursive, scope.selected_local)
+    reader = _curation_reader(repository, location, curation_scope)
 
-    assert service.next(CurateNextRequest(local=True)).entries == ()
+    assert reader.next(CurateNextRequest(local=True)).entries == ()
     with pytest.raises(InvalidMutationState) as recursive_failure:
-        service.next(CurateNextRequest())
+        reader.next(CurateNextRequest())
     assert {value.code for value in recursive_failure.value.diagnostics} == {"ORC009"}
 
     selected_error = selected.__class__(
@@ -373,14 +453,10 @@ def test_local_curate_next_ignores_unrelated_child_error_but_rejects_selected_er
     )
     selected_federation = FederatedSnapshot(selected_error, (selected_error,), Completeness())
     selected_local = MutationExecutionScope((location,), location, lambda: selected_federation)
-    selected_service = CurationService(
-        executor,
-        repository,
-        Clock(),
-        MutationScope(selected_local, selected_local),
-    )
+    selected_scope = MutationScope(selected_local, selected_local)
+    selected_reader = _curation_reader(repository, location, selected_scope)
     with pytest.raises(InvalidMutationState) as local_failure:
-        selected_service.next(CurateNextRequest(local=True))
+        selected_reader.next(CurateNextRequest(local=True))
     assert {value.code for value in local_failure.value.diagnostics} == {"ORC009"}
 
 

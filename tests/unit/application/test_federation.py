@@ -158,7 +158,7 @@ def test_local_load_locks_and_rereads_only_the_selected_store_with_default_timeo
     assert result.completeness.complete
     assert result.stores == (selected,)
     assert reader.discovers == [root]
-    assert reader.loads == [(root, True), (root, False)]
+    assert reader.loads == [(root, True), (root, False), (root, True)]
     assert locks.calls == [((selected.location,), 10.0)]
 
 
@@ -191,7 +191,7 @@ def test_run_exposes_file_reader_only_inside_the_ordered_lock_lease() -> None:
     )
 
     assert result.selected.location == selected.location
-    assert reader.loads == [(root, True), (root, True)]
+    assert reader.loads == [(root, True), (root, True), (root, True)]
     assert not active
 
 
@@ -222,6 +222,49 @@ def test_timeout_and_changed_anchor_never_expose_a_file_reader() -> None:
     )
     assert changed.reader is None
     assert not changed.snapshot.completeness.complete
+
+
+def test_missing_registered_child_appearing_at_lock_entry_closes_the_lease() -> None:
+    root = Path("/work/root")
+    child_root = Path("/work/child")
+    selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
+    child = _snapshot(child_root, CHILD_STORE_ID)
+    reader = ScriptedReader((selected, child))
+    reader.set_discovery(child_root, FileNotFoundError(child_root))
+
+    def appear() -> None:
+        reader.set_discovery(child_root, child.location)
+
+    lease = FederationService(reader, RecordingLocks(on_enter=appear)).run(
+        selected.location,
+        local=False,
+        action=lambda value: value,
+    )
+
+    assert lease.reader is None
+    assert not lease.snapshot.completeness.complete
+    assert any(value.diagnostic.code == "ORC007" for value in lease.snapshot.completeness.entries)
+
+
+def test_known_participant_disappearing_at_lock_entry_closes_the_lease() -> None:
+    root = Path("/work/root")
+    child_root = Path("/work/child")
+    selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
+    child = _snapshot(child_root, CHILD_STORE_ID)
+    reader = ScriptedReader((selected, child))
+
+    def disappear() -> None:
+        reader.set_discovery(child_root, FileNotFoundError(child_root))
+
+    lease = FederationService(reader, RecordingLocks(on_enter=disappear)).run(
+        selected.location,
+        local=False,
+        action=lambda value: value,
+    )
+
+    assert lease.reader is None
+    assert not lease.snapshot.completeness.complete
+    assert any(value.diagnostic.code == "ORC007" for value in lease.snapshot.completeness.entries)
 
 
 def test_recursive_resolution_uses_explicit_depth_first_and_global_lock_order() -> None:
@@ -256,9 +299,9 @@ def test_recursive_resolution_uses_explicit_depth_first_and_global_lock_order() 
     assert [location.real_root for location in locks.calls[0][0]] == [grandchild, child, root]
     assert ambient not in reader.discovers
     assert all(headers_only for _, headers_only in reader.loads)
-    assert reader.loads.count((root, True)) == 2
-    assert reader.loads.count((child, True)) == 2
-    assert reader.loads.count((grandchild, True)) == 2
+    assert reader.loads.count((root, True)) == 3
+    assert reader.loads.count((child, True)) == 3
+    assert reader.loads.count((grandchild, True)) == 3
 
 
 def test_casefold_path_alias_is_incomplete_and_never_added_to_the_lock_set() -> None:

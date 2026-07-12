@@ -59,12 +59,21 @@ def _result[T](
 
 
 def _curation_result(value: CurationPage) -> CommandResult:
+    exit_code = (
+        4
+        if any(
+            diagnostic.code == "ORC007" and diagnostic.severity == "error"
+            for diagnostic in value.diagnostics
+        )
+        else 0
+    )
     return CommandResult(
         "curate next",
         value.entries,
         complete=value.complete,
         truncated=value.truncated,
         diagnostics=value.diagnostics,
+        exit_code=exit_code,
     )
 
 
@@ -300,7 +309,9 @@ def register(app: App) -> None:  # noqa: C901
         run_command(
             "curate next",
             lambda: _curation_result(
-                CliContext.resolve(store).curation().next(CurateNextRequest(local, _limit(limit)))
+                CliContext.resolve(store)
+                .curation_reads()
+                .next(CurateNextRequest(local, _limit(limit)))
             ),
             fmt=format,
             allowed=("table", "json", "pipe", "raw"),

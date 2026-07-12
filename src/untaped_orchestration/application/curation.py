@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from untaped_orchestration.application.federation import FederationRead, FederationService
 from untaped_orchestration.application.item_support import (
     ItemMutationResult,
     ItemStateConflict,
@@ -21,7 +22,7 @@ from untaped_orchestration.application.mutations import (
     validate_selected_local,
 )
 from untaped_orchestration.application.ports import CanonicalFormatter, Clock, FileReplacement
-from untaped_orchestration.application.results import Completeness, FederatedSnapshot
+from untaped_orchestration.application.results import Completeness, FederatedSnapshot, StoreLocation
 from untaped_orchestration.application.validation import _graph_state, validate_snapshot
 from untaped_orchestration.domain.curation import (
     CurationEntry,
@@ -46,6 +47,68 @@ class CurationPage:
     complete: bool
     truncated: bool
     diagnostics: tuple[Diagnostic, ...]
+
+
+def _curation_page(
+    snapshot: FederatedSnapshot,
+    request: CurateNextRequest,
+    clock: Clock,
+) -> CurationPage:
+    scoped = (
+        FederatedSnapshot(snapshot.selected, (snapshot.selected,), Completeness())
+        if request.local
+        else snapshot
+    )
+    diagnostics = validate_snapshot(scoped, require_children=not request.local)
+    if any(value.severity == "error" for value in diagnostics):
+        raise InvalidMutationState(diagnostics)
+    contexts = tuple(
+        StoreCurationContext(store.store.id, store.store.timezone, store.store.curation)
+        for store in scoped.stores
+        if store.store is not None
+    )
+    queue = curation_queue(
+        _graph_state(scoped),
+        now=UtcTimestamp.from_datetime(clock.now()),
+        contexts=contexts,
+    )
+    return CurationPage(
+        queue[: request.limit],
+        scoped.completeness.complete,
+        len(queue) > request.limit,
+        diagnostics,
+    )
+
+
+class CurationReadService:
+    def __init__(
+        self,
+        federation: FederationService,
+        location: StoreLocation,
+        clock: Clock,
+    ) -> None:
+        self._federation = federation
+        self._location = location
+        self._clock = clock
+
+    def next(self, request: CurateNextRequest) -> CurationPage:
+        if not 1 <= request.limit <= 200:
+            raise ValueError("limit must be in range 1..200")
+        return self._federation.run(
+            self._location,
+            local=request.local,
+            action=lambda lease: self._next_locked(lease, request),
+        )
+
+    def _next_locked(self, lease: FederationRead, request: CurateNextRequest) -> CurationPage:
+        if lease.reader is None:
+            return CurationPage(
+                (),
+                False,
+                False,
+                lease.snapshot.completeness.diagnostics,
+            )
+        return _curation_page(lease.snapshot, request, self._clock)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,39 +138,6 @@ class CurationService:
         self._formatter = formatter
         self._clock = clock
         self._scope = scope
-
-    def next(self, request: CurateNextRequest) -> CurationPage:
-        if not 1 <= request.limit <= 200:
-            raise ValueError("limit must be in range 1..200")
-        snapshot = (self._scope.selected_local if request.local else self._scope.recursive).load()
-        scoped = (
-            FederatedSnapshot(snapshot.selected, (snapshot.selected,), Completeness())
-            if request.local
-            else snapshot
-        )
-        diagnostics = validate_snapshot(scoped, require_children=not request.local)
-        if any(value.severity == "error" for value in diagnostics):
-            raise InvalidMutationState(diagnostics)
-        stores = scoped.stores
-        contexts = []
-        for store in stores:
-            if store.store is None:
-                continue
-            contexts.append(
-                StoreCurationContext(store.store.id, store.store.timezone, store.store.curation)
-            )
-        graph = _graph_state(scoped)
-        queue = curation_queue(
-            graph,
-            now=UtcTimestamp.from_datetime(self._clock.now()),
-            contexts=tuple(contexts),
-        )
-        return CurationPage(
-            queue[: request.limit],
-            scoped.completeness.complete,
-            len(queue) > request.limit,
-            diagnostics,
-        )
 
     def acknowledge(
         self, request: AcknowledgeRequest, *, require_task: bool = False

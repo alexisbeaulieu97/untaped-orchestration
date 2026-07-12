@@ -146,7 +146,7 @@ CASES = (
     _Case(
         read_commands,
         ("curate", "next", "--local", "--limit", "12"),
-        "curation.next",
+        "curation_reads.next",
         "CurateNextRequest",
         {"local": True, "limit": 12},
     ),
@@ -609,7 +609,7 @@ def _expected_formats(case: _Case) -> tuple[str, ...]:
         "queries.show",
         "queries.search",
         "queries.next",
-        "curation.next",
+        "curation_reads.next",
         "queries.history_list",
         "queries.history_search",
         "queries.history_show",

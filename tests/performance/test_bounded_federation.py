@@ -7,18 +7,18 @@ body-read structure, never wall time or a machine-specific memory ceiling.
 from __future__ import annotations
 
 import tracemalloc
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import cast
 
 from tests.unit.application.test_federation import _registry, _store
-from untaped_orchestration.application.curation import CurateNextRequest, CurationService
-from untaped_orchestration.application.item_support import (
-    MutationExecutionScope,
-    MutationScope,
+from untaped_orchestration.application.curation import (
+    CurateNextRequest,
+    CurationReadService,
 )
-from untaped_orchestration.application.mutations import MutationExecutor
-from untaped_orchestration.application.ports import CanonicalFormatter
+from untaped_orchestration.application.federation import FederationRead, FederationService
+from untaped_orchestration.application.ports import StoreReader
 from untaped_orchestration.application.queries import (
     BriefRequest,
     ListRequest,
@@ -57,6 +57,24 @@ class Bodies:
         key = (location.real_root.as_posix(), path)
         self.reads.append(key)
         return self.values[key]
+
+
+class Federation:
+    def __init__(self, scope: QueryScope, bodies: Bodies) -> None:
+        self._scope = scope
+        self._bodies = bodies
+
+    def run[T](
+        self,
+        location: StoreLocation,
+        *,
+        local: bool,
+        headers_only: bool = True,
+        action: Callable[[FederationRead], T],
+    ) -> T:
+        del location, headers_only
+        snapshot = self._scope.selected_local() if local else self._scope.recursive()
+        return action(FederationRead(snapshot, cast(StoreReader, self._bodies)))
 
 
 def _fixture() -> tuple[QueryScope, Bodies, TaskId]:
@@ -149,13 +167,10 @@ def test_11_store_1000_item_queries_are_structurally_bounded() -> None:
     assert bodies.reads == []
     service.next(NextRequest(limit=200))
     assert bodies.reads == []
-    recursive = scope.recursive()
-    execution = MutationExecutionScope((), recursive.selected.location, scope.recursive)
-    CurationService(
-        cast(MutationExecutor, object()),
-        cast(CanonicalFormatter, object()),
+    CurationReadService(
+        cast(FederationService, Federation(scope, bodies)),
+        scope.recursive().selected.location,
         Clock(),
-        MutationScope(execution, execution),
     ).next(CurateNextRequest())
     assert bodies.reads == []
 

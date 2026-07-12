@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from untaped_orchestration.application.curation import CurationService
+from untaped_orchestration.application.curation import CurationReadService, CurationService
 from untaped_orchestration.application.decisions import DecisionService
 from untaped_orchestration.application.federation import (
     FederationRegistryService,
@@ -149,6 +149,9 @@ class CliContext:
             self.clock,
             self.scope,
         )
+
+    def curation_reads(self) -> CurationReadService:
+        return CurationReadService(self.federation, self.location, self.clock)
 
     def registry(self) -> FederationRegistryService:
         return FederationRegistryService(

@@ -237,6 +237,49 @@ class FederationService:
         headers_only: bool = True,
         action: Callable[[FederationRead], T],
     ) -> T:
+        resolution, key = self._resolve_headers(location, local=local)
+
+        ordered = sorted(
+            (value.snapshot.location for value in resolution.participants.values()),
+            key=_location_sort_key,
+        )
+        unavailable: FederatedSnapshot | None = None
+        try:
+            with self._locks.acquire(ordered, timeout=self._lock_timeout):
+                self._reread_under_lock(
+                    resolution,
+                    headers_only=headers_only,
+                )
+                snapshot = self._snapshot(resolution, key)
+                if any(entry.reason == "changed" for entry in resolution.entries):
+                    unavailable = snapshot
+                else:
+                    fresh_resolution, fresh_key = self._resolve_headers(location, local=local)
+                    fresh = self._snapshot(fresh_resolution, fresh_key)
+                    if self._anchor_signature(snapshot) != self._anchor_signature(fresh):
+                        self._record_change(
+                            resolution.participants[key],
+                            resolution,
+                            "federation participant set changed after lock acquisition",
+                        )
+                        unavailable = self._snapshot(resolution, key)
+                    else:
+                        return action(FederationRead(snapshot, self._reader))
+        except StoreLockTimeout as error:
+            self._record_timeout(error, resolution)
+        return action(
+            FederationRead(
+                unavailable or self._snapshot(resolution, key),
+                None,
+            )
+        )
+
+    def _resolve_headers(
+        self,
+        location: StoreLocation,
+        *,
+        local: bool,
+    ) -> tuple[_Resolution, str]:
         selected = self._reader.load_local(location, headers_only=True)
         selected_id = _identity(selected)
         if selected_id is None:
@@ -258,30 +301,17 @@ class FederationService:
                 ancestor_ids=frozenset({selected_id.root}),
                 ancestor_paths=frozenset({key}),
             )
+        return resolution, key
 
-        ordered = sorted(
-            (value.snapshot.location for value in resolution.participants.values()),
-            key=_location_sort_key,
-        )
-        unavailable: FederatedSnapshot | None = None
-        try:
-            with self._locks.acquire(ordered, timeout=self._lock_timeout):
-                self._reread_under_lock(
-                    resolution,
-                    headers_only=headers_only,
-                )
-                snapshot = self._snapshot(resolution, key)
-                if any(entry.reason == "changed" for entry in resolution.entries):
-                    unavailable = snapshot
-                else:
-                    return action(FederationRead(snapshot, self._reader))
-        except StoreLockTimeout as error:
-            self._record_timeout(error, resolution)
-        return action(
-            FederationRead(
-                unavailable or self._snapshot(resolution, key),
-                None,
+    @staticmethod
+    def _anchor_signature(snapshot: FederatedSnapshot) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            (
+                _path_key(anchor.location.real_root),
+                anchor.store_config_revision.root,
+                "" if anchor.registry_revision is None else anchor.registry_revision.root,
             )
+            for anchor in snapshot.participants
         )
 
     @staticmethod

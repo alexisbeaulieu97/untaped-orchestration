@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 import pytest
 
+import untaped_orchestration.application.curation as curation_module
 from tests.builders import CHILD_STORE_ID, DECISION_ID, STORE_ID, TASK_ID, task_bytes
 from tests.cli_fixtures import initialized_repository
 from untaped_orchestration.__main__ import main
@@ -98,6 +99,52 @@ def test_cli_list_is_header_bounded_and_show_reads_body_inside_lock(
         "json",
     )
     assert shown["data"]["body"].endswith("x" * 100 + "\n")
+
+
+def test_cli_curate_next_uses_header_only_federation_lease(tmp_path, monkeypatch, capsys) -> None:
+    root = initialized_repository(tmp_path)
+    active = False
+    full_loads: list[bool] = []
+    original_acquire = FileLockManager.acquire
+    original_load = FilesystemStoreRepository.load_local
+    original_queue = curation_module.curation_queue
+
+    @contextmanager
+    def tracked_acquire(self, locations, *, timeout):
+        nonlocal active
+        with original_acquire(self, locations, timeout=timeout):
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    def tracked_load(self, location, *, headers_only):
+        if not headers_only:
+            full_loads.append(active)
+        return original_load(self, location, headers_only=headers_only)
+
+    def guarded_queue(*args, **kwargs):
+        assert active, "curation queue escaped federation lock lease"
+        return original_queue(*args, **kwargs)
+
+    monkeypatch.setattr(FileLockManager, "acquire", tracked_acquire)
+    monkeypatch.setattr(FilesystemStoreRepository, "load_local", tracked_load)
+    monkeypatch.setattr(curation_module, "curation_queue", guarded_queue)
+
+    payload, _ = _invoke(
+        monkeypatch,
+        capsys,
+        "curate",
+        "next",
+        "--store",
+        str(root),
+        "--format",
+        "json",
+    )
+
+    assert payload["complete"] is True
+    assert full_loads == []
 
 
 def test_real_store_read_mutation_and_maintenance_families(tmp_path, monkeypatch, capsys) -> None:
