@@ -19,9 +19,9 @@ from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, usage_value
 from untaped_orchestration.cli.output import CommandResult, run_command
-from untaped_orchestration.domain.ids import DecisionId, TaskId
+from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import Revision
-from untaped_orchestration.domain.time import CalendarDate
+from untaped_orchestration.domain.time import CalendarDate, IanaTimezone
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
 from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
@@ -65,15 +65,28 @@ def register(app: App) -> None:  # noqa: C901
         debug: bool = False,
     ) -> None:
         del debug
+        if public and decisions_only:
+            raise SystemExit(2)
 
         def action() -> CommandResult:
+            validated_store_id = usage_value(lambda: StoreId(store_id)).root
+            usage_value(lambda: IanaTimezone(timezone))
             repository = FilesystemStoreRepository()
             receipt = InitializeStore(
                 repository,
                 repository,
                 FileLockManager(),
                 MarkdownViewRenderer(),
-            ).execute(InitRequest(path, store_id, name, timezone, public, decisions_only))
+            ).execute(
+                InitRequest(
+                    path,
+                    validated_store_id,
+                    name,
+                    timezone,
+                    public,
+                    decisions_only,
+                )
+            )
             return CommandResult("init", receipt)
 
         run_command("init", action, fmt=format, allowed=("table", "json"), columns=columns)
@@ -118,7 +131,11 @@ def register(app: App) -> None:  # noqa: C901
         debug: bool = False,
     ) -> None:
         del debug
-        if check == write or (write and (not local or if_store_revision is None)):
+        if (
+            check == write
+            or (check and if_store_revision is not None)
+            or (write and (not local or if_store_revision is None))
+        ):
             raise SystemExit(2)
 
         def action() -> CommandResult:

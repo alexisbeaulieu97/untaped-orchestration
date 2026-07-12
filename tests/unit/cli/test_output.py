@@ -122,17 +122,46 @@ def test_pipe_emits_data_and_diagnostic_records_for_partial_results() -> None:
         "orchestration.diagnostic",
     ]
     assert records[1]["record"]["code"] == "ORC005"
-    assert records[1]["record"]["complete"] is False
+    Diagnostic.model_validate(records[1]["record"])
     assert (
         encoded.stdout
         == (
             f'{{"untaped":"1","kind":"orchestration.task","record":{{"id":"{TASK_ID}","kind":"task"}}}}\n'
             '{"untaped":"1","kind":"orchestration.diagnostic","record":'
             '{"code":"ORC005","severity":"warning","path":"registry.toml",'
-            '"field":"children","message":"child missing","hint":"restore child",'
-            '"complete":false,"truncated":false}}\n'
+            '"field":"children","message":"child missing","hint":"restore child"}}\n'
         ).encode()
     )
+
+
+@pytest.mark.parametrize(
+    ("complete", "truncated", "message"),
+    (
+        (False, False, "command result is incomplete"),
+        (True, True, "command result is truncated"),
+        (False, True, "command result is incomplete and truncated"),
+    ),
+)
+def test_pipe_synthesizes_schema_valid_status_diagnostic(
+    complete: bool, truncated: bool, message: str
+) -> None:
+    encoded = encode_result(
+        CommandResult(
+            "list",
+            [{"id": TASK_ID, "kind": "task"}],
+            complete=complete,
+            truncated=truncated,
+        ),
+        fmt="pipe",
+    )
+    records = [json.loads(line) for line in encoded.stdout.splitlines()]
+    assert [record["kind"] for record in records] == [
+        "orchestration.task",
+        "orchestration.diagnostic",
+    ]
+    diagnostic = Diagnostic.model_validate(records[1]["record"])
+    assert diagnostic.code == "ORC005"
+    assert diagnostic.message == message
 
 
 def test_pipe_expected_failure_is_diagnostic_only_without_traceback(capfd) -> None:
@@ -144,15 +173,13 @@ def test_pipe_expected_failure_is_diagnostic_only_without_traceback(capfd) -> No
     assert raised.value.code == 1
     captured = capfd.readouterr()
     records = [json.loads(line) for line in captured.out.splitlines()]
-    assert [record["kind"] for record in records] == ["orchestration.diagnostic"]
+    assert [record["kind"] for record in records] == [
+        "orchestration.diagnostic",
+        "orchestration.diagnostic",
+    ]
+    for record in records:
+        Diagnostic.model_validate(record["record"])
     assert "Traceback" not in captured.err
-    assert captured.out == (
-        '{"untaped":"1","kind":"orchestration.diagnostic","record":'
-        '{"code":"ORC002","severity":"error","path":"","field":"",'
-        '"message":"invalid canonical state",'
-        '"hint":"Correct the reported condition and retry.",'
-        '"complete":false,"truncated":false}}\n'
-    )
 
 
 def test_binary_and_json_recovery_preserve_invalid_utf8_exactly() -> None:

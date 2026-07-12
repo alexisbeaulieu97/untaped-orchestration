@@ -131,6 +131,8 @@ def register(app: App) -> None:
         _guard(if_revision, force_current)
         if tag is not None and clear_tags:
             raise SystemExit(2)
+        if title is None and body_file is None and tag is None and not clear_tags:
+            raise SystemExit(2)
 
         def action() -> CommandResult:
             context = CliContext.resolve(store)

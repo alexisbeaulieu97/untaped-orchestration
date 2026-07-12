@@ -243,22 +243,32 @@ def _pipe_bytes(result: CommandResult) -> bytes:
             ).encode()
         )
     diagnostics = list(result.diagnostics)
-    if not result.complete and not diagnostics:
+    incomplete_unreported = not result.complete and not any(
+        value.code == "ORC005" for value in diagnostics
+    )
+    truncated_unreported = result.truncated and not any(
+        "truncat" in f"{value.message} {value.hint}".casefold() for value in diagnostics
+    )
+    if incomplete_unreported or truncated_unreported:
+        if incomplete_unreported and truncated_unreported:
+            status = "incomplete and truncated"
+        elif incomplete_unreported:
+            status = "incomplete"
+        else:
+            status = "truncated"
         diagnostics.append(
             Diagnostic(
                 code="ORC005",
                 severity="warning",
                 path="",
                 field="",
-                message="command result is incomplete",
-                hint="Inspect federation state before relying on omitted data.",
+                message=f"command result is {status}",
+                hint="Narrow the query or inspect federation state before relying on omitted data.",
             )
         )
     for diagnostic in diagnostics:
         record = _value(diagnostic)
         assert isinstance(record, dict)
-        record["complete"] = result.complete
-        record["truncated"] = result.truncated
         encoded.append(
             (
                 json.dumps(

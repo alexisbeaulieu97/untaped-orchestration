@@ -24,14 +24,14 @@ def register(app: App) -> None:
         debug: bool = False,
     ) -> None:
         del debug
-        if columns:
-            sys.stderr.write("error: id new does not accept --columns/-c\n")
-            raise SystemExit(2)
         try:
             fmt = validate_format(format, allowed=("table", "json", "raw"))
         except ValueError as error:
             sys.stderr.write(f"error: {error}\n")
             raise SystemExit(2) from error
+        if fmt == "raw" and columns:
+            sys.stderr.write("error: id new --format raw does not accept --columns/-c\n")
+            raise SystemExit(2)
         prefix = {"store": "sto", "task": "tsk", "decision": "dec"}[kind]
         item_id = f"{prefix}_{uuid7().hex}"
         emit_encoded(

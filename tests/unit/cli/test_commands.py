@@ -105,6 +105,61 @@ def test_id_new_raw_rejects_columns(capsys) -> None:
     assert captured.out == ""
 
 
+@pytest.mark.parametrize("format", ("table", "json"))
+def test_id_new_structured_formats_accept_columns_alias(format: str, capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        app(
+            ("id", "new", "task", "--format", format, "-c", "id"),
+            exit_on_error=False,
+        )
+    assert raised.value.code == 0
+    assert "tsk_" in capsys.readouterr().out
+
+
+def test_init_semantic_usage_is_validated_before_writes(tmp_path, capsys) -> None:
+    target = tmp_path / "store"
+    target.mkdir()
+    for extra in (
+        ("--store-id", "not-a-store-id"),
+        ("--store-id", STORE_ID, "--public", "--decisions-only"),
+    ):
+        with pytest.raises(SystemExit) as raised:
+            app(
+                (
+                    "init",
+                    str(target),
+                    *extra,
+                    "--name",
+                    "Store",
+                    "--timezone",
+                    "UTC",
+                ),
+                exit_on_error=False,
+            )
+        assert raised.value.code == 2
+        assert not target.joinpath(".untaped").exists()
+        assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("task", "update", TASK_ID, "--force-current"),
+        ("decision", "update", DECISION_ID, "--force-current"),
+        ("fmt", "--check", "--if-store-revision", REVISION),
+    ),
+)
+def test_cross_leaf_semantic_noop_or_inapplicable_flags_exit_two(
+    argv: tuple[str, ...], capsys
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        app(argv, exit_on_error=False)
+    assert raised.value.code == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "no .untaped/orchestration" not in captured.err
+
+
 @pytest.mark.parametrize(
     "argv",
     (

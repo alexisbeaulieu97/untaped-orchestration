@@ -145,6 +145,18 @@ def register(app: App) -> None:  # noqa: C901
         _guard(if_revision, force_current)
         if (tag is not None and clear_tags) or (waiting_on is not None and clear_waiting_on):
             raise SystemExit(2)
+        if all(
+            (
+                title is None,
+                body_file is None,
+                priority is None,
+                tag is None,
+                not clear_tags,
+                waiting_on is None,
+                not clear_waiting_on,
+            )
+        ):
+            raise SystemExit(2)
 
         def action() -> CommandResult:
             context = CliContext.resolve(store)
