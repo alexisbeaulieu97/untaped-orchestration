@@ -6,7 +6,7 @@ from uuid import uuid7
 
 from cyclopts import App
 
-from untaped_orchestration.cli.options import OutputFormat, validate_format
+from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, validate_format
 from untaped_orchestration.cli.output import CommandResult, emit_encoded, encode_result
 
 
@@ -20,10 +20,13 @@ def register(app: App) -> None:
         /,
         *,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
+        if columns:
+            sys.stderr.write("error: id new does not accept --columns/-c\n")
+            raise SystemExit(2)
         try:
             fmt = validate_format(format, allowed=("table", "json", "raw"))
         except ValueError as error:

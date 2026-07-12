@@ -78,6 +78,36 @@ def test_id_new_requires_no_store_and_rejects_non_id_kind(capsys) -> None:
 @pytest.mark.parametrize(
     "argv",
     (
+        ("list", "--limit", "0"),
+        ("show", "not-an-id", "--format", "json"),
+        ("show", TASK_ID, "--raw", "--format", "table"),
+    ),
+)
+def test_cli_validation_precedes_store_resolution_and_exits_two(
+    argv: tuple[str, ...], capsys
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        app(argv, exit_on_error=False)
+    assert raised.value.code == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "no .untaped/orchestration" not in captured.err
+
+
+def test_id_new_raw_rejects_columns(capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        app(
+            ("id", "new", "task", "--format", "raw", "--columns", "kind"),
+            exit_on_error=False,
+        )
+    assert raised.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
         ("task", "update", TASK_ID, "--title", "x", "--if-revision", REVISION, "--force-current"),
         ("task", "review", TASK_ID),
         ("decision", "update", DECISION_ID, "--title", "x"),

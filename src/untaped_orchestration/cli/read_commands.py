@@ -21,7 +21,13 @@ from untaped_orchestration.application.query_models import (
     TraceRequest,
 )
 from untaped_orchestration.cli.context import CliContext
-from untaped_orchestration.cli.options import DEFAULT_LIMIT, OutputFormat, validate_limit
+from untaped_orchestration.cli.options import (
+    DEFAULT_LIMIT,
+    ColumnsOption,
+    OutputFormat,
+    usage_value,
+    validate_limit,
+)
 from untaped_orchestration.cli.output import CommandResult, run_command
 from untaped_orchestration.domain.graph import DecisionState
 from untaped_orchestration.domain.ids import DecisionId, TaskId
@@ -29,7 +35,11 @@ from untaped_orchestration.domain.models import ItemKind, TaskOutcome, TaskStage
 
 
 def _item_id(value: str) -> TaskId | DecisionId:
-    return TaskId(value) if value.startswith("tsk_") else DecisionId(value)
+    return usage_value(lambda: TaskId(value) if value.startswith("tsk_") else DecisionId(value))
+
+
+def _limit(value: int) -> int:
+    return usage_value(lambda: validate_limit(value))
 
 
 def _result[T](
@@ -55,7 +65,7 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -81,7 +91,7 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         limit: int = DEFAULT_LIMIT,
         debug: bool = False,
     ) -> None:
@@ -93,7 +103,7 @@ def register(app: App) -> None:  # noqa: C901
             tag,
             waiting_on,
             local,
-            validate_limit(limit),
+            _limit(limit),
         )
         run_command(
             "list",
@@ -122,35 +132,42 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat | None = None,
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
-        context = CliContext.resolve(store)
         if raw:
             if columns:
                 raise SystemExit(2)
             selected = "raw" if format is None else format
+
+            def raw_action() -> CommandResult:
+                request = RawShowRequest(_item_id(item_id))
+                return _result("show", CliContext.resolve(store).queries().show_raw(request))
+
             run_command(
                 "show",
-                lambda: _result(
-                    "show", context.queries().show_raw(RawShowRequest(_item_id(item_id)))
-                ),
+                raw_action,
                 fmt=selected,
                 allowed=("raw", "json"),
                 binary_recovery=True,
             )
             return
         selected = "table" if format is None else format
-        run_command(
-            "show",
-            lambda: _result(
+
+        def parsed_action() -> CommandResult:
+            request = ShowRequest(_item_id(item_id), local)
+            return _result(
                 "show",
-                context.queries().show(ShowRequest(_item_id(item_id), local)),
+                CliContext.resolve(store).queries().show(request),
                 kind=(
                     "orchestration.task" if item_id.startswith("tsk_") else "orchestration.decision"
                 ),
-            ),
+            )
+
+        run_command(
+            "show",
+            parsed_action,
             fmt=selected,
             allowed=("table", "json", "pipe", "raw"),
             columns=columns,
@@ -164,17 +181,20 @@ def register(app: App) -> None:  # noqa: C901
         raw: bool,
         store: str | None = None,
         format: OutputFormat | None = None,
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
         if not raw or columns:
             raise SystemExit(2)
-        context = CliContext.resolve(store)
         selected = "raw" if format is None else format
         run_command(
             "inspect",
-            lambda: CommandResult("inspect", context.repository.read_raw(context.location, path)),
+            lambda: (
+                lambda context: CommandResult(
+                    "inspect", context.repository.read_raw(context.location, path)
+                )
+            )(CliContext.resolve(store)),
             fmt=selected,
             allowed=("raw", "json"),
             binary_recovery=True,
@@ -188,12 +208,12 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         limit: int = DEFAULT_LIMIT,
         debug: bool = False,
     ) -> None:
         del debug
-        request = SearchRequest(query, local, False, validate_limit(limit))
+        request = SearchRequest(query, local, False, _limit(limit))
         run_command(
             "search",
             lambda: _result(
@@ -215,12 +235,12 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         limit: int = DEFAULT_LIMIT,
         debug: bool = False,
     ) -> None:
         del debug
-        request = TraceRequest(_item_id(item_id), direction, local, validate_limit(limit))
+        request = TraceRequest(_item_id(item_id), direction, local, _limit(limit))
         run_command(
             "trace",
             lambda: _result("trace", CliContext.resolve(store).queries().trace(request)),
@@ -235,12 +255,12 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         limit: int = DEFAULT_LIMIT,
         debug: bool = False,
     ) -> None:
         del debug
-        request = NextRequest(local, validate_limit(limit))
+        request = NextRequest(local, _limit(limit))
         run_command(
             "next",
             lambda: _result(
@@ -262,7 +282,7 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         limit: int = DEFAULT_LIMIT,
         debug: bool = False,
     ) -> None:
@@ -271,9 +291,7 @@ def register(app: App) -> None:  # noqa: C901
             "curate next",
             lambda: CommandResult(
                 "curate next",
-                CliContext.resolve(store)
-                .curation()
-                .next(CurateNextRequest(local, validate_limit(limit))),
+                CliContext.resolve(store).curation().next(CurateNextRequest(local, _limit(limit))),
             ),
             fmt=format,
             allowed=("table", "json", "pipe", "raw"),
@@ -291,12 +309,12 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         limit: int = DEFAULT_LIMIT,
         debug: bool = False,
     ) -> None:
         del debug
-        request = HistoryListRequest(outcome, tag, local, validate_limit(limit))
+        request = HistoryListRequest(outcome, tag, local, _limit(limit))
         run_command(
             "history list",
             lambda: _result(
@@ -317,12 +335,12 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         limit: int = DEFAULT_LIMIT,
         debug: bool = False,
     ) -> None:
         del debug
-        request = HistorySearchRequest(query, local, validate_limit(limit))
+        request = HistorySearchRequest(query, local, _limit(limit))
         run_command(
             "history search",
             lambda: _result(
@@ -343,7 +361,7 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -353,7 +371,7 @@ def register(app: App) -> None:  # noqa: C901
                 "history show",
                 CliContext.resolve(store)
                 .queries()
-                .history_show(HistoryShowRequest(TaskId(item_id), local)),
+                .history_show(HistoryShowRequest(usage_value(lambda: TaskId(item_id)), local)),
                 kind="orchestration.task",
             ),
             fmt=format,

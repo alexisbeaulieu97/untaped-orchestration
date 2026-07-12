@@ -209,17 +209,23 @@ def _table_bytes(result: CommandResult, columns: tuple[str, ...]) -> bytes:
 
 def _raw_bytes(result: CommandResult, columns: tuple[str, ...]) -> bytes:
     rows = _rows(result.data)
+    if rows == [{}]:
+        return b""
     lines = []
     for row in rows:
         first = "id" if "id" in row else next(iter(row), "value")
         selected = (first, *columns) if columns else (first,)
-        lines.append("\t".join(str(_lookup(row, name) or "") for name in selected))
+        values = (_lookup(row, name) for name in selected)
+        lines.append("\t".join("" if value is None else str(value) for value in values))
     return (("\n".join(lines) + "\n") if lines else "").encode()
 
 
 def _pipe_bytes(result: CommandResult) -> bytes:
     encoded = []
-    for row in _rows(result.data):
+    rows = _rows(result.data)
+    if rows == [{}]:
+        rows = []
+    for row in rows:
         row_kind = row.get("kind")
         kind = result.pipe_kind
         if kind is None and row_kind in {"task", "decision"}:
@@ -230,6 +236,37 @@ def _pipe_bytes(result: CommandResult) -> bytes:
             (
                 json.dumps(
                     {"untaped": "1", "kind": kind, "record": row},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+        )
+    diagnostics = list(result.diagnostics)
+    if not result.complete and not diagnostics:
+        diagnostics.append(
+            Diagnostic(
+                code="ORC005",
+                severity="warning",
+                path="",
+                field="",
+                message="command result is incomplete",
+                hint="Inspect federation state before relying on omitted data.",
+            )
+        )
+    for diagnostic in diagnostics:
+        record = _value(diagnostic)
+        assert isinstance(record, dict)
+        record["complete"] = result.complete
+        record["truncated"] = result.truncated
+        encoded.append(
+            (
+                json.dumps(
+                    {
+                        "untaped": "1",
+                        "kind": "orchestration.diagnostic",
+                        "record": record,
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )

@@ -6,7 +6,7 @@ from cyclopts import App
 
 from untaped_orchestration.application.item_support import EvidenceRequest, LinkRequest
 from untaped_orchestration.cli.context import CliContext
-from untaped_orchestration.cli.options import OutputFormat
+from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, usage_value
 from untaped_orchestration.cli.output import CommandResult, run_command
 from untaped_orchestration.domain.evidence import EvidenceReference, EvidenceRelation
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
@@ -14,7 +14,11 @@ from untaped_orchestration.domain.models import LinkRelation, Revision
 
 
 def _item(value: str) -> TaskId | DecisionId:
-    return TaskId(value) if value.startswith("tsk_") else DecisionId(value)
+    return usage_value(lambda: TaskId(value) if value.startswith("tsk_") else DecisionId(value))
+
+
+def _revision(value: str | None) -> Revision | None:
+    return None if value is None else usage_value(lambda: Revision(value))
 
 
 def _guard(value: str | None, force: bool) -> None:
@@ -39,7 +43,7 @@ def register(app: App) -> None:
             force_current: bool = False,
             store: str | None = None,
             format: OutputFormat = "table",
-            columns: tuple[str, ...] = (),
+            columns: ColumnsOption = (),
             debug: bool = False,
         ) -> None:
             del debug
@@ -53,9 +57,9 @@ def register(app: App) -> None:
                     LinkRequest(
                         _item(source),
                         relation,
-                        StoreId(target_store),
+                        usage_value(lambda: StoreId(target_store)),
                         _item(target),
-                        None if if_revision is None else Revision(if_revision),
+                        _revision(if_revision),
                         force_current,
                     ),
                 )
@@ -87,7 +91,7 @@ def register(app: App) -> None:
             force_current: bool = False,
             store: str | None = None,
             format: OutputFormat = "table",
-            columns: tuple[str, ...] = (),
+            columns: ColumnsOption = (),
             debug: bool = False,
         ) -> None:
             del debug
@@ -101,8 +105,8 @@ def register(app: App) -> None:
                     EvidenceRequest(
                         _item(item_id),
                         relation,
-                        EvidenceReference(reference),
-                        None if if_revision is None else Revision(if_revision),
+                        usage_value(lambda: EvidenceReference(reference)),
+                        _revision(if_revision),
                         force_current,
                     ),
                 )

@@ -17,9 +17,9 @@ from untaped_orchestration.application.repair_operations import (
 )
 from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.cli.context import CliContext
-from untaped_orchestration.cli.options import OutputFormat
+from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, usage_value
 from untaped_orchestration.cli.output import CommandResult, run_command
-from untaped_orchestration.domain.ids import TaskId
+from untaped_orchestration.domain.ids import DecisionId, TaskId
 from untaped_orchestration.domain.models import Revision
 from untaped_orchestration.domain.time import CalendarDate
 from untaped_orchestration.infrastructure.locking import FileLockManager
@@ -28,7 +28,19 @@ from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
 
 
 def _revision(value: str | None) -> Revision | None:
-    return None if value is None else Revision(value)
+    return None if value is None else _required_revision(value)
+
+
+def _required_revision(value: str) -> Revision:
+    return usage_value(lambda: Revision(value))
+
+
+def _task_id(value: str) -> TaskId:
+    return usage_value(lambda: TaskId(value))
+
+
+def _item_id(value: str) -> TaskId | DecisionId:
+    return usage_value(lambda: TaskId(value) if value.startswith("tsk_") else DecisionId(value))
 
 
 def _guard(value: str | None, force_current: bool) -> tuple[Revision | None, bool]:
@@ -49,7 +61,7 @@ def register(app: App) -> None:  # noqa: C901
         public: bool = False,
         decisions_only: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -73,7 +85,7 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -102,7 +114,7 @@ def register(app: App) -> None:  # noqa: C901
         store: str | None = None,
         local: bool = False,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -130,7 +142,7 @@ def register(app: App) -> None:  # noqa: C901
         write: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -162,7 +174,7 @@ def register(app: App) -> None:  # noqa: C901
         apply: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -181,7 +193,7 @@ def register(app: App) -> None:  # noqa: C901
                     context.location,
                     path,
                     frontmatter_file,
-                    Revision(if_revision),
+                    _required_revision(if_revision),
                     body_file,
                     apply,
                 )
@@ -206,7 +218,7 @@ def register(app: App) -> None:  # noqa: C901
         apply: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -215,9 +227,9 @@ def register(app: App) -> None:  # noqa: C901
             context = CliContext.resolve(store)
             result = context.tasks().repair_duplicate(
                 RepairDuplicateRequest(
-                    TaskId(item_id),
-                    Revision(if_active_revision),
-                    Revision(if_archive_revision),
+                    _task_id(item_id),
+                    _required_revision(if_active_revision),
+                    _required_revision(if_archive_revision),
                     apply,
                 )
             )
@@ -242,7 +254,7 @@ def register(app: App) -> None:  # noqa: C901
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -250,13 +262,7 @@ def register(app: App) -> None:  # noqa: C901
 
         def action() -> CommandResult:
             context = CliContext.resolve(store)
-            typed = (
-                TaskId(item_id)
-                if item_id.startswith("tsk_")
-                else __import__(
-                    "untaped_orchestration.domain.ids", fromlist=["DecisionId"]
-                ).DecisionId(item_id)
-            )
+            typed = _item_id(item_id)
             result = context.curation().acknowledge(
                 AcknowledgeRequest(typed, _revision(if_revision), force_current)
             )
@@ -280,7 +286,7 @@ def register(app: App) -> None:  # noqa: C901
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -288,17 +294,11 @@ def register(app: App) -> None:  # noqa: C901
 
         def action() -> CommandResult:
             context = CliContext.resolve(store)
-            typed = (
-                TaskId(item_id)
-                if item_id.startswith("tsk_")
-                else __import__(
-                    "untaped_orchestration.domain.ids", fromlist=["DecisionId"]
-                ).DecisionId(item_id)
-            )
+            typed = _item_id(item_id)
             result = context.curation().snooze(
                 SnoozeRequest(
                     typed,
-                    CalendarDate(until),
+                    usage_value(lambda: CalendarDate(until)),
                     _revision(if_revision),
                     force_current,
                 )
@@ -324,7 +324,7 @@ def register(app: App) -> None:  # noqa: C901
         apply: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug

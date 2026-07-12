@@ -12,7 +12,12 @@ from untaped_orchestration.application.tasks import (
     TransitionTaskRequest,
 )
 from untaped_orchestration.cli.context import CliContext
-from untaped_orchestration.cli.options import OutputFormat
+from untaped_orchestration.cli.options import (
+    ColumnsOption,
+    OutputFormat,
+    read_body_file,
+    usage_value,
+)
 from untaped_orchestration.cli.output import CommandResult, run_command
 from untaped_orchestration.domain.ids import Slug, TaskId
 from untaped_orchestration.domain.models import Revision, TaskOutcome, TaskPriority, TaskStage
@@ -20,15 +25,27 @@ from untaped_orchestration.domain.ordering import PlacementAnchor, PlacementAnch
 
 
 def _body(path: Path | None) -> bytes:
-    return b"" if path is None else path.read_bytes()
+    return b"" if path is None else read_body_file(path)
 
 
 def _parent(value: str) -> TaskId | None:
-    return None if value == "none" else TaskId(value)
+    return None if value == "none" else _task_id(value)
 
 
 def _revision(value: str | None) -> Revision | None:
-    return None if value is None else Revision(value)
+    return None if value is None else _required_revision(value)
+
+
+def _required_revision(value: str) -> Revision:
+    return usage_value(lambda: Revision(value))
+
+
+def _task_id(value: str) -> TaskId:
+    return usage_value(lambda: TaskId(value))
+
+
+def _slug(value: str) -> Slug:
+    return usage_value(lambda: Slug(value))
 
 
 def _guard(value: str | None, force: bool) -> None:
@@ -82,7 +99,7 @@ def register(app: App) -> None:  # noqa: C901
         if_store_revision: str,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -92,13 +109,13 @@ def register(app: App) -> None:  # noqa: C901
             result = context.create_task().execute(
                 context.scope,
                 CreateTaskRequest(
-                    TaskId(id),
+                    _task_id(id),
                     title,
                     _body(body_file),
-                    tuple(Slug(value) for value in tag),
+                    tuple(_slug(value) for value in tag),
                     priority,
-                    tuple(Slug(value) for value in waiting_on),
-                    Revision(if_store_revision),
+                    tuple(_slug(value) for value in waiting_on),
+                    _required_revision(if_store_revision),
                 ),
             )
             return CommandResult("task create", result)
@@ -121,7 +138,7 @@ def register(app: App) -> None:  # noqa: C901
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -134,7 +151,7 @@ def register(app: App) -> None:  # noqa: C901
             result = context.update_task().execute(
                 context.scope,
                 UpdateTaskRequest(
-                    TaskId(item_id),
+                    _task_id(item_id),
                     _revision(if_revision),
                     force_current,
                     title,
@@ -142,11 +159,11 @@ def register(app: App) -> None:  # noqa: C901
                     priority,
                     ()
                     if clear_tags
-                    else (None if tag is None else tuple(Slug(value) for value in tag)),
+                    else (None if tag is None else tuple(_slug(value) for value in tag)),
                     ()
                     if clear_waiting_on
                     else (
-                        None if waiting_on is None else tuple(Slug(value) for value in waiting_on)
+                        None if waiting_on is None else tuple(_slug(value) for value in waiting_on)
                     ),
                 ),
             )
@@ -194,7 +211,7 @@ def register(app: App) -> None:  # noqa: C901
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -204,7 +221,7 @@ def register(app: App) -> None:  # noqa: C901
         placement_command(
             "task transition",
             TransitionTaskRequest(
-                TaskId(item_id),
+                _task_id(item_id),
                 to,
                 _parent(if_parent),
                 _revision(if_revision),
@@ -212,8 +229,8 @@ def register(app: App) -> None:  # noqa: C901
                 _placement(
                     first,
                     last,
-                    None if before is None else TaskId(before),
-                    None if after is None else TaskId(after),
+                    None if before is None else _task_id(before),
+                    None if after is None else _task_id(after),
                 ),
                 revisit_when,
                 _revision(if_anchor_revision),
@@ -241,7 +258,7 @@ def register(app: App) -> None:  # noqa: C901
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -251,7 +268,7 @@ def register(app: App) -> None:  # noqa: C901
         placement_command(
             "task move",
             MoveTaskRequest(
-                TaskId(item_id),
+                _task_id(item_id),
                 _parent(parent),
                 _parent(if_parent),
                 _revision(if_revision),
@@ -259,8 +276,8 @@ def register(app: App) -> None:  # noqa: C901
                 _placement(
                     first,
                     last,
-                    None if before is None else TaskId(before),
-                    None if after is None else TaskId(after),
+                    None if before is None else _task_id(before),
+                    None if after is None else _task_id(after),
                 ),
                 _revision(if_anchor_revision),
                 force_current,
@@ -279,7 +296,7 @@ def register(app: App) -> None:  # noqa: C901
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -290,7 +307,9 @@ def register(app: App) -> None:  # noqa: C901
                 "task review",
                 CliContext.resolve(store)
                 .tasks()
-                .review(AcknowledgeRequest(TaskId(item_id), _revision(if_revision), force_current)),
+                .review(
+                    AcknowledgeRequest(_task_id(item_id), _revision(if_revision), force_current)
+                ),
             ),
             fmt=format,
             allowed=("table", "json"),
@@ -311,7 +330,7 @@ def register(app: App) -> None:  # noqa: C901
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -333,12 +352,12 @@ def register(app: App) -> None:  # noqa: C901
                 .tasks()
                 .close(
                     CloseTaskRequest(
-                        TaskId(item_id),
+                        _task_id(item_id),
                         outcome,
                         note,
                         _revision(if_revision),
                         _revision(if_store_revision),
-                        None if successor is None else TaskId(successor),
+                        None if successor is None else _task_id(successor),
                         _revision(if_successor_revision),
                         force_current,
                     )

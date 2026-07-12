@@ -98,6 +98,63 @@ def test_curation_rows_project_stable_id_and_dynamic_pipe_kind() -> None:
     assert json.loads(pipe.stdout)["kind"] == "orchestration.task"
 
 
+def test_pipe_emits_data_and_diagnostic_records_for_partial_results() -> None:
+    diagnostic = Diagnostic(
+        code="ORC005",
+        severity="warning",
+        path="registry.toml",
+        field="children",
+        message="child missing",
+        hint="restore child",
+    )
+    encoded = encode_result(
+        CommandResult(
+            "list",
+            [{"id": TASK_ID, "kind": "task"}],
+            complete=False,
+            diagnostics=(diagnostic,),
+        ),
+        fmt="pipe",
+    )
+    records = [json.loads(line) for line in encoded.stdout.splitlines()]
+    assert [record["kind"] for record in records] == [
+        "orchestration.task",
+        "orchestration.diagnostic",
+    ]
+    assert records[1]["record"]["code"] == "ORC005"
+    assert records[1]["record"]["complete"] is False
+    assert (
+        encoded.stdout
+        == (
+            f'{{"untaped":"1","kind":"orchestration.task","record":{{"id":"{TASK_ID}","kind":"task"}}}}\n'
+            '{"untaped":"1","kind":"orchestration.diagnostic","record":'
+            '{"code":"ORC005","severity":"warning","path":"registry.toml",'
+            '"field":"children","message":"child missing","hint":"restore child",'
+            '"complete":false,"truncated":false}}\n'
+        ).encode()
+    )
+
+
+def test_pipe_expected_failure_is_diagnostic_only_without_traceback(capfd) -> None:
+    def fail() -> CommandResult:
+        raise ValueError("invalid canonical state")
+
+    with pytest.raises(SystemExit) as raised:
+        run_command("list", fail, fmt="pipe", allowed=("pipe",))
+    assert raised.value.code == 1
+    captured = capfd.readouterr()
+    records = [json.loads(line) for line in captured.out.splitlines()]
+    assert [record["kind"] for record in records] == ["orchestration.diagnostic"]
+    assert "Traceback" not in captured.err
+    assert captured.out == (
+        '{"untaped":"1","kind":"orchestration.diagnostic","record":'
+        '{"code":"ORC002","severity":"error","path":"","field":"",'
+        '"message":"invalid canonical state",'
+        '"hint":"Correct the reported condition and retry.",'
+        '"complete":false,"truncated":false}}\n'
+    )
+
+
 def test_binary_and_json_recovery_preserve_invalid_utf8_exactly() -> None:
     content = b"body\xff"
     raw = RawRecord(PurePosixPath(f"tasks/{TASK_ID}-broken.md"), REVISION, len(content), content)
@@ -189,6 +246,33 @@ def test_table_failure_emits_no_data_and_diagnostic_on_stderr(capfd) -> None:
     captured = capfd.readouterr()
     assert captured.out == ""
     assert "invalid canonical state" in captured.err
+
+
+def test_binary_recovery_failure_writes_zero_stdout_bytes(capfd) -> None:
+    def fail() -> CommandResult:
+        raise ValueError("raw file is ambiguous")
+
+    with pytest.raises(SystemExit) as raised:
+        run_command(
+            "show",
+            fail,
+            fmt="raw",
+            allowed=("raw", "json"),
+            binary_recovery=True,
+        )
+    assert raised.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "raw file is ambiguous" in captured.err
+
+
+def test_raw_projection_preserves_falsey_values() -> None:
+    encoded = encode_result(
+        CommandResult("list", [{"id": TASK_ID, "rank": 0, "blocked": False}]),
+        fmt="raw",
+        columns=("rank", "blocked"),
+    )
+    assert encoded.stdout == f"{TASK_ID}\t0\tFalse\n".encode()
 
 
 def test_unexpected_trace_is_emitted_only_with_debug(monkeypatch, capfd) -> None:

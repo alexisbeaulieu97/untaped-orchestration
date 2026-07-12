@@ -14,18 +14,35 @@ from untaped_orchestration.application.item_support import (
     UpdateDecisionRequest,
 )
 from untaped_orchestration.cli.context import CliContext
-from untaped_orchestration.cli.options import OutputFormat
+from untaped_orchestration.cli.options import (
+    ColumnsOption,
+    OutputFormat,
+    read_body_file,
+    usage_value,
+)
 from untaped_orchestration.cli.output import CommandResult, run_command
 from untaped_orchestration.domain.ids import DecisionId, Slug
 from untaped_orchestration.domain.models import Revision
 
 
 def _body(path: Path | None) -> bytes:
-    return b"" if path is None else path.read_bytes()
+    return b"" if path is None else read_body_file(path)
 
 
 def _revision(value: str | None) -> Revision | None:
-    return None if value is None else Revision(value)
+    return None if value is None else _required_revision(value)
+
+
+def _required_revision(value: str) -> Revision:
+    return usage_value(lambda: Revision(value))
+
+
+def _decision_id(value: str) -> DecisionId:
+    return usage_value(lambda: DecisionId(value))
+
+
+def _slug(value: str) -> Slug:
+    return usage_value(lambda: Slug(value))
 
 
 def _guard(value: str | None, force: bool) -> None:
@@ -47,7 +64,7 @@ def _predecessors(
         item, separator, revision = value.partition("=")
         if not separator:
             raise SystemExit(2)
-        parsed[DecisionId(item)] = Revision(revision)
+        parsed[_decision_id(item)] = _required_revision(revision)
     if set(parsed) != set(ids) or len(ids) != len(set(ids)):
         raise SystemExit(2)
     return tuple(DecisionGuard(item_id, parsed[item_id]) for item_id in ids)
@@ -67,7 +84,7 @@ def register(app: App) -> None:
         if_store_revision: str,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -77,11 +94,11 @@ def register(app: App) -> None:
             result = context.create_decision().execute(
                 context.scope,
                 CreateDecisionRequest(
-                    DecisionId(id),
+                    _decision_id(id),
                     title,
                     _body(body_file),
-                    tuple(Slug(value) for value in tag),
-                    Revision(if_store_revision),
+                    tuple(_slug(value) for value in tag),
+                    _required_revision(if_store_revision),
                 ),
             )
             return CommandResult("decision create", result)
@@ -107,7 +124,7 @@ def register(app: App) -> None:
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -120,14 +137,14 @@ def register(app: App) -> None:
             result = context.update_decision().execute(
                 context.scope,
                 UpdateDecisionRequest(
-                    DecisionId(item_id),
+                    _decision_id(item_id),
                     _revision(if_revision),
                     force_current,
                     title,
                     None if body_file is None else _body(body_file),
                     ()
                     if clear_tags
-                    else (None if tag is None else tuple(Slug(value) for value in tag)),
+                    else (None if tag is None else tuple(_slug(value) for value in tag)),
                 ),
             )
             return CommandResult("decision update", result)
@@ -153,13 +170,13 @@ def register(app: App) -> None:
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
         _guard(if_store_revision, force_current)
         guards = _predecessors(
-            tuple(DecisionId(value) for value in predecessor),
+            tuple(_decision_id(value) for value in predecessor),
             if_predecessor_revision,
             force_current,
         )
@@ -168,10 +185,10 @@ def register(app: App) -> None:
             context = CliContext.resolve(store)
             result = context.decisions().supersede(
                 SupersedeDecisionRequest(
-                    DecisionId(id),
+                    _decision_id(id),
                     title,
                     _body(body_file),
-                    tuple(Slug(value) for value in tag),
+                    tuple(_slug(value) for value in tag),
                     guards,
                     _revision(if_store_revision),
                     force_current,
@@ -198,7 +215,7 @@ def register(app: App) -> None:
         force_current: bool = False,
         store: str | None = None,
         format: OutputFormat = "table",
-        columns: tuple[str, ...] = (),
+        columns: ColumnsOption = (),
         debug: bool = False,
     ) -> None:
         del debug
@@ -212,7 +229,7 @@ def register(app: App) -> None:
                 .decisions()
                 .retire(
                     RetireDecisionRequest(
-                        DecisionId(item_id),
+                        _decision_id(item_id),
                         note,
                         _revision(if_revision),
                         _revision(if_store_revision),
