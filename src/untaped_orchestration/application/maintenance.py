@@ -417,15 +417,15 @@ class RecursiveMaintenanceService:
     def _child_views_current(self, store: StoreSnapshot) -> bool:
         if store.store is None:
             return False
-        paths = self._views.managed_paths()
-        if not store.store.capabilities.active_tasks:
-            paths = tuple(path for path in paths if path.name == "decisions.md")
-        marker = f"Store revision: `{store.store_revision.root}`".encode()
         try:
-            return all(
-                marker in self._reader.read_file(store.location, path).content for path in paths
+            _, managed = view_comparisons(
+                self._reader,
+                store.location,
+                self._views,
+                store,
             )
-        except FileNotFoundError, OSError, ValueError:
+            return all(managed.values())
+        except OSError, ValueError:
             return False
 
     @staticmethod

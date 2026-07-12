@@ -48,6 +48,16 @@ class RecordingViews(MarkdownViewRenderer):
         return super().expected(snapshot)
 
 
+class FailingChildViews(MarkdownViewRenderer):
+    def __init__(self, child: Path) -> None:
+        self.child = child.resolve()
+
+    def expected(self, snapshot):
+        if snapshot.location.real_root == self.child:
+            raise ValueError("child renderer failed")
+        return super().expected(snapshot)
+
+
 def _service(views=None):
     repository = FilesystemStoreRepository()
     locks = FileLockManager()
@@ -121,7 +131,7 @@ def test_recursive_check_only_evaluates_selected_views_and_never_writes_child(
 
     _service(views).check(RecursiveCheckRequest(location_from_root(parent)))
 
-    assert set(views.locations) == {parent.resolve()}
+    assert set(views.locations) == {parent.resolve(), child.resolve()}
     assert before == _durable_files(child)
 
 
@@ -189,4 +199,74 @@ def test_recursive_check_reads_child_view_revision_without_rendering_child(tmp_p
 
     child_check = next(value for value in result.checks if value.store_id == CHILD_STORE_ID)
     assert not child_check.views_current
-    assert child.resolve() not in views.locations
+    assert child.resolve() in views.locations
+
+
+@pytest.mark.integration
+def test_recursive_check_compares_every_child_view_byte_for_byte_without_writing(
+    tmp_path: Path,
+) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    _registry(parent, child)
+    _render_local(parent)
+    _render_local(child)
+    exact = _durable_files(child)
+
+    current = _service().check(RecursiveCheckRequest(location_from_root(parent)))
+    child_current = next(value for value in current.checks if value.store_id == CHILD_STORE_ID)
+    assert child_current.views_current
+    assert exact == _durable_files(child)
+
+    path = child / "views" / "roadmap.md"
+    marker = f"Store revision: `{child_current.store_revision.root}`".encode()
+    path.write_bytes(b"garbage\n" + marker + b"\n")
+    before = _durable_files(child)
+
+    stale = _service().check(RecursiveCheckRequest(location_from_root(parent)))
+
+    child_stale = next(value for value in stale.checks if value.store_id == CHILD_STORE_ID)
+    assert not child_stale.views_current
+    assert any(
+        value.code == "ORC008" and value.path == (child / "views").as_posix()
+        for value in child_stale.diagnostics
+    )
+    assert before == _durable_files(child)
+
+
+@pytest.mark.integration
+def test_recursive_check_uses_decision_only_child_applicability_and_reports_renderer_failure(
+    tmp_path: Path,
+) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    _registry(parent, child)
+    repository = FilesystemStoreRepository()
+    child_location = location_from_root(child)
+    snapshot = repository.load_local(child_location, headers_only=False)
+    assert snapshot.store is not None
+    decision_only = snapshot.store.model_copy(
+        update={
+            "capabilities": snapshot.store.capabilities.model_copy(update={"active_tasks": False})
+        }
+    )
+    child.joinpath("store.toml").write_bytes(repository.store_bytes(decision_only))
+    _render_local(parent)
+    _render_local(child)
+    assert tuple(path.name for path in child.joinpath("views").iterdir()) == ("decisions.md",)
+
+    applicable = _service().check(RecursiveCheckRequest(location_from_root(parent)))
+    child_check = next(value for value in applicable.checks if value.store_id == CHILD_STORE_ID)
+    assert child_check.views_current
+
+    before = _durable_files(child)
+    failed = _service(FailingChildViews(child)).check(
+        RecursiveCheckRequest(location_from_root(parent))
+    )
+    failed_child = next(value for value in failed.checks if value.store_id == CHILD_STORE_ID)
+    assert not failed_child.views_current
+    assert any(
+        value.code == "ORC008" and value.path == (child / "views").as_posix()
+        for value in failed_child.diagnostics
+    )
+    assert before == _durable_files(child)

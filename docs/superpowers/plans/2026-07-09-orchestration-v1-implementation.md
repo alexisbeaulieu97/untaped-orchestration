@@ -975,7 +975,10 @@ loader.
 Extend maintenance with default recursive `check`, `check --local`, warning-only
 missing children, `--require-children` promotion, all invalid children in one
 report, recursive read-only `fmt --check`, local-only `fmt --write`, and
-always-local render. Prove recursive check never renders or writes a child.
+always-local render. Recursive check may render expected child view bytes purely
+in memory for byte-exact comparison, but it never writes or reconciles child
+views; `render --write` remains selected-local. Prove recursive check never
+writes a child.
 
 For queries, pin deterministic list filters including `--waiting-on`, parsed
 show/history-show recursive defaults plus `--local`, selected-store-only raw

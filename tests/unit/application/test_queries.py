@@ -271,6 +271,44 @@ def test_next_reports_mutation_context_without_loading_bodies() -> None:
     assert reader.reads == []
 
 
+def test_next_uses_stable_priority_rank_and_due_projection_without_loading_bodies() -> None:
+    scope, reader = _scope()
+    selected = scope.local().selected
+    records = tuple(
+        record.__class__(
+            record.path,
+            record.revision,
+            record.metadata.model_copy(update={"waiting_on": ()})
+            if isinstance(record.metadata, ActiveTask)
+            else record.metadata,
+            None,
+        )
+        for record in selected.records
+    )
+    selected = selected.__class__(
+        selected.location,
+        selected.store,
+        selected.registry,
+        records,
+        (),
+        (),
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    federation = FederatedSnapshot(selected, (selected,), Completeness())
+
+    result = QueryService(QueryScope(lambda: federation, lambda: federation), reader, Clock()).next(
+        NextRequest()
+    )
+
+    assert len(result.data) == 1
+    assert result.data[0].row.priority.value == "high"
+    assert result.data[0].row.rank == 1000
+    assert result.data[0].row.due_on.root == "2026-07-08"
+    assert reader.reads == []
+
+
 def test_invalid_canonical_store_makes_partial_reads_incomplete_and_readiness_fail_closed() -> None:
     scope, reader = _scope()
     selected = scope.local().selected

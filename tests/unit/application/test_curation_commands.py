@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -26,10 +26,12 @@ from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
     IncompleteStore,
+    LoadedRecord,
+    StoreLocation,
 )
 from untaped_orchestration.domain.diagnostics import Diagnostic
-from untaped_orchestration.domain.ids import DecisionId, StoreId
-from untaped_orchestration.domain.models import Decision
+from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
+from untaped_orchestration.domain.models import ActiveTask, Decision
 from untaped_orchestration.domain.time import CalendarDate
 
 
@@ -202,6 +204,156 @@ def test_recursive_curate_next_fails_closed_but_local_ignores_unrelated_child_fa
         service.next(CurateNextRequest())
     local = service.next(CurateNextRequest(local=True))
     assert [entry.item_id for entry in local] == [task.record.metadata.id]
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_code"),
+    [
+        ("canonical", "ORC001"),
+        ("duplicate", "ORC003"),
+        ("cycle", "ORC004"),
+        ("missing-parent", "ORC004"),
+    ],
+)
+def test_recursive_curate_next_rejects_complete_but_semantically_invalid_federation(
+    tmp_path: Path,
+    fault: str,
+    expected_code: str,
+) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    created = create(repository, location, scope, executor)
+    selected = repository.load_local(location, headers_only=False)
+    record = next(value for value in selected.records if isinstance(value.metadata, ActiveTask))
+    diagnostics = selected.load_diagnostics
+    records = selected.records
+    if fault == "canonical":
+        diagnostics = (
+            Diagnostic(
+                code="ORC001",
+                severity="error",
+                path=record.path.as_posix(),
+                field="",
+                message="canonical item is unreadable",
+                hint="repair the item",
+            ),
+        )
+    elif fault == "duplicate":
+        records = (
+            *records,
+            LoadedRecord(
+                PurePosixPath(f"tasks/{created.record.metadata.id.root}-duplicate.md"),
+                record.revision,
+                record.metadata,
+                record.body,
+            ),
+        )
+    elif fault == "cycle":
+        cyclic = record.metadata.model_copy(update={"parent": record.metadata.id})
+        records = tuple(
+            value.__class__(value.path, value.revision, cyclic, value.body)
+            if value is record
+            else value
+            for value in records
+        )
+    else:
+        missing_parent = TaskId("tsk_019f0000000070008000000000000099")
+        orphan = record.metadata.model_copy(update={"parent": missing_parent})
+        records = tuple(
+            value.__class__(value.path, value.revision, orphan, value.body)
+            if value is record
+            else value
+            for value in records
+        )
+    invalid = selected.__class__(
+        selected.location,
+        selected.store,
+        selected.registry,
+        records,
+        diagnostics,
+        selected.raw_index,
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    federation = FederatedSnapshot(invalid, (invalid,), Completeness())
+    recursive = MutationExecutionScope((location,), location, lambda: federation)
+    service = CurationService(
+        executor,
+        repository,
+        Clock(),
+        MutationScope(recursive, scope.selected_local),
+    )
+
+    with pytest.raises(InvalidMutationState) as failure:
+        service.next(CurateNextRequest())
+
+    assert expected_code in {value.code for value in failure.value.diagnostics}
+
+
+def test_local_curate_next_ignores_unrelated_child_error_but_rejects_selected_error(
+    tmp_path: Path,
+) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    create(repository, location, scope, executor)
+    selected = repository.load_local(location, headers_only=False)
+    child_id = StoreId("sto_019f0000000070008000000000000099")
+    assert selected.store is not None and selected.registry is not None
+    child_location = StoreLocation(Path("/child"), Path("/child"))
+    child_error = Diagnostic(
+        code="ORC009",
+        severity="error",
+        path="/child/store.toml",
+        field="visibility",
+        message="child policy is invalid",
+        hint="repair the child",
+    )
+    child = selected.__class__(
+        child_location,
+        selected.store.model_copy(update={"id": child_id}),
+        selected.registry.model_copy(update={"store_id": child_id}),
+        (),
+        (child_error,),
+        (),
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    federation = FederatedSnapshot(selected, (selected, child), Completeness())
+    recursive = MutationExecutionScope((location, child_location), location, lambda: federation)
+    service = CurationService(
+        executor,
+        repository,
+        Clock(),
+        MutationScope(recursive, scope.selected_local),
+    )
+
+    assert service.next(CurateNextRequest(local=True)) == ()
+    with pytest.raises(InvalidMutationState) as recursive_failure:
+        service.next(CurateNextRequest())
+    assert {value.code for value in recursive_failure.value.diagnostics} == {"ORC009"}
+
+    selected_error = selected.__class__(
+        selected.location,
+        selected.store,
+        selected.registry,
+        selected.records,
+        (child_error.model_copy(update={"path": "/selected/store.toml"}),),
+        selected.raw_index,
+        selected.store_revision,
+        selected.registry_revision,
+        selected.store_config_revision,
+    )
+    selected_federation = FederatedSnapshot(selected_error, (selected_error,), Completeness())
+    selected_local = MutationExecutionScope((location,), location, lambda: selected_federation)
+    selected_service = CurationService(
+        executor,
+        repository,
+        Clock(),
+        MutationScope(selected_local, selected_local),
+    )
+    with pytest.raises(InvalidMutationState) as local_failure:
+        selected_service.next(CurateNextRequest(local=True))
+    assert {value.code for value in local_failure.value.diagnostics} == {"ORC009"}
 
 
 def test_acknowledge_and_same_date_snooze_never_replay_stale_revision(tmp_path: Path) -> None:

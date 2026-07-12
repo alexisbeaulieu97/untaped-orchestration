@@ -21,8 +21,8 @@ from untaped_orchestration.application.mutations import (
     validate_selected_local,
 )
 from untaped_orchestration.application.ports import CanonicalFormatter, Clock, FileReplacement
-from untaped_orchestration.application.results import FederatedSnapshot
-from untaped_orchestration.application.validation import _graph_state
+from untaped_orchestration.application.results import Completeness, FederatedSnapshot
+from untaped_orchestration.application.validation import _graph_state, validate_snapshot
 from untaped_orchestration.domain.curation import (
     CurationEntry,
     StoreCurationContext,
@@ -66,9 +66,15 @@ class CurationService:
 
     def next(self, request: CurateNextRequest) -> tuple[CurationEntry, ...]:
         snapshot = (self._scope.selected_local if request.local else self._scope.recursive).load()
-        if not request.local and not snapshot.completeness.complete:
-            raise InvalidMutationState(snapshot.completeness.diagnostics)
-        stores = (snapshot.selected,) if request.local else snapshot.stores
+        scoped = (
+            FederatedSnapshot(snapshot.selected, (snapshot.selected,), Completeness())
+            if request.local
+            else snapshot
+        )
+        diagnostics = validate_snapshot(scoped, require_children=not request.local)
+        if any(value.severity == "error" for value in diagnostics):
+            raise InvalidMutationState(diagnostics)
+        stores = scoped.stores
         contexts = []
         for store in stores:
             if store.store is None:
@@ -76,13 +82,7 @@ class CurationService:
             contexts.append(
                 StoreCurationContext(store.store.id, store.store.timezone, store.store.curation)
             )
-        graph = _graph_state(
-            snapshot
-            if not request.local
-            else snapshot.__class__(
-                snapshot.selected, (snapshot.selected,), snapshot.completeness.__class__()
-            )
-        )
+        graph = _graph_state(scoped)
         return curation_queue(
             graph,
             now=UtcTimestamp.from_datetime(self._clock.now()),

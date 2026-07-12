@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-
 from untaped_orchestration.application.ports import Clock, StoreReader
 from untaped_orchestration.application.query_brief import assemble_brief
 from untaped_orchestration.application.query_models import (
@@ -41,27 +39,18 @@ from untaped_orchestration.application.query_projection import (
 from untaped_orchestration.application.query_search import stream_search
 from untaped_orchestration.application.query_trace import build_trace
 from untaped_orchestration.application.results import (
-    Completeness,
     FederatedSnapshot,
     LoadedRecord,
     RawRecord,
     StoreSnapshot,
 )
-from untaped_orchestration.application.validation import _graph_state, validate_snapshot
 from untaped_orchestration.domain.curation import StoreCurationContext, curation_queue
 from untaped_orchestration.domain.diagnostics import Diagnostic
-from untaped_orchestration.domain.graph import (
-    DecisionRef,
-    GraphState,
-    TaskRef,
-    decision_state,
-    readiness,
-)
-from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
+from untaped_orchestration.domain.graph import TaskRef, readiness
+from untaped_orchestration.domain.ids import DecisionId, TaskId
 from untaped_orchestration.domain.models import (
     ActiveTask,
     ArchivedTask,
-    Decision,
     LinkRelation,
     Revision,
     TaskOutcome,
@@ -88,65 +77,6 @@ def _selected(snapshot: FederatedSnapshot, local: bool) -> tuple[StoreSnapshot, 
     return (snapshot.selected,) if local else snapshot.stores
 
 
-def _store_revisions(snapshot: FederatedSnapshot, local: bool) -> tuple[tuple[str, Revision], ...]:
-    values = []
-    for store in _selected(snapshot, local):
-        if store.store is not None:
-            values.append((store.store.id.root, store.store_revision))
-    return tuple(sorted(values))
-
-
-def _validated_scope(snapshot: FederatedSnapshot, local: bool) -> FederatedSnapshot:
-    if not local:
-        return snapshot
-    return FederatedSnapshot(snapshot.selected, (snapshot.selected,), Completeness())
-
-
-def _query_diagnostics(snapshot: FederatedSnapshot, local: bool) -> tuple[Diagnostic, ...]:
-    return validate_snapshot(_validated_scope(snapshot, local), require_children=False)
-
-
-def _query_complete(snapshot: FederatedSnapshot, local: bool) -> bool:
-    diagnostics = _query_diagnostics(snapshot, local)
-    federation_complete = local or snapshot.completeness.complete
-    return federation_complete and not any(value.severity == "error" for value in diagnostics)
-
-
-def _active_records(
-    snapshot: FederatedSnapshot, local: bool
-) -> Iterable[tuple[StoreSnapshot, LoadedRecord]]:
-    for store in _selected(snapshot, local):
-        if store.store is None:
-            continue
-        for record in store.records:
-            if isinstance(record.metadata, (ActiveTask, Decision)):
-                yield store, record
-
-
-def _row(
-    store_id: StoreId,
-    record: LoadedRecord,
-    graph: GraphState | None = None,
-) -> ItemRow:
-    metadata = record.metadata
-    state = None
-    if isinstance(metadata, Decision) and graph is not None:
-        state = decision_state(DecisionRef(store_id, metadata.id), graph)
-    return ItemRow(
-        metadata.id,
-        metadata.kind,
-        metadata.title,
-        store_id,
-        record.path.as_posix(),
-        record.revision,
-        metadata.stage if isinstance(metadata, ActiveTask) else None,
-        state,
-        tuple(value.root for value in metadata.waiting_on)
-        if isinstance(metadata, (ActiveTask, ArchivedTask))
-        else (),
-    )
-
-
 def _find(
     snapshot: FederatedSnapshot,
     item_id: TaskId | DecisionId,
@@ -161,15 +91,6 @@ def _find(
     if len(matches) != 1:
         raise ValueError("item does not resolve uniquely")
     return matches[0]
-
-
-def _truncate_utf8(raw: bytes, limit: int) -> tuple[bytes, bool]:
-    if len(raw) <= limit:
-        return raw, False
-    end = limit
-    while end and raw[end : end + 1] and raw[end] & 0b1100_0000 == 0b1000_0000:
-        end -= 1
-    return raw[:end], True
 
 
 class QueryService:
@@ -299,12 +220,13 @@ class QueryService:
     def next(self, request: NextRequest) -> QueryResult[tuple[NextItem, ...]]:
         limit = _limit(request.limit)
         snapshot = self._load(request.local)
-        if not _query_complete(snapshot, request.local):
-            raise QueryIncompleteError(_query_diagnostics(snapshot, request.local))
-        graph = _graph_state(snapshot)
+        projection = self._project(snapshot, request.local)
+        if not projection.complete:
+            raise QueryIncompleteError(projection.diagnostics)
+        graph = projection.graph
         candidates = []
         by_key = {}
-        for store, record in _active_records(snapshot, request.local):
+        for store, record in active_records(projection):
             if isinstance(record.metadata, ActiveTask):
                 assert store.store is not None
                 key = (store.store.id, record.metadata.id)
@@ -314,7 +236,7 @@ class QueryService:
         ordered = sort_tasks(candidates)
         contexts = tuple(
             StoreCurationContext(store.store.id, store.store.timezone, store.store.curation)
-            for store in _selected(snapshot, request.local)
+            for store in projection.snapshot.stores
             if store.store is not None
         )
         due_ids = {
@@ -353,7 +275,7 @@ class QueryService:
             )
             rows.append(
                 NextItem(
-                    _row(value.store_id, record, graph),
+                    row_for(projection, value.store_id, record),
                     tuple(reversed(ancestors)),
                     unblocks,
                     (value.store_id, value.task.id) in due_ids,
