@@ -820,9 +820,19 @@ preserves the SDK Pipe v1 envelope exactly, one NDJSON object per line:
 {"untaped":"1","kind":"orchestration.task","record":{"id":"tsk_..."}}
 ```
 
-Kinds are `orchestration.store`, `.task`, `.decision`, `.evidence`, and
-`.diagnostic`; `record` contains command data or the structured diagnostic.
-Pipe ignores columns. Raw output defaults its first field to stable ID;
+Kinds are `orchestration.store`, `.task`, `.decision`, `.evidence`,
+`.diagnostic`, and `.status`; `record` contains command data, a structured
+diagnostic, or the stream status. Every successful or expected-failure Pipe
+stream ends with exactly one status trailer:
+
+```json
+{"untaped":"1","kind":"orchestration.status","record":{"complete":true,"truncated":false}}
+```
+
+Data records appear first in stable order, followed by real canonical
+diagnostic records in stable order, followed by the status trailer. The tool
+never synthesizes or recodes a diagnostic to communicate stream status. Pipe
+ignores columns. Raw output defaults its first field to stable ID;
 repeatable `--columns FIELD`/`-c FIELD` controls additions and supports the
 SDK's dotted paths.
 
@@ -932,8 +942,9 @@ Format availability is command-specific:
 Every unlisted format/command combination is a usage error with exit 2. In
 particular, `brief`, `trace`, init, mutations, check, fmt, render, import, and
 repair reject `pipe` and row-projection `raw`; their compound result shapes
-use only table or JSON. Pipe kinds therefore remain limited to the five kinds
-in section 10.4 and never invent a receipt or brief kind. `id new --format raw`
+use only table or JSON. Pipe kinds therefore remain limited to the six kinds
+in section 10.4 and never invent a receipt or brief kind; `.status` is the
+mandatory stream trailer, not a command result kind. `id new --format raw`
 prints only the allocated ID; its table/JSON forms use the allocated-ID shape.
 
 `--before`/`--after` require `--if-anchor-revision`; other placements reject it.

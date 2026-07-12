@@ -63,7 +63,8 @@ def test_pipe_preserves_exact_sdk_v1_envelope_and_ignores_columns() -> None:
     assert encoded.stdout == (
         b'{"untaped":"1","kind":"orchestration.task","record":'
         + f'{{"id":"{TASK_ID}","title":"Task"}}}}'.encode()
-        + b"\n"
+        + b'\n{"untaped":"1","kind":"orchestration.status","record":'
+        + b'{"complete":true,"truncated":false}}\n'
     )
 
 
@@ -82,6 +83,7 @@ def test_pipe_uses_each_mixed_item_rows_own_kind() -> None:
     assert [record["kind"] for record in records] == [
         "orchestration.task",
         "orchestration.decision",
+        "orchestration.status",
     ]
 
 
@@ -95,7 +97,10 @@ def test_curation_rows_project_stable_id_and_dynamic_pipe_kind() -> None:
     raw = encode_result(CommandResult("curate next", [entry]), fmt="raw")
     assert raw.stdout == f"{TASK_ID}\n".encode()
     pipe = encode_result(CommandResult("curate next", [entry]), fmt="pipe")
-    assert json.loads(pipe.stdout)["kind"] == "orchestration.task"
+    assert [json.loads(line)["kind"] for line in pipe.stdout.splitlines()] == [
+        "orchestration.task",
+        "orchestration.status",
+    ]
 
 
 def test_pipe_emits_data_and_diagnostic_records_for_partial_results() -> None:
@@ -120,6 +125,7 @@ def test_pipe_emits_data_and_diagnostic_records_for_partial_results() -> None:
     assert [record["kind"] for record in records] == [
         "orchestration.task",
         "orchestration.diagnostic",
+        "orchestration.status",
     ]
     assert records[1]["record"]["code"] == "ORC005"
     Diagnostic.model_validate(records[1]["record"])
@@ -130,21 +136,22 @@ def test_pipe_emits_data_and_diagnostic_records_for_partial_results() -> None:
             '{"untaped":"1","kind":"orchestration.diagnostic","record":'
             '{"code":"ORC005","severity":"warning","path":"registry.toml",'
             '"field":"children","message":"child missing","hint":"restore child"}}\n'
+            '{"untaped":"1","kind":"orchestration.status","record":'
+            '{"complete":false,"truncated":false}}\n'
         ).encode()
     )
 
 
 @pytest.mark.parametrize(
-    ("complete", "truncated", "message"),
+    ("complete", "truncated"),
     (
-        (False, False, "command result is incomplete"),
-        (True, True, "command result is truncated"),
-        (False, True, "command result is incomplete and truncated"),
+        (True, False),
+        (True, True),
+        (False, False),
+        (False, True),
     ),
 )
-def test_pipe_synthesizes_schema_valid_status_diagnostic(
-    complete: bool, truncated: bool, message: str
-) -> None:
+def test_pipe_always_ends_with_exactly_one_status_trailer(complete: bool, truncated: bool) -> None:
     encoded = encode_result(
         CommandResult(
             "list",
@@ -157,11 +164,13 @@ def test_pipe_synthesizes_schema_valid_status_diagnostic(
     records = [json.loads(line) for line in encoded.stdout.splitlines()]
     assert [record["kind"] for record in records] == [
         "orchestration.task",
-        "orchestration.diagnostic",
+        "orchestration.status",
     ]
-    diagnostic = Diagnostic.model_validate(records[1]["record"])
-    assert diagnostic.code == "ORC005"
-    assert diagnostic.message == message
+    assert records[-1]["record"] == {
+        "complete": complete,
+        "truncated": truncated,
+    }
+    assert sum(record["kind"] == "orchestration.status" for record in records) == 1
 
 
 def test_pipe_expected_failure_is_diagnostic_only_without_traceback(capfd) -> None:
@@ -175,10 +184,10 @@ def test_pipe_expected_failure_is_diagnostic_only_without_traceback(capfd) -> No
     records = [json.loads(line) for line in captured.out.splitlines()]
     assert [record["kind"] for record in records] == [
         "orchestration.diagnostic",
-        "orchestration.diagnostic",
+        "orchestration.status",
     ]
-    for record in records:
-        Diagnostic.model_validate(record["record"])
+    Diagnostic.model_validate(records[0]["record"])
+    assert records[1]["record"] == {"complete": False, "truncated": False}
     assert "Traceback" not in captured.err
 
 
