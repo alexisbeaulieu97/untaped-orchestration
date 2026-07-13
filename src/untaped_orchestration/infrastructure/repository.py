@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 from untaped_orchestration.application.ports import (
     AdministrativeState,
     CanonicalFormatter,
+    ExternalFileReader,
     FederatedSnapshot,
     FileDeletion,
     FileReplacement,
@@ -21,7 +23,8 @@ from untaped_orchestration.application.ports import (
     UnprovableBodyBoundary,
 )
 from untaped_orchestration.domain.canonical import CanonicalItem
-from untaped_orchestration.domain.diagnostics import Diagnostic, sort_diagnostics
+from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticError, sort_diagnostics
+from untaped_orchestration.domain.limits import FRONTMATTER_LIMIT, ITEM_FILE_LIMIT
 from untaped_orchestration.domain.models import Registry, StoreConfig
 from untaped_orchestration.infrastructure.codec import (
     CodecError,
@@ -30,6 +33,7 @@ from untaped_orchestration.infrastructure.codec import (
     RegistryCodec,
     StoreConfigCodec,
 )
+from untaped_orchestration.infrastructure.external_files import FilesystemExternalFileReader
 from untaped_orchestration.infrastructure.filesystem import (
     ADMIN_PATHS,
     AtomicFilesystem,
@@ -56,11 +60,33 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
         item_codec: ItemCodec | None = None,
         store_codec: StoreConfigCodec | None = None,
         registry_codec: RegistryCodec | None = None,
+        external_files: ExternalFileReader | None = None,
     ) -> None:
         self._atomic = atomic or AtomicFilesystem()
         self._items = item_codec or ItemCodec()
         self._stores = store_codec or StoreConfigCodec()
         self._registries = registry_codec or RegistryCodec()
+        self._external_files = external_files or FilesystemExternalFileReader()
+
+    def read_external(self, path: Path, *, limit: int, field: str) -> bytes:
+        return self._external_files.read_external(path, limit=limit, field=field)
+
+    def _read_canonical(
+        self,
+        location: StoreLocation,
+        relative_path: PurePosixPath,
+    ) -> bytes:
+        limit = ITEM_FILE_LIMIT if _is_item_path(relative_path) else FRONTMATTER_LIMIT
+        absolute = location.real_root.joinpath(*relative_path.parts)
+        try:
+            return self.read_external(absolute, limit=limit, field="")
+        except DiagnosticError as error:
+            raise DiagnosticError(
+                tuple(
+                    diagnostic.model_copy(update={"path": relative_path.as_posix()})
+                    for diagnostic in error.diagnostics
+                )
+            ) from error
 
     def discover(self, start: Path, override: Path | None = None) -> StoreLocation:
         return discover_location(start, override)
@@ -76,14 +102,13 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
         raw_index: list[RawReference] = []
         file_revisions = {}
         for relative_path in relative_paths:
-            absolute = location.real_root.joinpath(*relative_path.parts)
+            raw = self._read_canonical(location, relative_path)
             if _is_item_path(relative_path):
-                with absolute.open("rb") as stream:
-                    streamed = self._items.parse_stream(
-                        stream,
-                        relative_path=relative_path,
-                        headers_only=headers_only,
-                    )
+                streamed = self._items.parse_stream(
+                    io.BytesIO(raw),
+                    relative_path=relative_path,
+                    headers_only=headers_only,
+                )
                 file_revisions[relative_path] = streamed.revision
                 raw_index.append(
                     RawReference(
@@ -106,7 +131,6 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
                 )
                 continue
 
-            raw = absolute.read_bytes()
             revision = file_revision(raw)
             file_revisions[relative_path] = revision
             if relative_path == PurePosixPath("store.toml"):
@@ -190,15 +214,21 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
         store_id = None
         registry_revision = None
         try:
-            store_raw = safe_read_path(location, PurePosixPath("store.toml")).read_bytes()
+            store_raw = self._read_canonical(location, PurePosixPath("store.toml"))
             store_id = self._stores.parse(store_raw).id.root
         except CodecError, FileNotFoundError, PathSafetyError:
             pass
+        except DiagnosticError as error:
+            if not _is_unavailable_path(error):
+                raise
         try:
-            registry_raw = safe_read_path(location, PurePosixPath("registry.toml")).read_bytes()
+            registry_raw = self._read_canonical(location, PurePosixPath("registry.toml"))
             registry_revision = file_revision(registry_raw)
         except FileNotFoundError, PathSafetyError:
             pass
+        except DiagnosticError as error:
+            if not _is_unavailable_path(error):
+                raise
         return AdministrativeState(store_id, registry_revision)
 
     def prepare(self, root: Path) -> StoreLocation:
@@ -264,13 +294,14 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
     ) -> ProjectedMutation:
         entry_map = {entry.path: entry for entry in store_entries(selected)}
         contents = {
-            path: selected.real_root.joinpath(*path.parts).read_bytes()
+            path: self._read_canonical(selected, path)
             for path, entry in entry_map.items()
-            if entry.kind == "file"
+            if entry.kind == "file" and (path in ADMIN_PATHS or _is_item_path(path))
         }
         for replacement in replacements:
             entry_map[replacement.path] = StoreEntry(replacement.path, "file")
-            contents[replacement.path] = replacement.content
+            if replacement.path in ADMIN_PATHS or _is_item_path(replacement.path):
+                contents[replacement.path] = replacement.content
         for deletion in deletions:
             entry_map.pop(deletion.path, None)
             contents.pop(deletion.path, None)
@@ -374,3 +405,9 @@ def _is_item_path(relative_path: PurePosixPath) -> bool:
         ("decisions",),
         ("archive", "tasks"),
     }
+
+
+def _is_unavailable_path(error: DiagnosticError) -> bool:
+    return bool(error.diagnostics) and all(
+        diagnostic.code == "ORC003" for diagnostic in error.diagnostics
+    )

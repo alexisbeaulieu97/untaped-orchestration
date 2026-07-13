@@ -9,6 +9,7 @@ from tests.builders import TASK_ID
 from untaped_orchestration.cli import app, maintenance_commands, read_commands, task_commands
 from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.domain.diagnostics import DiagnosticError
+from untaped_orchestration.infrastructure.external_files import FilesystemExternalFileReader
 
 
 @pytest.mark.parametrize(
@@ -65,35 +66,24 @@ def test_columns_short_alias_is_repeatable(monkeypatch) -> None:
 @pytest.mark.parametrize("module_name", ("task_commands", "decision_commands"))
 def test_body_file_read_is_bounded_to_limit_plus_one(
     tmp_path: Path,
-    monkeypatch,
     module_name: str,
 ) -> None:
     module = __import__(f"untaped_orchestration.cli.{module_name}", fromlist=["_body"])
     body = tmp_path / "body.md"
     body.write_bytes(b"x")
-    original = Path.open
-    sizes: list[int] = []
+    calls: list[tuple[Path, int, str]] = []
 
     class TrackingReader:
-        def __init__(self, wrapped) -> None:
-            self.wrapped = wrapped
+        def read_external(self, path: Path, *, limit: int, field: str) -> bytes:
+            calls.append((path, limit, field))
+            return FilesystemExternalFileReader().read_external(
+                path,
+                limit=limit,
+                field=field,
+            )
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args) -> None:
-            self.wrapped.close()
-
-        def read(self, size: int = -1) -> bytes:
-            sizes.append(size)
-            return self.wrapped.read(size)
-
-    def tracking_open(path: Path, *args, **kwargs):
-        return TrackingReader(original(path, *args, **kwargs))
-
-    monkeypatch.setattr(Path, "open", tracking_open)
-    assert module._body(body) == b"x"
-    assert sizes == [1024 * 1024 + 1]
+    assert module._body(TrackingReader(), body) == b"x"
+    assert calls == [(body, 1024 * 1024, "body")]
 
 
 @pytest.mark.parametrize("module_name", ("task_commands", "decision_commands"))
@@ -104,12 +94,13 @@ def test_body_file_rejects_oversize_and_invalid_utf8(
     module = __import__(f"untaped_orchestration.cli.{module_name}", fromlist=["_body"])
     body = tmp_path / "body.md"
     body.write_bytes(b"x" * (1024 * 1024 + 1))
+    reader = FilesystemExternalFileReader()
     with pytest.raises(DiagnosticError, match="1 MiB") as oversized:
-        module._body(body)
+        module._body(reader, body)
     assert oversized.value.diagnostics[0].code == "ORC001"
     body.write_bytes(b"\xff")
     with pytest.raises(DiagnosticError, match="UTF-8") as invalid:
-        module._body(body)
+        module._body(reader, body)
     assert invalid.value.diagnostics[0].code == "ORC001"
 
 
@@ -123,6 +114,7 @@ def test_invalid_body_file_uses_typed_command_failure_before_service(
 
     class Context:
         scope = object()
+        repository = FilesystemExternalFileReader()
 
         def create_task(self):
             raise AssertionError("invalid body input must not call the service")

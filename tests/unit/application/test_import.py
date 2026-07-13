@@ -14,6 +14,8 @@ from untaped_orchestration.application.maintenance import (
 from untaped_orchestration.application.mutations import MutationExecutor
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
 from untaped_orchestration.domain.evidence import EvidenceRelation
+from untaped_orchestration.domain.limits import BODY_LIMIT, FRONTMATTER_LIMIT
+from untaped_orchestration.infrastructure.external_files import FilesystemExternalFileReader
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -28,7 +30,13 @@ def _body(raw: bytes) -> bytes:
     return raw.split(b"+++\n", 2)[2]
 
 
-def _fixture(tmp_path: Path, *, public: bool = False, decisions_only: bool = False):
+def _fixture(
+    tmp_path: Path,
+    *,
+    public: bool = False,
+    decisions_only: bool = False,
+    external_files=None,
+):
     target = tmp_path / "repository"
     target.mkdir()
     repository = FilesystemStoreRepository()
@@ -55,6 +63,7 @@ def _fixture(tmp_path: Path, *, public: bool = False, decisions_only: bool = Fal
         repository,
         executor,
         views,
+        external_files=external_files or FilesystemExternalFileReader(),
         locations=(location,),
         load=load,
     )
@@ -143,6 +152,62 @@ def test_manifest_is_the_only_revision_authority_and_import_defaults_to_dry_run(
     assert result.records[0].revision.root.startswith("sha256:")
     assert not location.real_root.joinpath(*destination.parts).exists()
     assert "expected_store_revision" not in ImportRequest.__dataclass_fields__
+
+
+def test_import_reads_each_bounded_external_snapshot_once(tmp_path: Path) -> None:
+    class ReadSpy:
+        def __init__(self) -> None:
+            self.delegate = FilesystemExternalFileReader()
+            self.calls: list[tuple[Path, int, str]] = []
+
+        def read_external(self, path: Path, *, limit: int, field: str) -> bytes:
+            self.calls.append((path, limit, field))
+            return self.delegate.read_external(path, limit=limit, field=field)
+
+    reader = ReadSpy()
+    repository, location, service = _fixture(tmp_path, external_files=reader)
+    base = repository.load_local(location, headers_only=False).store_revision
+    manifest = _manifest(tmp_path, base.root)
+
+    service.execute(ImportRequest(location, manifest))
+
+    assert reader.calls == [
+        (manifest, FRONTMATTER_LIMIT, "manifest"),
+        (tmp_path / "records" / "decision.toml", FRONTMATTER_LIMIT, "frontmatter"),
+        (tmp_path / "records" / "decision.md", BODY_LIMIT, "body"),
+    ]
+
+
+def test_import_manifest_accepts_exact_bound_and_rejects_limit_plus_one(
+    tmp_path: Path,
+) -> None:
+    repository, location, service = _fixture(tmp_path)
+    base = repository.load_local(location, headers_only=False).store_revision
+    manifest = _manifest(tmp_path, base.root)
+    raw = manifest.read_bytes()
+    padding = FRONTMATTER_LIMIT - len(raw)
+    manifest.write_bytes(raw + b"\n#" + b"x" * (padding - 2))
+    assert manifest.stat().st_size == FRONTMATTER_LIMIT
+
+    service.execute(ImportRequest(location, manifest))
+
+    manifest.write_bytes(manifest.read_bytes() + b"x")
+    with pytest.raises(ImportConflict) as captured:
+        service.execute(ImportRequest(location, manifest))
+    assert captured.value.diagnostics[0].code == "ORC001"
+
+
+def test_import_manifest_invalid_utf8_is_orc001_without_content_leak(tmp_path: Path) -> None:
+    _, location, service = _fixture(tmp_path)
+    manifest = tmp_path / "import.toml"
+    manifest.write_bytes(b"private-secret\xff")
+
+    with pytest.raises(ImportConflict) as captured:
+        service.execute(ImportRequest(location, manifest))
+
+    diagnostic = captured.value.diagnostics[0]
+    assert diagnostic.code == "ORC001"
+    assert "private-secret" not in diagnostic.message
 
 
 def test_apply_requires_if_clean_and_inserts_canonical_tracked_by_evidence(

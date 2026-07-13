@@ -13,6 +13,7 @@ from untaped_orchestration.application.item_support import validated_copy
 from untaped_orchestration.application.mutations import IntendedMutation, MutationExecutor
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
+    ExternalFileReader,
     FileDeletion,
     FileReplacement,
     StoreLocation,
@@ -33,6 +34,7 @@ from untaped_orchestration.domain.diagnostics import (
 )
 from untaped_orchestration.domain.evidence import Evidence, EvidenceRelation
 from untaped_orchestration.domain.ids import DecisionId, TaskId, item_filename
+from untaped_orchestration.domain.limits import BODY_LIMIT, FRONTMATTER_LIMIT
 from untaped_orchestration.domain.models import ImportManifest, Revision
 
 ITEM_ROOTS = (
@@ -49,6 +51,16 @@ class ImportConflict(DiagnosticError):
         diagnostics: tuple[Diagnostic, ...] | None = None,
     ) -> None:
         super().__init__(diagnostics or expected_diagnostic("ORC002", message))
+
+
+def _prefixed_diagnostics(
+    prefix: str,
+    diagnostics: tuple[Diagnostic, ...],
+) -> tuple[Diagnostic, ...]:
+    return tuple(
+        diagnostic.model_copy(update={"message": f"{prefix}: {diagnostic.message}"})
+        for diagnostic in diagnostics
+    )
 
 
 class ImportRepository(StoreReader, CanonicalFormatter, Protocol):
@@ -84,13 +96,14 @@ class ImportResult:
     records: tuple[ImportedRecord, ...]
 
 
-def _regular_external_file(path: Path, *, label: str) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label} must be a regular nonsymlink file")
-    return path.read_bytes()
-
-
-def _manifest_record_file(root: Path, relative: str) -> bytes:
+def _manifest_record_file(
+    reader: ExternalFileReader,
+    root: Path,
+    relative: str,
+    *,
+    limit: int,
+    field: str,
+) -> bytes:
     if root.is_symlink():
         raise ImportConflict("manifest record root cannot be a symlink")
     relative_path = PurePosixPath(relative)
@@ -107,18 +120,43 @@ def _manifest_record_file(root: Path, relative: str) -> bytes:
             raise ImportConflict("manifest record path cannot contain symlinks")
         current = current.parent
     try:
-        return _regular_external_file(candidate, label="manifest record")
+        return reader.read_external(candidate, limit=limit, field=field)
+    except DiagnosticError as error:
+        raise ImportConflict(
+            "manifest record cannot be read",
+            _prefixed_diagnostics("manifest record cannot be read", error.diagnostics),
+        ) from error
     except (OSError, ValueError) as error:
         raise ImportConflict("manifest record path must be a regular nonsymlink file") from error
 
 
-def _load_manifest(request: ImportRequest) -> ImportManifest:
+def _load_manifest(request: ImportRequest, reader: ExternalFileReader) -> ImportManifest:
     try:
-        if request.manifest.parent.is_symlink():
-            raise ValueError("manifest parent cannot be a symlink")
-        raw = _regular_external_file(request.manifest, label="manifest")
-        return ImportManifest.model_validate(tomllib.loads(raw.decode("utf-8")))
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValidationError, ValueError) as error:
+        raw = reader.read_external(
+            request.manifest,
+            limit=FRONTMATTER_LIMIT,
+            field="manifest",
+        )
+    except DiagnosticError as error:
+        raise ImportConflict(
+            "manifest does not match untaped.orchestration.import/v1",
+            _prefixed_diagnostics("import manifest cannot be read", error.diagnostics),
+        ) from error
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as error:
+        raise ImportConflict(
+            "manifest does not match untaped.orchestration.import/v1",
+            expected_diagnostic(
+                "ORC001",
+                "import manifest is not valid UTF-8",
+                path=request.manifest.as_posix(),
+                field="manifest",
+            ),
+        ) from error
+    try:
+        return ImportManifest.model_validate(tomllib.loads(text))
+    except (OSError, tomllib.TOMLDecodeError, ValidationError, ValueError) as error:
         raise ImportConflict("manifest does not match untaped.orchestration.import/v1") from error
 
 
@@ -228,12 +266,14 @@ class ImportService:
         executor: MutationExecutor,
         views: ViewRenderer,
         *,
+        external_files: ExternalFileReader,
         locations: tuple[StoreLocation, ...],
         load: Callable[[], FederatedSnapshot],
     ) -> None:
         self._repository = repository
         self._executor = executor
         self._views = views
+        self._external_files = external_files
         self._locations = locations
         self._load = load
 
@@ -246,10 +286,19 @@ class ImportService:
         seen: set[PurePosixPath] = set()
         for entry in manifest.records:
             frontmatter = _manifest_record_file(
+                self._external_files,
                 request.manifest.parent,
                 entry.frontmatter_file,
+                limit=FRONTMATTER_LIMIT,
+                field="frontmatter",
             )
-            body = _manifest_record_file(request.manifest.parent, entry.body_file)
+            body = _manifest_record_file(
+                self._external_files,
+                request.manifest.parent,
+                entry.body_file,
+                limit=BODY_LIMIT,
+                field="body",
+            )
             item_id, title = _item_identity(frontmatter)
             path = PurePosixPath(entry.destination.value) / item_filename(item_id, title)
             if path in seen:
@@ -295,7 +344,7 @@ class ImportService:
         return tuple(imported)
 
     def execute(self, request: ImportRequest) -> ImportResult:
-        manifest = _load_manifest(request)
+        manifest = _load_manifest(request, self._external_files)
         if request.apply and manifest.require_empty_items and not request.if_clean:
             raise ImportConflict("import apply requires explicit --if-clean")
         records = self._records(request, manifest)

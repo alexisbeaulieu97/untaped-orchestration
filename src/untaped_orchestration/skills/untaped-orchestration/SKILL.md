@@ -30,6 +30,9 @@ use generated views as machine input.
    views with `render --write` when an authorized human workflow requires it.
 5. Run `check` after hand edits or recovery, followed by `fmt --check` and
    `render --check` as applicable.
+6. Supply only regular nonsymlink files for import manifests, replacement front
+   matter, and body-file inputs. Keep front matter within 64 KiB and bodies
+   within 1 MiB.
 
 ## Privacy, evidence, and readiness
 

@@ -7,8 +7,9 @@ from typing import Annotated, Literal, cast
 
 from cyclopts import Parameter
 
+from untaped_orchestration.application.ports import ExternalFileReader
 from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
-from untaped_orchestration.infrastructure.codec import BODY_LIMIT
+from untaped_orchestration.domain.limits import BODY_LIMIT
 
 OutputFormat = Literal["table", "json", "pipe", "raw"]
 ColumnsOption = Annotated[
@@ -43,11 +44,8 @@ def usage_value[T](factory: Callable[[], T]) -> T:
         raise SystemExit(2) from error
 
 
-def read_body_file(path: Path) -> bytes:
-    with path.open("rb") as stream:
-        body = stream.read(BODY_LIMIT + 1)
-    if len(body) > BODY_LIMIT:
-        raise BodyInputError(path, "body file exceeds the 1 MiB limit")
+def read_body_file(reader: ExternalFileReader, path: Path) -> bytes:
+    body = reader.read_external(path, limit=BODY_LIMIT, field="body")
     try:
         body.decode("utf-8")
     except UnicodeDecodeError as error:

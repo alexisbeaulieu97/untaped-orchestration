@@ -8,6 +8,7 @@ from typing import Protocol
 from untaped_orchestration.application.item_support import ItemMutationResult
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
+    ExternalFileReader,
     FileReplacement,
     LockManager,
     MutationProjector,
@@ -32,6 +33,7 @@ from untaped_orchestration.domain.diagnostics import (
     DiagnosticError,
     expected_diagnostic,
 )
+from untaped_orchestration.domain.limits import BODY_LIMIT, FRONTMATTER_LIMIT
 from untaped_orchestration.domain.models import Revision
 
 DEFAULT_LOCK_TIMEOUT = 10.0
@@ -84,12 +86,6 @@ class RepairFrontmatterResult:
     after: bytes
 
 
-def _regular_external_file(path: Path, *, label: str) -> bytes:
-    if path.parent.is_symlink() or path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label} must be a regular nonsymlink file")
-    return path.read_bytes()
-
-
 def _federated(snapshot: StoreSnapshot) -> FederatedSnapshot:
     return FederatedSnapshot(snapshot, (snapshot,), Completeness())
 
@@ -125,6 +121,7 @@ class RepairService:
         locks: LockManager,
         views: ViewRenderer,
         *,
+        external_files: ExternalFileReader,
         duplicate_repair: DuplicateRepair | None = None,
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     ) -> None:
@@ -132,6 +129,7 @@ class RepairService:
         self._writer = writer
         self._locks = locks
         self._views = views
+        self._external_files = external_files
         self._duplicate_repair = duplicate_repair
         self._lock_timeout = lock_timeout
 
@@ -168,12 +166,17 @@ class RepairService:
 
     def _planned_repair(self, request: RepairFrontmatterRequest, before: bytes) -> bytes:
         try:
-            replacement = _regular_external_file(
+            replacement = self._external_files.read_external(
                 request.frontmatter_file,
-                label="frontmatter file",
+                limit=FRONTMATTER_LIMIT,
+                field="frontmatter",
             )
             body = (
-                _regular_external_file(request.body_file, label="body file")
+                self._external_files.read_external(
+                    request.body_file,
+                    limit=BODY_LIMIT,
+                    field="body",
+                )
                 if request.body_file is not None
                 else None
             )

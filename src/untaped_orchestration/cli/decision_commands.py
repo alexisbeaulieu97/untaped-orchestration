@@ -13,6 +13,7 @@ from untaped_orchestration.application.item_support import (
     CreateDecisionRequest,
     UpdateDecisionRequest,
 )
+from untaped_orchestration.application.ports import ExternalFileReader
 from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.cli.options import (
     ColumnsOption,
@@ -25,8 +26,8 @@ from untaped_orchestration.domain.ids import DecisionId, Slug
 from untaped_orchestration.domain.models import Revision
 
 
-def _body(path: Path | None) -> bytes:
-    return b"" if path is None else read_body_file(path)
+def _body(reader: ExternalFileReader, path: Path | None) -> bytes:
+    return b"" if path is None else read_body_file(reader, path)
 
 
 def _revision(value: str | None) -> Revision | None:
@@ -92,8 +93,8 @@ def register(app: App) -> None:
         del debug
 
         def action() -> CommandResult:
-            body = _body(body_file)
             context = CliContext.resolve(store)
+            body = _body(context.repository, body_file)
             result = context.create_decision().execute(
                 context.scope,
                 CreateDecisionRequest(
@@ -138,8 +139,8 @@ def register(app: App) -> None:
             raise SystemExit(2)
 
         def action() -> CommandResult:
-            body = None if body_file is None else _body(body_file)
             context = CliContext.resolve(store)
+            body = None if body_file is None else _body(context.repository, body_file)
             result = context.update_decision().execute(
                 context.scope,
                 UpdateDecisionRequest(
@@ -188,8 +189,8 @@ def register(app: App) -> None:
         )
 
         def action() -> CommandResult:
-            body = _body(body_file)
             context = CliContext.resolve(store)
+            body = _body(context.repository, body_file)
             result = context.decisions().supersede(
                 SupersedeDecisionRequest(
                     _decision_id(id),

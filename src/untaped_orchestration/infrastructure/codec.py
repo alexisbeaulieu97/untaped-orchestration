@@ -18,6 +18,11 @@ from untaped_orchestration.domain.canonical import (
     canonical_store_table,
 )
 from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticCode, DiagnosticError
+from untaped_orchestration.domain.limits import (
+    BODY_LIMIT,
+    DELIMITER_OVERHEAD,
+    FRONTMATTER_LIMIT,
+)
 from untaped_orchestration.domain.models import (
     ActiveTask,
     ArchivedTask,
@@ -28,10 +33,8 @@ from untaped_orchestration.domain.models import (
     StoreConfig,
 )
 
-FRONTMATTER_LIMIT = 64 * 1024
-BODY_LIMIT = 1024 * 1024
 STREAM_CHUNK_SIZE = 64 * 1024
-ENVELOPE_LIMIT = 4 + FRONTMATTER_LIMIT + 4
+ENVELOPE_LIMIT = FRONTMATTER_LIMIT + DELIMITER_OVERHEAD
 UTF8_BOM = b"\xef\xbb\xbf"
 ITEM_FILENAME_RE = re.compile(r"(?P<id>(?:tsk|dec)_[0-9a-f]{32})-(?P<slug>.*)\.md")
 ITEM_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -264,7 +267,7 @@ def _split_item(raw: bytes, *, relative_path: PurePosixPath) -> tuple[bytes, byt
                 message="item front matter exceeds the 64 KiB limit",
                 hint="Reduce metadata before parsing or formatting the item.",
             )
-        line_end = raw.find(b"\n", cursor, 4 + FRONTMATTER_LIMIT + 4)
+        line_end = raw.find(b"\n", cursor, ENVELOPE_LIMIT)
         if line_end == -1:
             if len(raw) - cursor == 3 and raw[cursor:] == b"+++":
                 metadata = raw[4:cursor]

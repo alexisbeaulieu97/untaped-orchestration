@@ -10,7 +10,14 @@ from tests.builders import (
     decision_bytes,
     task_bytes,
 )
-from untaped_orchestration.application.results import FileDeletion, FileReplacement
+from untaped_orchestration.application.results import (
+    Completeness,
+    FederatedSnapshot,
+    FileDeletion,
+    FileReplacement,
+)
+from untaped_orchestration.domain.diagnostics import DiagnosticError
+from untaped_orchestration.domain.limits import FRONTMATTER_LIMIT, ITEM_FILE_LIMIT
 from untaped_orchestration.infrastructure.codec import CodecError, ItemCodec
 from untaped_orchestration.infrastructure.filesystem import (
     AtomicFilesystem,
@@ -339,6 +346,103 @@ def test_registry_revision_hashes_exact_bytes_and_store_revision_excludes_views_
     local_store.joinpath(".lock").write_bytes(b"lock")
     local_store.joinpath(".store.toml.untaped-tmp-orphan").write_bytes(b"temp")
     assert repository.load_local(location, headers_only=True).store_revision == first.store_revision
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        PurePosixPath("store.toml"),
+        PurePosixPath("registry.toml"),
+        PurePosixPath("AGENTS.md"),
+        PurePosixPath("CLAUDE.md"),
+    ),
+)
+def test_load_local_rejects_oversized_canonical_admin_and_instruction_files(
+    local_store: Path,
+    relative: PurePosixPath,
+) -> None:
+    local_store.joinpath(*relative.parts).write_bytes(b"x" * (FRONTMATTER_LIMIT + 1))
+
+    with pytest.raises(DiagnosticError) as captured:
+        FilesystemStoreRepository().load_local(
+            location_from_root(local_store),
+            headers_only=True,
+        )
+
+    assert captured.value.diagnostics[0].code == "ORC001"
+    assert captured.value.diagnostics[0].path == relative.as_posix()
+
+
+def test_load_local_accepts_exact_item_limit_and_rejects_limit_plus_one(
+    local_store: Path,
+) -> None:
+    canonical = decision_bytes()
+    metadata, body = canonical.split(b"+++\n")[1:]
+    metadata_padding = 64 * 1024 - len(metadata)
+    metadata = metadata + b"#" * (metadata_padding - 1) + b"\n"
+    body = body + b"x" * (1024 * 1024 - len(body))
+    exact = b"+++\n" + metadata + b"+++\n" + body
+    assert len(exact) == ITEM_FILE_LIMIT
+    item = local_store / "decisions" / f"{DECISION_ID}-choice.md"
+    item.parent.mkdir()
+    item.write_bytes(exact)
+
+    snapshot = FilesystemStoreRepository().load_local(
+        location_from_root(local_store),
+        headers_only=True,
+    )
+    assert snapshot.records[0].metadata.id.root == DECISION_ID
+
+    item.write_bytes(exact + b"x")
+    with pytest.raises(DiagnosticError) as captured:
+        FilesystemStoreRepository().load_local(
+            location_from_root(local_store),
+            headers_only=True,
+        )
+    assert captured.value.diagnostics[0].code == "ORC001"
+
+
+def test_projection_reads_only_bounded_canonical_content_but_keeps_all_entries(
+    local_store: Path,
+) -> None:
+    class ReadSpy:
+        def __init__(self) -> None:
+            self.paths: list[Path] = []
+
+        def read_external(self, path: Path, *, limit: int, field: str) -> bytes:
+            del limit, field
+            self.paths.append(path)
+            with path.open("rb") as stream:
+                return stream.read()
+
+    spy = ReadSpy()
+    repository = FilesystemStoreRepository(external_files=spy)
+    location = location_from_root(local_store)
+    selected = repository.load_local(location, headers_only=False)
+    current = FederatedSnapshot(selected, (selected,), Completeness())
+    spy.paths.clear()
+    noise = {
+        PurePosixPath("views/roadmap.md"): b"v" * (2 * 1024 * 1024),
+        PurePosixPath("notes.txt"): b"unexpected",
+        PurePosixPath(".orphan.tmp"): b"temporary",
+        PurePosixPath("scratch.md~"): b"editor",
+        PurePosixPath(".store.toml.untaped-tmp-orphan"): b"atomic",
+    }
+    for relative, raw in noise.items():
+        target = local_store.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+
+    projection = repository.project(current, location, (), ())
+
+    assert {path.relative_to(local_store).as_posix() for path in spy.paths} == {
+        "AGENTS.md",
+        "CLAUDE.md",
+        "registry.toml",
+        "store.toml",
+    }
+    assert set(noise) <= {entry.path for entry in projection.entries}
+    assert not set(noise) & projection.contents.keys()
 
 
 def test_store_entry_enumeration_exposes_directories_symlinks_and_atomic_temporaries(

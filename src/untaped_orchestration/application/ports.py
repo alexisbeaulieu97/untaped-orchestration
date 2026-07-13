@@ -40,6 +40,7 @@ __all__ = [
     "AdministrativeState",
     "CanonicalFormatter",
     "Clock",
+    "ExternalFileReader",
     "FileDeletion",
     "FileReplacement",
     "IdGenerator",
@@ -71,6 +72,10 @@ MANAGED_VIEW_PATHS = (
 
 class UnprovableBodyBoundary(ValueError):
     pass
+
+
+class ExternalFileReader(Protocol):
+    def read_external(self, path: Path, *, limit: int, field: str) -> bytes: ...
 
 
 class StoreDiscoveryMissing(Exception):

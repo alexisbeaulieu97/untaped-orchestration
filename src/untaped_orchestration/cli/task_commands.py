@@ -6,6 +6,7 @@ from cyclopts import App
 
 from untaped_orchestration.application.curation import AcknowledgeRequest
 from untaped_orchestration.application.item_support import CreateTaskRequest, UpdateTaskRequest
+from untaped_orchestration.application.ports import ExternalFileReader
 from untaped_orchestration.application.tasks import (
     CloseTaskRequest,
     MoveTaskRequest,
@@ -24,8 +25,8 @@ from untaped_orchestration.domain.models import Revision, TaskOutcome, TaskPrior
 from untaped_orchestration.domain.ordering import PlacementAnchor, PlacementAnchorKind
 
 
-def _body(path: Path | None) -> bytes:
-    return b"" if path is None else read_body_file(path)
+def _body(reader: ExternalFileReader, path: Path | None) -> bytes:
+    return b"" if path is None else read_body_file(reader, path)
 
 
 def _parent(value: str) -> TaskId | None:
@@ -105,8 +106,8 @@ def register(app: App) -> None:  # noqa: C901
         del debug
 
         def action() -> CommandResult:
-            body = _body(body_file)
             context = CliContext.resolve(store)
+            body = _body(context.repository, body_file)
             result = context.create_task().execute(
                 context.scope,
                 CreateTaskRequest(
@@ -160,8 +161,8 @@ def register(app: App) -> None:  # noqa: C901
             raise SystemExit(2)
 
         def action() -> CommandResult:
-            body = None if body_file is None else _body(body_file)
             context = CliContext.resolve(store)
+            body = None if body_file is None else _body(context.repository, body_file)
             result = context.update_task().execute(
                 context.scope,
                 UpdateTaskRequest(

@@ -65,3 +65,10 @@ stdout is zero bytes.
 `repair frontmatter` validates replacement TOML and preserves a provable body
 boundary. If delimiters or UTF-8 corruption make that boundary unknowable, an
 explicit bounded `--body-file` is required; the tool never guesses.
+
+External manifests, replacement front matter, and body files are read once as
+bounded byte snapshots. Every path component must remain a nonsymlink, and the
+opened object must be a regular file. On platforms without descriptor-relative
+no-follow support, the reader uses cooperative pre-open and post-read identity
+checks and rejects any substitution it detects; writers must not replace path
+components while the read is in progress.

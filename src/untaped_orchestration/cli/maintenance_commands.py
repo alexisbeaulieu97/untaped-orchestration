@@ -216,6 +216,7 @@ def register(app: App) -> None:  # noqa: C901
                 context.repository,
                 context.locks,
                 context.views,
+                external_files=context.repository,
                 duplicate_repair=context.tasks(),
             )
             result = service.frontmatter(
@@ -365,6 +366,7 @@ def register(app: App) -> None:  # noqa: C901
                 context.repository,
                 context.executor,
                 context.views,
+                external_files=context.repository,
                 locations=context.scope.recursive.locations,
                 load=context.scope.recursive.load,
             )

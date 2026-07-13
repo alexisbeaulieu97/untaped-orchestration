@@ -13,6 +13,8 @@ from untaped_orchestration.application.maintenance import (
 )
 from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.domain.ids import TaskId
+from untaped_orchestration.domain.limits import BODY_LIMIT, FRONTMATTER_LIMIT
+from untaped_orchestration.infrastructure.external_files import FilesystemExternalFileReader
 from untaped_orchestration.infrastructure.filesystem import file_revision, location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -21,7 +23,7 @@ from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
 PATH = PurePosixPath(f"decisions/{DECISION_ID}-use-toml-front-matter-and-opaque-markdown-bodies.md")
 
 
-def _fixture(tmp_path: Path):
+def _fixture(tmp_path: Path, *, external_files=None):
     target = tmp_path / "repository"
     target.mkdir()
     repository = FilesystemStoreRepository()
@@ -34,7 +36,18 @@ def _fixture(tmp_path: Path):
     item = location.real_root.joinpath(*PATH.parts)
     item.parent.mkdir()
     item.write_bytes(decision_bytes())
-    return repository, location, RepairService(repository, repository, locks, views), item
+    return (
+        repository,
+        location,
+        RepairService(
+            repository,
+            repository,
+            locks,
+            views,
+            external_files=external_files or FilesystemExternalFileReader(),
+        ),
+        item,
+    )
 
 
 def _metadata(raw: bytes) -> bytes:
@@ -57,6 +70,43 @@ def test_frontmatter_dry_run_preserves_proven_body_and_never_renames(tmp_path: P
     assert result.after != original
     assert item.read_bytes() == original
     assert result.receipt.intended_paths == (PATH,)
+
+
+def test_repair_captures_frontmatter_and_body_once_through_injected_reader(
+    tmp_path: Path,
+) -> None:
+    class ReadSpy:
+        def __init__(self) -> None:
+            self.delegate = FilesystemExternalFileReader()
+            self.calls: list[tuple[Path, int, str]] = []
+
+        def read_external(self, path: Path, *, limit: int, field: str) -> bytes:
+            self.calls.append((path, limit, field))
+            return self.delegate.read_external(path, limit=limit, field=field)
+
+    reader = ReadSpy()
+    _, location, service, item = _fixture(tmp_path, external_files=reader)
+    broken = b"not an envelope"
+    item.write_bytes(broken)
+    frontmatter = tmp_path / "frontmatter.toml"
+    frontmatter.write_bytes(_metadata(decision_bytes()))
+    body = tmp_path / "body.md"
+    body.write_bytes(b"replacement body\n")
+
+    service.frontmatter(
+        RepairFrontmatterRequest(
+            location,
+            PATH,
+            frontmatter,
+            file_revision(broken),
+            body_file=body,
+        )
+    )
+
+    assert reader.calls == [
+        (frontmatter, FRONTMATTER_LIMIT, "frontmatter"),
+        (body, BODY_LIMIT, "body"),
+    ]
 
 
 def test_unprovable_boundary_requires_explicit_valid_body_and_exact_guard(
@@ -166,6 +216,7 @@ def test_duplicate_repair_facade_delegates_exact_guarded_request(tmp_path: Path)
         repository,
         FileLockManager(),
         MarkdownViewRenderer(),
+        external_files=FilesystemExternalFileReader(),
         duplicate_repair=delegate,
     )
     request = RepairDuplicateRequest(
