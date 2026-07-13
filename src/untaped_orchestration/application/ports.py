@@ -49,6 +49,8 @@ __all__ = [
     "ProjectedMutation",
     "RawRecord",
     "RawReference",
+    "StoreDiscoveryInvalid",
+    "StoreDiscoveryMissing",
     "StoreEntry",
     "StoreLocation",
     "StoreLockTimeout",
@@ -69,6 +71,14 @@ MANAGED_VIEW_PATHS = (
 
 class UnprovableBodyBoundary(ValueError):
     pass
+
+
+class StoreDiscoveryMissing(Exception):
+    """Recognized missing-store condition during discovery."""
+
+
+class StoreDiscoveryInvalid(Exception):
+    """Recognized unsafe or invalid store anchor during discovery."""
 
 
 class Clock(Protocol):

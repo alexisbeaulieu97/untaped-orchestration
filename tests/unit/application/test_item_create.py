@@ -20,6 +20,7 @@ from untaped_orchestration.application.items import (
 )
 from untaped_orchestration.application.mutations import MutationExecutor
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
+from untaped_orchestration.domain.diagnostics import DiagnosticError
 from untaped_orchestration.domain.ids import DecisionId, Slug, TaskId
 from untaped_orchestration.domain.models import (
     ActiveTask,
@@ -126,6 +127,21 @@ def test_create_request_types_are_frozen_typed_and_have_no_hidden_identity_sourc
     ]
     assert "id_generator" not in CreateTask.__init__.__annotations__
     assert "id_generator" not in CreateDecision.__init__.__annotations__
+
+
+@pytest.mark.parametrize("kind", ("task", "decision"))
+def test_create_schema_validation_is_typed_orc002(tmp_path: Path, kind: str) -> None:
+    repository, location, scope, tasks, decisions, _ = _services(tmp_path)
+    revision = repository.load_local(location, headers_only=False).store_revision
+
+    with pytest.raises(DiagnosticError) as captured:
+        if kind == "task":
+            tasks.execute(scope, _task_request(revision, title=""))
+        else:
+            decisions.execute(scope, _decision_request(revision, title=""))
+
+    assert captured.value.diagnostics[0].code == "ORC002"
+    assert captured.value.diagnostics[0].field == "title"
 
 
 def test_task_create_uses_caller_id_defaults_and_reports_generated_values(tmp_path: Path) -> None:

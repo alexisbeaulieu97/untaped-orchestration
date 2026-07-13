@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
+from pydantic import ValidationError
+
 from untaped_orchestration.application.item_relations import (
     ChangeEvidence as ChangeEvidence,
 )
@@ -11,6 +13,7 @@ from untaped_orchestration.application.item_support import (
     CreateDecisionRequest,
     CreateTaskRequest,
     ItemMutationResult,
+    ItemSchemaConflict,
     ItemStateConflict,
     MutationScope,
     PlannedRecord,
@@ -49,6 +52,7 @@ from untaped_orchestration.application.ports import CanonicalFormatter, Clock, F
 from untaped_orchestration.application.results import (
     FederatedSnapshot,
 )
+from untaped_orchestration.domain.diagnostics import validation_diagnostic
 from untaped_orchestration.domain.ids import item_filename
 from untaped_orchestration.domain.models import (
     ActiveTask,
@@ -108,18 +112,28 @@ class CreateTask:
         def build(snapshot: FederatedSnapshot) -> IntendedMutation:
             if replay:
                 return IntendedMutation(replayed=True)
-            primary = ActiveTask(
-                schema="untaped.orchestration.task/v1",
-                kind=ItemKind.TASK,
-                id=request.item_id,
-                title=request.title,
-                created_at=UtcTimestamp.from_datetime(self._clock.now()),
-                tags=request.tags,
-                stage=TaskStage.PLANNED,
-                priority=request.priority,
-                rank=1000,
-                waiting_on=request.waiting_on,
-            )
+            try:
+                primary = ActiveTask(
+                    schema="untaped.orchestration.task/v1",
+                    kind=ItemKind.TASK,
+                    id=request.item_id,
+                    title=request.title,
+                    created_at=UtcTimestamp.from_datetime(self._clock.now()),
+                    tags=request.tags,
+                    stage=TaskStage.PLANNED,
+                    priority=request.priority,
+                    rank=1000,
+                    waiting_on=request.waiting_on,
+                )
+            except ValidationError as error:
+                raise ItemSchemaConflict(
+                    "invalid task metadata",
+                    validation_diagnostic(
+                        error,
+                        "ORC002",
+                        message_prefix="invalid task metadata",
+                    ),
+                ) from error
             records = {
                 record.metadata.id: record
                 for record in snapshot.selected.records
@@ -211,14 +225,24 @@ class CreateDecision:
             del snapshot
             if replay:
                 return IntendedMutation(replayed=True)
-            metadata = Decision(
-                schema="untaped.orchestration.decision/v1",
-                kind=ItemKind.DECISION,
-                id=request.item_id,
-                title=request.title,
-                created_at=UtcTimestamp.from_datetime(self._clock.now()),
-                tags=request.tags,
-            )
+            try:
+                metadata = Decision(
+                    schema="untaped.orchestration.decision/v1",
+                    kind=ItemKind.DECISION,
+                    id=request.item_id,
+                    title=request.title,
+                    created_at=UtcTimestamp.from_datetime(self._clock.now()),
+                    tags=request.tags,
+                )
+            except ValidationError as error:
+                raise ItemSchemaConflict(
+                    "invalid decision metadata",
+                    validation_diagnostic(
+                        error,
+                        "ORC002",
+                        message_prefix="invalid decision metadata",
+                    ),
+                ) from error
             path = PurePosixPath("decisions") / item_filename(request.item_id, request.title)
             planned.path = path
             planned.metadata = metadata

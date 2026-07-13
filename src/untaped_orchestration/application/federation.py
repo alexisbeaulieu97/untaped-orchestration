@@ -7,10 +7,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from pydantic import ValidationError
+
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
     FileReplacement,
     LockManager,
+    StoreDiscoveryInvalid,
+    StoreDiscoveryMissing,
     StoreLockTimeout,
     StoreReader,
     StoreWriter,
@@ -39,6 +43,7 @@ from untaped_orchestration.domain.diagnostics import (
     DiagnosticSeverity,
     diagnostic_sort_key,
     expected_diagnostic,
+    validation_diagnostic,
 )
 from untaped_orchestration.domain.ids import StoreId
 from untaped_orchestration.domain.models import Registry, RegistryChild, Revision
@@ -54,6 +59,17 @@ class RegistryRevisionConflict(DiagnosticError):
 class RegistryMutationConflict(DiagnosticError):
     def __init__(self, message: str) -> None:
         super().__init__(expected_diagnostic("ORC005", message, field="children"))
+
+
+class RegistryPathConflict(DiagnosticError):
+    def __init__(self, error: ValidationError) -> None:
+        super().__init__(
+            validation_diagnostic(
+                error,
+                "ORC003",
+                message_prefix="invalid registry child path",
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,7 +462,7 @@ class FederationService:
             candidate = parent.snapshot.location.root.joinpath(*PurePosixPath(child.path).parts)
             try:
                 location = self._reader.discover(parent.snapshot.location.root, override=candidate)
-            except OSError as error:
+            except FileNotFoundError, StoreDiscoveryMissing:
                 resolution.entries.append(
                     _incomplete(
                         child.id,
@@ -455,13 +471,13 @@ class FederationService:
                         severity="warning",
                         path=_registry_path(parent.snapshot),
                         field=field,
-                        message=f"registered child store is missing or inaccessible: {error}",
+                        message="registered child store is missing or inaccessible",
                         hint="Restore the child store at its registered path or remove the entry.",
                     )
                 )
                 resolution.declared_ids.add(child.id.root)
                 continue
-            except ValueError as error:
+            except StoreDiscoveryInvalid:
                 resolution.entries.append(
                     _incomplete(
                         child.id,
@@ -470,12 +486,14 @@ class FederationService:
                         severity="error",
                         path=_registry_path(parent.snapshot),
                         field=field,
-                        message=f"registered child store path is invalid: {error}",
+                        message="registered child store path is invalid",
                         hint="Repair the child registry path before retrying.",
                     )
                 )
                 resolution.declared_ids.add(child.id.root)
                 continue
+            except DiagnosticError:
+                raise
             if self._path_is_duplicate(
                 location,
                 child.id,
@@ -546,7 +564,7 @@ class FederationService:
     ) -> None:
         try:
             snapshot = self._reader.load_local(location, headers_only=headers_only)
-        except OSError as error:
+        except FileNotFoundError, StoreDiscoveryMissing:
             resolution.entries.append(
                 _incomplete(
                     expected_store_id,
@@ -555,25 +573,13 @@ class FederationService:
                     severity="warning",
                     path=_registry_path(parent.snapshot),
                     field=f"children.{expected_store_id.root}",
-                    message=f"registered child store became inaccessible while loading: {error}",
+                    message="registered child store became inaccessible while loading",
                     hint="Restore the child store and retry federation resolution.",
                 )
             )
             return
-        except ValueError as error:
-            resolution.entries.append(
-                _incomplete(
-                    expected_store_id,
-                    reason="invalid",
-                    code="ORC005",
-                    severity="error",
-                    path=_registry_path(parent.snapshot),
-                    field=f"children.{expected_store_id.root}",
-                    message=f"registered child store could not be loaded: {error}",
-                    hint="Repair the child store filesystem and retry.",
-                )
-            )
-            return
+        except DiagnosticError:
+            raise
 
         participant = _Participant(expected_store_id, snapshot, exposed=False)
         key = _path_key(location.real_root)
@@ -621,13 +627,15 @@ class FederationService:
                     optimistic.location.root,
                     override=optimistic.location.root,
                 )
-            except (OSError, ValueError) as error:
+            except FileNotFoundError, StoreDiscoveryMissing, StoreDiscoveryInvalid:
                 self._record_change(
                     participant,
                     resolution,
-                    f"store path or anchor changed during federation resolution: {error}",
+                    "store path or anchor changed during federation resolution",
                 )
                 continue
+            except DiagnosticError:
+                raise
             if current_location.real_root != optimistic.location.real_root:
                 self._record_change(
                     participant,
@@ -637,13 +645,15 @@ class FederationService:
                 continue
             try:
                 current = self._reader.load_local(current_location, headers_only=headers_only)
-            except (OSError, ValueError) as error:
+            except FileNotFoundError, StoreDiscoveryMissing:
                 self._record_change(
                     participant,
                     resolution,
-                    f"store anchor or registry changed during federation resolution: {error}",
+                    "store anchor or registry changed during federation resolution",
                 )
                 continue
+            except DiagnosticError:
+                raise
             if self._anchors_changed(optimistic, current):
                 self._record_change(
                     participant,
@@ -765,7 +775,10 @@ class FederationRegistryService:
         child_id = (
             request.child_id if isinstance(request.child_id, StoreId) else StoreId(request.child_id)
         )
-        child = RegistryChild(id=child_id, path=request.path)
+        try:
+            child = RegistryChild(id=child_id, path=request.path)
+        except ValidationError as error:
+            raise RegistryPathConflict(error) from error
         current = self._optimistic(request.location)
         selected = current.selected
         if selected.registry is None:

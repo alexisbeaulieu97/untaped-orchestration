@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -13,6 +14,8 @@ from tests.builders import CHILD_STORE_ID, STORE_ID
 from untaped_orchestration.application.federation import FederationService, UnidentifiedStoreError
 from untaped_orchestration.application.ports import StoreLockTimeout
 from untaped_orchestration.application.results import LoadedRecord, StoreLocation, StoreSnapshot
+from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
 from untaped_orchestration.domain.models import Registry, Revision, StoreConfig
 from untaped_orchestration.infrastructure.codec import RegistryCodec, StoreConfigCodec
 
@@ -265,6 +268,62 @@ def test_known_participant_disappearing_at_lock_entry_closes_the_lease() -> None
     assert lease.reader is None
     assert not lease.snapshot.completeness.complete
     assert any(value.diagnostic.code == "ORC007" for value in lease.snapshot.completeness.entries)
+    assert str(child_root) not in lease.snapshot.completeness.entries[0].diagnostic.message
+
+
+def test_unexpected_child_load_error_is_redacted_and_exits_five(capfd) -> None:
+    root = Path("/work/root")
+    child_root = Path("/work/child")
+    selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
+    child = _snapshot(child_root, CHILD_STORE_ID)
+
+    class FailingChildReader(ScriptedReader):
+        def load_local(self, location: StoreLocation, *, headers_only: bool) -> StoreSnapshot:
+            if location.root == child_root:
+                raise OSError("secret child transport")
+            return super().load_local(location, headers_only=headers_only)
+
+    reader = FailingChildReader((selected, child))
+    with pytest.raises(SystemExit) as raised:
+        run_command(
+            "brief",
+            lambda: CommandResult(
+                "brief",
+                FederationService(reader, RecordingLocks()).load(
+                    selected.location,
+                    local=False,
+                    headers_only=True,
+                ),
+            ),
+            fmt="json",
+            allowed=("json",),
+        )
+
+    assert raised.value.code == 5
+    captured = capfd.readouterr()
+    assert "secret child transport" not in captured.out + captured.err
+    assert json.loads(captured.out)["diagnostics"][0]["code"] == "ORC002"
+
+
+def test_child_load_preserves_typed_diagnostic() -> None:
+    root = Path("/work/root")
+    child_root = Path("/work/child")
+    selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
+    child = _snapshot(child_root, CHILD_STORE_ID)
+    failure = DiagnosticError(expected_diagnostic("ORC003", "typed child path failure"))
+
+    class FailingChildReader(ScriptedReader):
+        def load_local(self, location: StoreLocation, *, headers_only: bool) -> StoreSnapshot:
+            if location.root == child_root:
+                raise failure
+            return super().load_local(location, headers_only=headers_only)
+
+    with pytest.raises(DiagnosticError) as captured:
+        FederationService(FailingChildReader((selected, child)), RecordingLocks()).load(
+            selected.location, local=False, headers_only=True
+        )
+
+    assert captured.value is failure
 
 
 def test_recursive_resolution_uses_explicit_depth_first_and_global_lock_order() -> None:
@@ -572,17 +631,8 @@ def test_generic_timeout_with_a_location_shape_is_not_mistaken_for_port_timeout(
         )
 
 
-@pytest.mark.parametrize(
-    ("discovery_error", "expected_severity"),
-    [
-        (FileNotFoundError("unavailable"), "warning"),
-        (ValueError("invalid registered path"), "error"),
-    ],
-)
-def test_child_discovery_severity_distinguishes_availability_from_invalidity(
-    discovery_error: Exception,
-    expected_severity: str,
-) -> None:
+def test_missing_child_discovery_is_a_static_warning() -> None:
+    discovery_error = FileNotFoundError("unavailable")
     root = Path("/work/root")
     candidate = Path("/work/child")
     selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
@@ -595,7 +645,8 @@ def test_child_discovery_severity_distinguishes_availability_from_invalidity(
         headers_only=True,
     )
 
-    assert result.completeness.entries[0].diagnostic.severity == expected_severity
+    assert result.completeness.entries[0].diagnostic.severity == "warning"
+    assert str(discovery_error) not in result.completeness.entries[0].diagnostic.message
 
 
 def test_untrusted_children_are_locked_in_global_order_but_missing_children_are_not() -> None:

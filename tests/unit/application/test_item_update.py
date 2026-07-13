@@ -8,6 +8,7 @@ import pytest
 
 from tests.builders import STORE_ID, TASK_ID
 from untaped_orchestration.application.bootstrap import InitializeStore, InitRequest
+from untaped_orchestration.application.item_support import RelationConflict, validated_copy
 from untaped_orchestration.application.items import (
     CreateDecision,
     CreateDecisionRequest,
@@ -28,9 +29,15 @@ from untaped_orchestration.application.results import (
     FederatedSnapshot,
     IncompleteStore,
 )
-from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticError
 from untaped_orchestration.domain.ids import DecisionId, Slug, StoreId, TaskId
-from untaped_orchestration.domain.models import Revision, TaskPriority, TaskStage
+from untaped_orchestration.domain.models import (
+    Link,
+    LinkRelation,
+    Revision,
+    TaskPriority,
+    TaskStage,
+)
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -137,6 +144,63 @@ def test_task_update_replaces_only_owned_fields_and_keeps_creation_filename(
     assert task.rank == 1000
     assert updated.record.path == created.record.path
     assert updated.receipt.views_current
+
+
+def test_task_update_schema_validation_is_orc002(tmp_path: Path) -> None:
+    repository, location, scope, executor = _state(tmp_path)
+    before = repository.load_local(location, headers_only=False)
+    created = CreateTask(executor, repository, Clock()).execute(
+        scope,
+        CreateTaskRequest(
+            TaskId(TASK_ID),
+            "Task",
+            b"",
+            (),
+            TaskPriority.NORMAL,
+            (),
+            before.store_revision,
+        ),
+    )
+
+    with pytest.raises(DiagnosticError) as captured:
+        UpdateTask(executor, repository).execute(
+            scope,
+            UpdateTaskRequest(TaskId(TASK_ID), created.record.revision, title=""),
+        )
+
+    assert captured.value.diagnostics[0].code == "ORC002"
+    assert captured.value.diagnostics[0].field == "title"
+
+
+def test_validated_copy_distinguishes_relation_and_lifecycle_failures(tmp_path: Path) -> None:
+    repository, location, scope, executor = _state(tmp_path)
+    before = repository.load_local(location, headers_only=False)
+    created = CreateTask(executor, repository, Clock()).execute(
+        scope,
+        CreateTaskRequest(
+            TaskId(TASK_ID),
+            "Task",
+            b"",
+            (),
+            TaskPriority.NORMAL,
+            (),
+            before.store_revision,
+        ),
+    )
+    task = created.record.metadata
+    link = Link(
+        relation=LinkRelation.SUPERSEDES,
+        target_store_id=StoreId(STORE_ID),
+        target=TaskId("tsk_019f0000000070008000000000000001"),
+    )
+
+    with pytest.raises(RelationConflict) as relation:
+        validated_copy(task, {"links": (link, link)})
+    assert relation.value.diagnostics[0].code == "ORC004"
+
+    with pytest.raises(ItemStateConflict) as lifecycle:
+        validated_copy(task, {"stage": TaskStage.BACKLOG})
+    assert lifecycle.value.diagnostics[0].code == "ORC006"
 
 
 def test_updates_require_one_change_and_exact_current_item_revision(tmp_path: Path) -> None:

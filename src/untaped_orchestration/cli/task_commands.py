@@ -105,13 +105,14 @@ def register(app: App) -> None:  # noqa: C901
         del debug
 
         def action() -> CommandResult:
+            body = _body(body_file)
             context = CliContext.resolve(store)
             result = context.create_task().execute(
                 context.scope,
                 CreateTaskRequest(
                     _task_id(id),
                     title,
-                    _body(body_file),
+                    body,
                     tuple(_slug(value) for value in tag),
                     priority,
                     tuple(_slug(value) for value in waiting_on),
@@ -159,6 +160,7 @@ def register(app: App) -> None:  # noqa: C901
             raise SystemExit(2)
 
         def action() -> CommandResult:
+            body = None if body_file is None else _body(body_file)
             context = CliContext.resolve(store)
             result = context.update_task().execute(
                 context.scope,
@@ -167,7 +169,7 @@ def register(app: App) -> None:  # noqa: C901
                     _revision(if_revision),
                     force_current,
                     title,
-                    None if body_file is None else _body(body_file),
+                    body,
                     priority,
                     ()
                     if clear_tags

@@ -353,8 +353,11 @@ def test_init_rejects_store_name_line_breaks_before_any_canonical_write(
     target = tmp_path / "repository"
     target.mkdir()
 
-    with pytest.raises(ValueError, match="line breaks"):
+    with pytest.raises(ValueError, match="line breaks") as captured:
         _service().execute(_request(target, name=name))
+
+    assert captured.value.diagnostics[0].code == "ORC002"
+    assert captured.value.diagnostics[0].field == "name"
 
     root = target / ".untaped" / "orchestration"
     assert not root.exists() or not root.joinpath("store.toml").exists()

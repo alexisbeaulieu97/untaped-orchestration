@@ -25,6 +25,7 @@ from untaped_orchestration.domain.diagnostics import (
     DiagnosticCode,
     DiagnosticError,
     expected_diagnostic,
+    validation_diagnostic,
 )
 from untaped_orchestration.domain.evidence import EvidenceReference, EvidenceRelation
 from untaped_orchestration.domain.ids import DecisionId, Slug, StoreId, TaskId
@@ -59,6 +60,10 @@ class CreateConflict(ItemMutationConflict):
 
 class ItemStateConflict(ItemMutationConflict):
     pass
+
+
+class ItemSchemaConflict(ItemMutationConflict):
+    code: DiagnosticCode = "ORC002"
 
 
 class RelationConflict(ItemMutationConflict):
@@ -246,8 +251,34 @@ def validated_copy(
             return ArchivedTask.model_validate(values)
         return Decision.model_validate(values)
     except ValidationError as error:
-        message = error.errors()[0]["msg"]
-        raise ItemStateConflict(f"invalid item lifecycle state: {message}") from error
+        conflict: type[ItemMutationConflict]
+        if updates.keys() & {"links", "evidence"}:
+            conflict = RelationConflict
+            prefix = "invalid item relation"
+        elif updates.keys() & {
+            "stage",
+            "parent",
+            "started_at",
+            "revisit_when",
+            "reviewed_at",
+            "review_on",
+            "waiting_on",
+            "closed_from",
+            "outcome",
+            "closed_at",
+            "close_note",
+            "retired_at",
+            "retire_note",
+        }:
+            conflict = ItemStateConflict
+            prefix = "invalid item lifecycle state"
+        else:
+            conflict = ItemSchemaConflict
+            prefix = "invalid item metadata"
+        raise conflict(
+            prefix,
+            validation_diagnostic(error, conflict.code, message_prefix=prefix),
+        ) from error
 
 
 def execute_mutation(

@@ -2,7 +2,7 @@ import posixpath
 from collections.abc import Iterable
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 type DiagnosticCode = Literal[
     "ORC001",
@@ -71,6 +71,24 @@ def expected_diagnostic(
             message=message,
             hint=hint,
         ),
+    )
+
+
+def validation_diagnostic(
+    error: ValidationError,
+    code: DiagnosticCode,
+    *,
+    message_prefix: str,
+    path: str = "",
+    field: str | None = None,
+) -> tuple[Diagnostic, ...]:
+    first = error.errors()[0]
+    location = ".".join(str(part) for part in first["loc"])
+    return expected_diagnostic(
+        code,
+        f"{message_prefix}: {first['msg']}",
+        path=path,
+        field=location if field is None else field,
     )
 
 

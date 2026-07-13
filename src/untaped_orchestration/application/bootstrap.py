@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import tomli_w
+from pydantic import ValidationError
 
 from untaped_orchestration.application.ports import (
     FileDeletion,
@@ -23,7 +24,11 @@ from untaped_orchestration.application.scaffold import (
     REGISTRY_PATH,
     STORE_PATH,
 )
-from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
+from untaped_orchestration.domain.diagnostics import (
+    DiagnosticError,
+    expected_diagnostic,
+    validation_diagnostic,
+)
 from untaped_orchestration.domain.models import Registry, Revision, StoreConfig
 
 DEFAULT_LOCK_TIMEOUT = 10.0
@@ -35,6 +40,13 @@ class InitConflictError(DiagnosticError):
         super().__init__(expected_diagnostic("ORC003", message, field="path"))
 
 
+class InitSchemaError(DiagnosticError):
+    def __init__(self, error: ValidationError) -> None:
+        super().__init__(
+            validation_diagnostic(error, "ORC002", message_prefix="invalid store metadata")
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class InitRequest:
     target: Path
@@ -43,6 +55,38 @@ class InitRequest:
     timezone: str
     public: bool = False
     decisions_only: bool = False
+
+
+def _initial_models(request: InitRequest) -> tuple[StoreConfig, Registry]:
+    try:
+        config = StoreConfig.model_validate(
+            {
+                "schema": "untaped.orchestration.store/v1",
+                "id": request.store_id,
+                "name": request.name,
+                "visibility": "public" if request.public else "private",
+                "timezone": request.timezone,
+                "capabilities": {"active_tasks": not (request.public or request.decisions_only)},
+                "curation": {"inbox_review_days": 7, "in_progress_review_days": 14},
+                "brief": {
+                    "pinned_decisions": [],
+                    "max_decision_body_bytes": 4096,
+                    "max_total_body_bytes": 16384,
+                    "max_rows_per_section": 10,
+                    "max_total_bytes": 32768,
+                },
+            }
+        )
+        registry = Registry.model_validate(
+            {
+                "schema": "untaped.orchestration.registry/v1",
+                "store_id": request.store_id,
+                "children": [],
+            }
+        )
+    except ValidationError as error:
+        raise InitSchemaError(error) from error
+    return config, registry
 
 
 def _canonical_toml(model: StoreConfig | Registry) -> bytes:
@@ -107,31 +151,7 @@ class InitializeStore:
     def execute(self, request: InitRequest) -> MutationReceipt:
         if request.public and request.decisions_only:
             raise ValueError("--public and --decisions-only are mutually exclusive")
-        config = StoreConfig.model_validate(
-            {
-                "schema": "untaped.orchestration.store/v1",
-                "id": request.store_id,
-                "name": request.name,
-                "visibility": "public" if request.public else "private",
-                "timezone": request.timezone,
-                "capabilities": {"active_tasks": not (request.public or request.decisions_only)},
-                "curation": {"inbox_review_days": 7, "in_progress_review_days": 14},
-                "brief": {
-                    "pinned_decisions": [],
-                    "max_decision_body_bytes": 4096,
-                    "max_total_body_bytes": 16384,
-                    "max_rows_per_section": 10,
-                    "max_total_bytes": 32768,
-                },
-            }
-        )
-        registry = Registry.model_validate(
-            {
-                "schema": "untaped.orchestration.registry/v1",
-                "store_id": request.store_id,
-                "children": [],
-            }
-        )
+        config, registry = _initial_models(request)
         root = request.target / ".untaped" / "orchestration"
         location = self._writer.prepare(root)
         canonical = {

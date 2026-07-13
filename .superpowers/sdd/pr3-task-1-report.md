@@ -93,3 +93,30 @@ wrapper that destroys an existing typed diagnostic.
 Configuration-only constructor guards and service-not-configured assertions
 remain ordinary exceptions intentionally: CLI usage is rejected before service
 execution, while impossible dependency wiring is an internal exit-5 failure.
+
+## Diagnostic review follow-up
+
+A post-Task-1 review found three remaining caller-reachable gaps. Pydantic
+validation still escaped task/decision creation, store initialization, and
+registry child path construction; `validated_copy` recoded every model error
+as ORC006; and federation resolution caught broad `OSError`/`ValueError`
+families while embedding exception text in public diagnostics.
+
+The focused RED suite demonstrated all three issues:
+`16 failed, 84 passed in 8.80s`. The production follow-up now converts schema
+and field validation to ORC002, registry child paths to ORC003, body bounds and
+UTF-8 failures to ORC001, relation validation to ORC004, and lifecycle
+validation to ORC006. Body files are validated before context/service access.
+Federation catches only explicit missing/invalid discovery markers and raw
+`FileNotFoundError`, emits static ORC005/ORC007 messages, preserves unrelated
+typed diagnostics, and lets arbitrary failures reach the redacted exit-5 path.
+
+Follow-up verification:
+
+- Focused GREEN: `99 passed in 8.26s`.
+- Full unit suite: `847 passed in 43.54s`.
+- Relevant integration suite: `32 passed, 1 warning in 4.71s`; the warning is
+  the existing Cyclopts pytest no-token invocation warning.
+- Ruff check: `All checks passed!`.
+- Ruff format: `114 files already formatted`.
+- mypy: `Success: no issues found in 58 source files`.

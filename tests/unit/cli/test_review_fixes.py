@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from tests.builders import TASK_ID
 from untaped_orchestration.cli import app, maintenance_commands, read_commands, task_commands
+from untaped_orchestration.cli.context import CliContext
+from untaped_orchestration.domain.diagnostics import DiagnosticError
 
 
 @pytest.mark.parametrize(
@@ -101,8 +104,49 @@ def test_body_file_rejects_oversize_and_invalid_utf8(
     module = __import__(f"untaped_orchestration.cli.{module_name}", fromlist=["_body"])
     body = tmp_path / "body.md"
     body.write_bytes(b"x" * (1024 * 1024 + 1))
-    with pytest.raises(ValueError, match="1 MiB"):
+    with pytest.raises(DiagnosticError, match="1 MiB") as oversized:
         module._body(body)
+    assert oversized.value.diagnostics[0].code == "ORC001"
     body.write_bytes(b"\xff")
-    with pytest.raises(ValueError, match="UTF-8"):
+    with pytest.raises(DiagnosticError, match="UTF-8") as invalid:
         module._body(body)
+    assert invalid.value.diagnostics[0].code == "ORC001"
+
+
+def test_invalid_body_file_uses_typed_command_failure_before_service(
+    tmp_path: Path,
+    monkeypatch,
+    capfd,
+) -> None:
+    body = tmp_path / "body.md"
+    body.write_bytes(b"\xff")
+
+    class Context:
+        scope = object()
+
+        def create_task(self):
+            raise AssertionError("invalid body input must not call the service")
+
+    monkeypatch.setattr(CliContext, "resolve", classmethod(lambda cls, store: Context()))
+    with pytest.raises(SystemExit) as raised:
+        app(
+            (
+                "task",
+                "create",
+                "--id",
+                TASK_ID,
+                "--title",
+                "Task",
+                "--body-file",
+                str(body),
+                "--if-store-revision",
+                f"sha256:{'a' * 64}",
+                "--format",
+                "json",
+            ),
+            exit_on_error=False,
+        )
+
+    assert raised.value.code == 1
+    payload = json.loads(capfd.readouterr().out)
+    assert payload["diagnostics"][0]["code"] == "ORC001"

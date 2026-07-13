@@ -6,7 +6,13 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
-from untaped_orchestration.application.ports import RawReference, StoreEntry, StoreLocation
+from untaped_orchestration.application.ports import (
+    RawReference,
+    StoreDiscoveryInvalid,
+    StoreDiscoveryMissing,
+    StoreEntry,
+    StoreLocation,
+)
 from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
 from untaped_orchestration.domain.models import Revision
 
@@ -32,12 +38,12 @@ VIEW_PATHS = frozenset(
 )
 
 
-class StoreNotFoundError(DiagnosticError, FileNotFoundError):
+class StoreNotFoundError(DiagnosticError, FileNotFoundError, StoreDiscoveryMissing):
     def __init__(self, message: str) -> None:
         super().__init__(expected_diagnostic("ORC003", message, field="path"))
 
 
-class PathSafetyError(DiagnosticError):
+class PathSafetyError(DiagnosticError, StoreDiscoveryInvalid):
     def __init__(self, path: Path | PurePosixPath, message: str) -> None:
         self.path = path
         super().__init__(expected_diagnostic("ORC003", message, path=path.as_posix(), field="path"))

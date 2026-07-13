@@ -92,13 +92,14 @@ def register(app: App) -> None:
         del debug
 
         def action() -> CommandResult:
+            body = _body(body_file)
             context = CliContext.resolve(store)
             result = context.create_decision().execute(
                 context.scope,
                 CreateDecisionRequest(
                     _decision_id(id),
                     title,
-                    _body(body_file),
+                    body,
                     tuple(_slug(value) for value in tag),
                     _required_revision(if_store_revision),
                 ),
@@ -137,6 +138,7 @@ def register(app: App) -> None:
             raise SystemExit(2)
 
         def action() -> CommandResult:
+            body = None if body_file is None else _body(body_file)
             context = CliContext.resolve(store)
             result = context.update_decision().execute(
                 context.scope,
@@ -145,7 +147,7 @@ def register(app: App) -> None:
                     _revision(if_revision),
                     force_current,
                     title,
-                    None if body_file is None else _body(body_file),
+                    body,
                     ()
                     if clear_tags
                     else (None if tag is None else tuple(_slug(value) for value in tag)),
@@ -186,12 +188,13 @@ def register(app: App) -> None:
         )
 
         def action() -> CommandResult:
+            body = _body(body_file)
             context = CliContext.resolve(store)
             result = context.decisions().supersede(
                 SupersedeDecisionRequest(
                     _decision_id(id),
                     title,
-                    _body(body_file),
+                    body,
                     tuple(_slug(value) for value in tag),
                     guards,
                     _revision(if_store_revision),

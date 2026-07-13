@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from tests.builders import CHILD_STORE_ID, STORE_ID, registry_bytes, store_bytes, write_store
 from untaped_orchestration.application.federation import (
@@ -202,7 +201,7 @@ def test_invalid_absolute_child_path_is_rejected_before_any_store_io(tmp_path: P
         repository, repository, FileLockManager(), MarkdownViewRenderer(), repository
     )
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError) as captured:
         service.add_child(
             AddChildRequest(
                 location_from_root(parent),
@@ -213,6 +212,9 @@ def test_invalid_absolute_child_path_is_rejected_before_any_store_io(tmp_path: P
                 ).registry_revision,
             )
         )
+
+    assert captured.value.diagnostics[0].code == "ORC003"
+    assert captured.value.diagnostics[0].field == "path"
 
     assert repository.calls == 0
 
