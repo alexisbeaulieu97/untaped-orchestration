@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import fields, replace
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 from tests.unit.application.test_task_transition import Clock, state
+from untaped_orchestration.application import decisions as decisions_module
 from untaped_orchestration.application.decision_recovery import (
     SupersedePhase,
     recognize_supersede_phase,
@@ -25,10 +27,12 @@ from untaped_orchestration.application.items import (
 from untaped_orchestration.application.ports import FileReplacement
 from untaped_orchestration.application.results import Completeness, FederatedSnapshot
 from untaped_orchestration.application.validation import _graph_state
+from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.domain.diagnostics import DiagnosticError
 from untaped_orchestration.domain.evidence import Evidence, EvidenceReference, EvidenceRelation
 from untaped_orchestration.domain.graph import DecisionRef, DecisionState, decision_state
 from untaped_orchestration.domain.ids import DecisionId, Slug
-from untaped_orchestration.domain.models import Decision, LinkRelation, Revision
+from untaped_orchestration.domain.models import Decision, Link, LinkRelation, Revision
 from untaped_orchestration.domain.time import CalendarDate
 
 
@@ -131,6 +135,66 @@ def test_supersede_consolidates_predecessors_and_preserves_pin_order(tmp_path: P
         decision_state(DecisionRef(final.store.id, first.record.metadata.id), graph)
         is DecisionState.SUPERSEDED
     )
+
+
+@pytest.mark.parametrize(
+    ("changes", "field"),
+    (
+        ({"title": ""}, "title"),
+        ({"tags": (Slug("duplicate"), Slug("duplicate"))}, "tags"),
+    ),
+)
+def test_fresh_supersede_schema_failure_is_orc002_exit_one_without_mutation(
+    tmp_path: Path,
+    capfd,
+    changes: dict[str, object],
+    field: str,
+) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    predecessor = create_decision(repository, location, scope, executor, 1)
+    before = repository.load_local(location, headers_only=False)
+    request = replace(supersede_request((predecessor,), before.store_revision), **changes)
+
+    with pytest.raises(SystemExit) as captured:
+        run_command(
+            "decision supersede",
+            lambda: CommandResult(
+                "decision supersede",
+                service(executor, repository, scope).supersede(request),
+            ),
+            fmt="json",
+            allowed=("json",),
+        )
+
+    assert captured.value.code == 1
+    diagnostic = json.loads(capfd.readouterr().out)["diagnostics"][0]
+    assert diagnostic["code"] == "ORC002"
+    assert diagnostic["field"] == field
+    assert repository.load_local(location, headers_only=False) == before
+
+
+def test_fresh_supersede_generated_relation_failure_remains_orc004(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository, location, scope, executor, _ = state(tmp_path)
+    predecessor = create_decision(repository, location, scope, executor, 1)
+    before = repository.load_local(location, headers_only=False)
+    assert before.store is not None
+    invalid = Link(
+        relation=LinkRelation.GOVERNED_BY,
+        target_store_id=before.store.id,
+        target=predecessor.record.metadata.id,
+    )
+    monkeypatch.setattr(decisions_module, "supersedes_links", lambda *args: (invalid,))
+
+    with pytest.raises(DiagnosticError) as captured:
+        service(executor, repository, scope).supersede(
+            supersede_request((predecessor,), before.store_revision)
+        )
+
+    assert captured.value.diagnostics[0].code == "ORC004"
+    assert repository.load_local(location, headers_only=False) == before
 
 
 def test_supersede_rejects_stale_guards_duplicates_and_inactive_predecessors(

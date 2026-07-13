@@ -120,3 +120,31 @@ Follow-up verification:
 - Ruff check: `All checks passed!`.
 - Ruff format: `114 files already formatted`.
 - mypy: `Success: no issues found in 58 source files`.
+
+## Precise mutation-validation follow-up
+
+A second review found that fresh decision supersede still constructed its
+caller-controlled successor without typed validation handling, and that
+`validated_copy` selected an ORC family from requested update keys instead of
+the actual Pydantic failure. That made invalid successor title/tags exit 5 and
+allowed an unrelated valid lifecycle-key update to recode a title failure as
+ORC006.
+
+The focused RED suite was `4 failed, 23 passed in 0.98s`. Fresh supersede now
+uses the same item-validation classifier as update mutations. The classifier
+uses the first actual validation location and model-level category: ordinary
+field/schema failures, including duplicate waiting parties, are ORC002;
+relation/link failures are ORC004; and true lifecycle failures remain ORC006.
+Fresh supersede schema failures exit 1 and leave the store snapshot unchanged.
+
+Second follow-up verification:
+
+- Focused GREEN: `27 passed in 0.89s`.
+- Broader affected unit slice: `68 passed in 0.94s`.
+- Full unit suite: `850 passed in 6.16s`.
+- Relevant integration suite, including item mutations:
+  `47 passed, 1 warning in 1.23s`; the warning is the existing Cyclopts pytest
+  no-token invocation warning.
+- Ruff check: `All checks passed!`.
+- Ruff format: `114 files already formatted`.
+- mypy: `Success: no issues found in 58 source files`.

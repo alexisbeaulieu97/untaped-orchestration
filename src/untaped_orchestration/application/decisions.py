@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from pydantic import ValidationError
+
 from untaped_orchestration.application.decision_recovery import (
     SupersedePhase,
     exact_successor_shape,
@@ -20,6 +22,7 @@ from untaped_orchestration.application.item_support import (
     RevisionConflict,
     execute_mutation,
     guard_revision,
+    item_validation_conflict,
     record_result,
     selected_record,
     selected_store_id,
@@ -263,15 +266,18 @@ class _SupersedeOperation:
         self.planned.body = successor.body
 
     def _successor_replacement(self) -> FileReplacement:
-        metadata = Decision(
-            schema="untaped.orchestration.decision/v1",
-            id=self.request.successor_id,
-            kind=ItemKind.DECISION,
-            title=self.request.title,
-            created_at=UtcTimestamp.from_datetime(self.clock.now()),
-            tags=self.request.tags,
-            links=self.links,
-        )
+        try:
+            metadata = Decision(
+                schema="untaped.orchestration.decision/v1",
+                id=self.request.successor_id,
+                kind=ItemKind.DECISION,
+                title=self.request.title,
+                created_at=UtcTimestamp.from_datetime(self.clock.now()),
+                tags=self.request.tags,
+                links=self.links,
+            )
+        except ValidationError as error:
+            raise item_validation_conflict(error) from error
         path = PurePosixPath("decisions") / item_filename(
             self.request.successor_id, self.request.title
         )

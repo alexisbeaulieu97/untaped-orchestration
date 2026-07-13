@@ -172,7 +172,7 @@ def test_task_update_schema_validation_is_orc002(tmp_path: Path) -> None:
     assert captured.value.diagnostics[0].field == "title"
 
 
-def test_validated_copy_distinguishes_relation_and_lifecycle_failures(tmp_path: Path) -> None:
+def test_validated_copy_classifies_the_actual_validation_error(tmp_path: Path) -> None:
     repository, location, scope, executor = _state(tmp_path)
     before = repository.load_local(location, headers_only=False)
     created = CreateTask(executor, repository, Clock()).execute(
@@ -197,6 +197,16 @@ def test_validated_copy_distinguishes_relation_and_lifecycle_failures(tmp_path: 
     with pytest.raises(RelationConflict) as relation:
         validated_copy(task, {"links": (link, link)})
     assert relation.value.diagnostics[0].code == "ORC004"
+
+    with pytest.raises(DiagnosticError) as mixed:
+        validated_copy(task, {"title": "", "waiting_on": ()})
+    assert mixed.value.diagnostics[0].code == "ORC002"
+    assert mixed.value.diagnostics[0].field == "title"
+
+    with pytest.raises(DiagnosticError) as waiting:
+        validated_copy(task, {"waiting_on": (Slug("alexis"), Slug("alexis"))})
+    assert waiting.value.diagnostics[0].code == "ORC002"
+    assert waiting.value.diagnostics[0].field == "waiting_on"
 
     with pytest.raises(ItemStateConflict) as lifecycle:
         validated_copy(task, {"stage": TaskStage.BACKLOG})

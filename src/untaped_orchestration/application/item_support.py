@@ -70,6 +70,52 @@ class RelationConflict(ItemMutationConflict):
     code: DiagnosticCode = "ORC004"
 
 
+_RELATION_FIELDS = frozenset({"links", "evidence"})
+_LIFECYCLE_FIELDS = frozenset(
+    {
+        "stage",
+        "started_at",
+        "revisit_when",
+        "reviewed_at",
+        "review_on",
+        "closed_from",
+        "outcome",
+        "closed_at",
+        "close_note",
+        "retired_at",
+        "retire_note",
+    }
+)
+_RELATION_MESSAGE_PARTS = (
+    "link",
+    "relation",
+    "supersedes",
+    "governed-by",
+    "depends-on",
+    "follow-up-to",
+)
+
+
+def item_validation_conflict(error: ValidationError) -> ItemMutationConflict:
+    first = error.errors()[0]
+    location = first["loc"]
+    field = str(location[0]) if location else ""
+    message = str(first["msg"]).casefold()
+    if field in _RELATION_FIELDS or any(part in message for part in _RELATION_MESSAGE_PARTS):
+        conflict: type[ItemMutationConflict] = RelationConflict
+        prefix = "invalid item relation"
+    elif not location or field in _LIFECYCLE_FIELDS:
+        conflict = ItemStateConflict
+        prefix = "invalid item lifecycle state"
+    else:
+        conflict = ItemSchemaConflict
+        prefix = "invalid item metadata"
+    return conflict(
+        prefix,
+        validation_diagnostic(error, conflict.code, message_prefix=prefix),
+    )
+
+
 def validate_force_current(
     force_current: bool,
     revisions: tuple[Revision | None, ...],
@@ -251,34 +297,7 @@ def validated_copy(
             return ArchivedTask.model_validate(values)
         return Decision.model_validate(values)
     except ValidationError as error:
-        conflict: type[ItemMutationConflict]
-        if updates.keys() & {"links", "evidence"}:
-            conflict = RelationConflict
-            prefix = "invalid item relation"
-        elif updates.keys() & {
-            "stage",
-            "parent",
-            "started_at",
-            "revisit_when",
-            "reviewed_at",
-            "review_on",
-            "waiting_on",
-            "closed_from",
-            "outcome",
-            "closed_at",
-            "close_note",
-            "retired_at",
-            "retire_note",
-        }:
-            conflict = ItemStateConflict
-            prefix = "invalid item lifecycle state"
-        else:
-            conflict = ItemSchemaConflict
-            prefix = "invalid item metadata"
-        raise conflict(
-            prefix,
-            validation_diagnostic(error, conflict.code, message_prefix=prefix),
-        ) from error
+        raise item_validation_conflict(error) from error
 
 
 def execute_mutation(
