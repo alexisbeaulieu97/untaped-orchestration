@@ -53,7 +53,12 @@ from untaped_orchestration.application.results import (
 from untaped_orchestration.application.scaffold import ShapeInspection, inspect_store_shape
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.application.view_management import apply_views, view_comparisons
-from untaped_orchestration.domain.diagnostics import Diagnostic, sort_diagnostics
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticError,
+    expected_diagnostic,
+    sort_diagnostics,
+)
 from untaped_orchestration.domain.models import Revision
 
 DEFAULT_LOCK_TIMEOUT = 10.0
@@ -100,15 +105,17 @@ class RecursiveFormatResult:
         )
 
 
-class InvalidStoreState(ValueError):
+class InvalidStoreState(DiagnosticError):
     def __init__(self, diagnostics: tuple[Diagnostic, ...], result: CheckResult) -> None:
         self.diagnostics = diagnostics
         self.result = result
-        super().__init__("store state is invalid")
+        super().__init__(diagnostics)
+        self.args = ("store state is invalid",)
 
 
-class RevisionConflict(ValueError):
-    pass
+class RevisionConflict(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC007", message, field="revision"))
 
 
 def _federated(snapshot: StoreSnapshot) -> FederatedSnapshot:

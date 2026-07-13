@@ -26,7 +26,11 @@ from untaped_orchestration.application.results import (
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.application.view_management import view_comparisons
 from untaped_orchestration.domain.canonical import CanonicalItem
-from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticError,
+    expected_diagnostic,
+)
 from untaped_orchestration.domain.evidence import Evidence, EvidenceRelation
 from untaped_orchestration.domain.ids import DecisionId, TaskId, item_filename
 from untaped_orchestration.domain.models import ImportManifest, Revision
@@ -38,8 +42,13 @@ ITEM_ROOTS = (
 )
 
 
-class ImportConflict(ValueError):
-    pass
+class ImportConflict(DiagnosticError):
+    def __init__(
+        self,
+        message: str,
+        diagnostics: tuple[Diagnostic, ...] | None = None,
+    ) -> None:
+        super().__init__(diagnostics or expected_diagnostic("ORC002", message))
 
 
 class ImportRepository(StoreReader, CanonicalFormatter, Protocol):
@@ -150,7 +159,14 @@ class _ImportExecution:
     def guard(self, current: FederatedSnapshot) -> None:
         selected = current.selected
         if selected.store is None or selected.store.id != self.manifest.target_store_id:
-            raise ImportConflict("manifest target_store_id does not match selected store")
+            raise ImportConflict(
+                "manifest target_store_id does not match selected store",
+                expected_diagnostic(
+                    "ORC003",
+                    "manifest target_store_id does not match selected store",
+                    field="target_store_id",
+                ),
+            )
         expected = {record.path: record for record in self.records}
         for entry in self.repository.list_entries(self.request.location):
             if entry.kind != "file" or not _is_item_path(entry.path):
@@ -173,10 +189,15 @@ class _ImportExecution:
         ).snapshot
         base_diagnostics = validate_snapshot(reconstructed, require_children=True)
         if any(value.severity == "error" for value in base_diagnostics):
-            raise ImportConflict("reconstructed pre-import store is invalid")
+            raise ImportConflict("reconstructed pre-import store is invalid", base_diagnostics)
         if reconstructed.selected.store_revision != self.manifest.expected_store_revision:
             raise ImportConflict(
-                "expected_store_revision does not match reconstructed base revision"
+                "expected_store_revision does not match reconstructed base revision",
+                expected_diagnostic(
+                    "ORC007",
+                    "expected_store_revision does not match reconstructed base revision",
+                    field="expected_store_revision",
+                ),
             )
         if self.manifest.require_empty_items and not self.present:
             _, managed = view_comparisons(
@@ -262,6 +283,11 @@ class ImportService:
                 content = self._repository.item_bytes(metadata, parsed_body)
             except ImportConflict:
                 raise
+            except DiagnosticError as error:
+                raise ImportConflict(
+                    f"invalid manifest record: {path.as_posix()}",
+                    error.diagnostics,
+                ) from error
             except (ValidationError, ValueError) as error:
                 raise ImportConflict(f"invalid manifest record: {path.as_posix()}") from error
             revision = Revision(f"sha256:{sha256(content).hexdigest()}")

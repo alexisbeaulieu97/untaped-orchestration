@@ -44,6 +44,36 @@ class Diagnostic(BaseModel):
     hint: str
 
 
+class DiagnosticError(ValueError):
+    """Caller-recoverable failure represented by exact public diagnostics."""
+
+    def __init__(self, diagnostics: tuple[Diagnostic, ...]) -> None:
+        if not diagnostics or not all(isinstance(value, Diagnostic) for value in diagnostics):
+            raise TypeError("diagnostic errors require a nonempty diagnostic tuple")
+        self.diagnostics = diagnostics
+        super().__init__("; ".join(value.message for value in diagnostics))
+
+
+def expected_diagnostic(
+    code: DiagnosticCode,
+    message: str,
+    *,
+    path: str = "",
+    field: str = "",
+    hint: str = "Correct the reported condition and retry.",
+) -> tuple[Diagnostic, ...]:
+    return (
+        Diagnostic(
+            code=code,
+            severity="error",
+            path=path,
+            field=field,
+            message=message,
+            hint=hint,
+        ),
+    )
+
+
 def _location_part(value: int | None) -> LocationSortPart:
     return (value is None, value if value is not None else 0)
 

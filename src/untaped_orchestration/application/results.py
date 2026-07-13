@@ -5,7 +5,11 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from untaped_orchestration.domain.canonical import CanonicalItem
-from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticError,
+    expected_diagnostic,
+)
 from untaped_orchestration.domain.ids import StoreId
 from untaped_orchestration.domain.models import Registry, Revision, StoreConfig
 
@@ -18,10 +22,18 @@ class StoreLocation:
     real_root: Path
 
 
-class StoreLockTimeout(TimeoutError):
+class StoreLockTimeout(DiagnosticError, TimeoutError):
     def __init__(self, location: StoreLocation) -> None:
         self.location = location
-        super().__init__(f"timed out acquiring orchestration store lock: {location.real_root}")
+        super().__init__(
+            expected_diagnostic(
+                "ORC007",
+                "timed out acquiring orchestration store lock",
+                path=location.real_root.as_posix(),
+                field="lock",
+                hint="Retry after the current store mutation finishes.",
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)

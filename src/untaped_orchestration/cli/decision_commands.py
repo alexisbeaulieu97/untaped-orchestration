@@ -55,6 +55,8 @@ def _predecessors(
     revisions: tuple[str, ...],
     force: bool,
 ) -> tuple[DecisionGuard, ...]:
+    if len(ids) != len(set(ids)):
+        raise SystemExit(2)
     if force:
         if revisions:
             raise SystemExit(2)
@@ -65,7 +67,7 @@ def _predecessors(
         if not separator:
             raise SystemExit(2)
         parsed[_decision_id(item)] = _required_revision(revision)
-    if set(parsed) != set(ids) or len(ids) != len(set(ids)):
+    if set(parsed) != set(ids):
         raise SystemExit(2)
     return tuple(DecisionGuard(item_id, parsed[item_id]) for item_id in ids)
 

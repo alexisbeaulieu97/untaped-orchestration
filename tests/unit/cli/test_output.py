@@ -21,12 +21,27 @@ from untaped_orchestration.cli.output import (
 )
 from untaped_orchestration.cli.read_commands import _curation_result
 from untaped_orchestration.domain.curation import CurationEntry, CurationKind
-from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticError
 from untaped_orchestration.domain.ids import StoreId, TaskId
 from untaped_orchestration.domain.models import Revision
 from untaped_orchestration.domain.time import CalendarDate
 
 REVISION = Revision(f"sha256:{'a' * 64}")
+
+
+def _reported_failure(message: str) -> DiagnosticError:
+    return DiagnosticError(
+        (
+            Diagnostic(
+                code="ORC002",
+                severity="error",
+                path="",
+                field="",
+                message=message,
+                hint="correct the reported condition",
+            ),
+        )
+    )
 
 
 def test_json_envelope_has_exact_order_and_expected_failure_shape() -> None:
@@ -248,7 +263,7 @@ def test_pipe_always_ends_with_exactly_one_status_trailer(complete: bool, trunca
 
 def test_pipe_expected_failure_is_diagnostic_only_without_traceback(capfd) -> None:
     def fail() -> CommandResult:
-        raise ValueError("invalid canonical state")
+        raise _reported_failure("invalid canonical state")
 
     with pytest.raises(SystemExit) as raised:
         run_command("list", fail, fmt="pipe", allowed=("pipe",))
@@ -364,7 +379,7 @@ def test_error_diagnostic_code_has_stable_exit_priority_without_traceback(
 @pytest.mark.parametrize(
     ("error", "exit_code"),
     (
-        (ValueError("invalid canonical state"), 1),
+        (ValueError("invalid canonical state"), 5),
         (
             QueryIncompleteError(
                 (
@@ -406,7 +421,7 @@ def test_expected_failures_keep_json_envelope_and_stable_exit(
 
 def test_table_failure_emits_no_data_and_diagnostic_on_stderr(capfd) -> None:
     def fail() -> CommandResult:
-        raise ValueError("invalid canonical state")
+        raise _reported_failure("invalid canonical state")
 
     with pytest.raises(SystemExit) as raised:
         run_command("check", fail, fmt="table", allowed=("table",))
@@ -418,7 +433,7 @@ def test_table_failure_emits_no_data_and_diagnostic_on_stderr(capfd) -> None:
 
 def test_binary_recovery_failure_writes_zero_stdout_bytes(capfd) -> None:
     def fail() -> CommandResult:
-        raise ValueError("raw file is ambiguous")
+        raise _reported_failure("raw file is ambiguous")
 
     with pytest.raises(SystemExit) as raised:
         run_command(

@@ -48,7 +48,11 @@ from untaped_orchestration.application.results import (
     StoreSnapshot,
 )
 from untaped_orchestration.domain.curation import StoreCurationContext, curation_queue
-from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticError,
+    expected_diagnostic,
+)
 from untaped_orchestration.domain.graph import TaskRef, readiness
 from untaped_orchestration.domain.ids import DecisionId, TaskId
 from untaped_orchestration.domain.models import (
@@ -64,16 +68,16 @@ from untaped_orchestration.domain.time import UtcTimestamp
 MAX_LIMIT = 200
 
 
-class QueryIncompleteError(ValueError):
+class QueryIncompleteError(DiagnosticError):
     def __init__(self, diagnostics: tuple[Diagnostic, ...]) -> None:
-        self.diagnostics = diagnostics
-        super().__init__("query requires a complete federation; retry locally or restore children")
+        super().__init__(diagnostics)
+        self.args = ("query requires a complete federation; retry locally or restore children",)
 
 
-class RawAmbiguityError(ValueError):
+class RawAmbiguityError(DiagnosticError):
     def __init__(self, paths: tuple[str, ...]) -> None:
         self.paths = paths
-        self.diagnostics = tuple(
+        diagnostics = tuple(
             Diagnostic(
                 code="ORC003",
                 severity="error",
@@ -84,7 +88,12 @@ class RawAmbiguityError(ValueError):
             )
             for path in paths
         )
-        super().__init__("raw item filename prefix is ambiguous")
+        super().__init__(diagnostics)
+
+
+class QueryResolutionError(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC003", message, field="id"))
 
 
 def _limit(value: int) -> int:
@@ -109,7 +118,7 @@ def _find(
         if record.metadata.id == item_id
     ]
     if len(matches) != 1:
-        raise ValueError("item does not resolve uniquely")
+        raise QueryResolutionError("item does not resolve uniquely")
     return matches[0]
 
 
@@ -234,7 +243,9 @@ class QueryService:
                     raise RawAmbiguityError(
                         tuple(sorted(value.path.as_posix() for value in matches))
                     )
-                raise ValueError("raw item filename prefix does not resolve in selected store")
+                raise QueryResolutionError(
+                    "raw item filename prefix does not resolve in selected store"
+                )
             raw = reader.read_raw(snapshot.selected.location, matches[0].path)
             return self._result(
                 snapshot,
@@ -443,7 +454,7 @@ class QueryService:
                 and record.metadata.id == request.item_id
             ]
             if len(matches) != 1:
-                raise ValueError("archived item does not resolve uniquely")
+                raise QueryResolutionError("archived item does not resolve uniquely")
             store, record = matches[0]
             assert store.store is not None
             body = reader.read_item_body(store.location, record.path)

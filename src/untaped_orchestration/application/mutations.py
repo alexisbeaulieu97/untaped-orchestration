@@ -28,20 +28,24 @@ from untaped_orchestration.application.scaffold import (
 )
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.application.view_management import apply_views
-from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticError,
+    expected_diagnostic,
+)
 from untaped_orchestration.domain.models import LinkRelation
 
 DEFAULT_LOCK_TIMEOUT = 10.0
 
 
-class InvalidMutationState(ValueError):
+class InvalidMutationState(DiagnosticError):
     def __init__(self, diagnostics: tuple[Diagnostic, ...]) -> None:
-        self.diagnostics = diagnostics
-        super().__init__("mutation requires a valid complete intended store state")
+        super().__init__(diagnostics)
 
 
-class MutationLockSetError(ValueError):
-    pass
+class MutationLockSetError(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC007", message, field="lock_set"))
 
 
 @dataclass(frozen=True, slots=True)

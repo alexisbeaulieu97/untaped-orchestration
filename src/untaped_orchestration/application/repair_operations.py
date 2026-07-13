@@ -27,13 +27,23 @@ from untaped_orchestration.application.results import (
 from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.application.validation import validate_snapshot
 from untaped_orchestration.application.view_management import apply_views
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticError,
+    expected_diagnostic,
+)
 from untaped_orchestration.domain.models import Revision
 
 DEFAULT_LOCK_TIMEOUT = 10.0
 
 
-class RepairConflict(ValueError):
-    pass
+class RepairConflict(DiagnosticError):
+    def __init__(
+        self,
+        message: str,
+        diagnostics: tuple[Diagnostic, ...] | None = None,
+    ) -> None:
+        super().__init__(diagnostics or expected_diagnostic("ORC002", message))
 
 
 class RepairRepository(
@@ -134,7 +144,15 @@ class RepairService:
         with self._locks.acquire((request.location,), timeout=self._lock_timeout):
             before = self._repository.read_raw(request.location, request.path).content
             if Revision(f"sha256:{sha256(before).hexdigest()}") != request.expected_revision:
-                raise RepairConflict("item revision guard does not match current revision")
+                raise RepairConflict(
+                    "item revision guard does not match current revision",
+                    expected_diagnostic(
+                        "ORC007",
+                        "item revision guard does not match current revision",
+                        path=request.path.as_posix(),
+                        field="revision",
+                    ),
+                )
             after = self._planned_repair(request, before)
             current = self._repository.load_local(request.location, headers_only=False)
             projected = self._repository.project(
@@ -145,7 +163,7 @@ class RepairService:
             )
             diagnostics = validate_snapshot(projected.snapshot, require_children=True)
             if any(value.severity == "error" for value in diagnostics):
-                raise RepairConflict("repair would leave an invalid store")
+                raise RepairConflict("repair would leave an invalid store", diagnostics)
             return self._finish(request, before, after, projected.snapshot.selected)
 
     def _planned_repair(self, request: RepairFrontmatterRequest, before: bytes) -> bytes:
@@ -165,9 +183,22 @@ class RepairService:
                 replacement_frontmatter=replacement,
                 replacement_body=body,
             )
+        except DiagnosticError as error:
+            raise RepairConflict(
+                "replacement front matter or body is invalid",
+                error.diagnostics,
+            ) from error
         except (OSError, ValueError) as error:
             if isinstance(error, UnprovableBodyBoundary):
-                raise RepairConflict("body boundary is unprovable; provide --body-file") from error
+                raise RepairConflict(
+                    "body boundary is unprovable; provide --body-file",
+                    expected_diagnostic(
+                        "ORC001",
+                        "body boundary is unprovable; provide --body-file",
+                        path=request.path.as_posix(),
+                        field="body",
+                    ),
+                ) from error
             raise RepairConflict("replacement front matter or body is invalid") from error
 
     def _finish(

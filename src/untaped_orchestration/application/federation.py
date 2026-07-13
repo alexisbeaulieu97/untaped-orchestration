@@ -35,8 +35,10 @@ from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.domain.diagnostics import (
     Diagnostic,
     DiagnosticCode,
+    DiagnosticError,
     DiagnosticSeverity,
     diagnostic_sort_key,
+    expected_diagnostic,
 )
 from untaped_orchestration.domain.ids import StoreId
 from untaped_orchestration.domain.models import Registry, RegistryChild, Revision
@@ -44,12 +46,14 @@ from untaped_orchestration.domain.models import Registry, RegistryChild, Revisio
 DEFAULT_LOCK_TIMEOUT = 10.0
 
 
-class RegistryRevisionConflict(ValueError):
-    pass
+class RegistryRevisionConflict(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC007", message, field="registry_revision"))
 
 
-class RegistryMutationConflict(ValueError):
-    pass
+class RegistryMutationConflict(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC005", message, field="children"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,12 +107,19 @@ class _NoopLocks:
         yield
 
 
-class UnidentifiedStoreError(ValueError):
+class UnidentifiedStoreError(DiagnosticError):
     """The selected snapshot has no truthful immutable identity."""
 
     def __init__(self, location: StoreLocation) -> None:
         self.location = location
-        super().__init__(f"selected store identity is unreadable: {location.root}")
+        super().__init__(
+            expected_diagnostic(
+                "ORC003",
+                "selected store identity is unreadable",
+                path=location.root.as_posix(),
+                field="id",
+            )
+        )
 
 
 @dataclass(slots=True)

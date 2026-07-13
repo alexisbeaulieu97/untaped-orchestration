@@ -23,14 +23,16 @@ from untaped_orchestration.application.scaffold import (
     REGISTRY_PATH,
     STORE_PATH,
 )
+from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
 from untaped_orchestration.domain.models import Registry, Revision, StoreConfig
 
 DEFAULT_LOCK_TIMEOUT = 10.0
 _IGNORED_NAMES = frozenset({".lock", ".DS_Store"})
 
 
-class InitConflictError(ValueError):
-    pass
+class InitConflictError(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC003", message, field="path"))
 
 
 @dataclass(frozen=True, slots=True)

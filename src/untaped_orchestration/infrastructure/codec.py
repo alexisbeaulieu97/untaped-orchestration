@@ -17,7 +17,7 @@ from untaped_orchestration.domain.canonical import (
     canonical_registry_table,
     canonical_store_table,
 )
-from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticCode
+from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticCode, DiagnosticError
 from untaped_orchestration.domain.models import (
     ActiveTask,
     ArchivedTask,
@@ -38,10 +38,10 @@ ITEM_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ITEM_ADAPTER: TypeAdapter[ItemRecord] = TypeAdapter(ItemRecord)
 
 
-class CodecError(ValueError):
+class CodecError(DiagnosticError):
     def __init__(self, diagnostic: Diagnostic) -> None:
         self.diagnostic = diagnostic
-        super().__init__(diagnostic.message)
+        super().__init__((diagnostic,))
 
 
 @dataclass(frozen=True, slots=True)

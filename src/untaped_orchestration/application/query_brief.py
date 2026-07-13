@@ -18,6 +18,7 @@ from untaped_orchestration.application.query_projection import (
     safe_task_order,
 )
 from untaped_orchestration.application.results import LoadedRecord
+from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
 from untaped_orchestration.domain.graph import DecisionState
 from untaped_orchestration.domain.ids import DecisionId, StoreId
 from untaped_orchestration.domain.models import (
@@ -153,7 +154,13 @@ def assemble_brief(
     selected = projection.snapshot.selected
     config = selected.store
     if config is None:
-        raise ValueError("brief requires a valid selected store configuration")
+        raise DiagnosticError(
+            expected_diagnostic(
+                "ORC003",
+                "brief requires a valid selected store configuration",
+                field="store",
+            )
+        )
     local, qualified = _indexes(projection)
     pins = _pins(projection, reader, local)
     inactive_map = {

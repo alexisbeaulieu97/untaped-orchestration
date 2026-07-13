@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
 from untaped_orchestration.application.ports import RawReference, StoreEntry, StoreLocation
+from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
 from untaped_orchestration.domain.models import Revision
 
 STORE_ANCHOR = Path(".untaped/orchestration/store.toml")
@@ -31,25 +32,55 @@ VIEW_PATHS = frozenset(
 )
 
 
-class StoreNotFoundError(FileNotFoundError):
-    pass
+class StoreNotFoundError(DiagnosticError, FileNotFoundError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC003", message, field="path"))
 
 
-class PathSafetyError(ValueError):
+class PathSafetyError(DiagnosticError):
     def __init__(self, path: Path | PurePosixPath, message: str) -> None:
         self.path = path
-        super().__init__(f"{path}: {message}")
+        super().__init__(expected_diagnostic("ORC003", message, path=path.as_posix(), field="path"))
 
 
-class RawPrefixNotFoundError(LookupError):
-    pass
+class ReadPathNotFoundError(DiagnosticError, FileNotFoundError):
+    def __init__(self, path: PurePosixPath) -> None:
+        super().__init__(
+            expected_diagnostic(
+                "ORC003",
+                "read target is missing or is not a regular file",
+                path=path.as_posix(),
+                field="path",
+            )
+        )
 
 
-class AmbiguousRawPrefixError(LookupError):
+class RawPrefixNotFoundError(DiagnosticError, LookupError):
+    def __init__(self, prefix: str) -> None:
+        super().__init__(
+            expected_diagnostic(
+                "ORC003",
+                f"raw filename prefix {prefix!r} does not resolve",
+                field="path",
+            )
+        )
+
+
+class AmbiguousRawPrefixError(DiagnosticError, LookupError):
     def __init__(self, prefix: str, paths: Sequence[PurePosixPath]) -> None:
         self.prefix = prefix
         self.paths = tuple(paths)
-        super().__init__(f"raw filename prefix {prefix!r} is ambiguous")
+        super().__init__(
+            tuple(
+                expected_diagnostic(
+                    "ORC003",
+                    f"raw filename prefix {prefix!r} is ambiguous",
+                    path=path.as_posix(),
+                    field="path",
+                )[0]
+                for path in self.paths
+            )
+        )
 
 
 def _absolute_without_resolving(path: Path) -> Path:
@@ -294,7 +325,7 @@ def safe_read_path(location: StoreLocation, relative_path: PurePosixPath) -> Pat
     _assert_relative(relative_path)
     absolute = _walk_existing_components(location.real_root, relative_path)
     if not _is_regular_nonsymlink(absolute):
-        raise FileNotFoundError(relative_path.as_posix())
+        raise ReadPathNotFoundError(relative_path)
     return absolute
 
 

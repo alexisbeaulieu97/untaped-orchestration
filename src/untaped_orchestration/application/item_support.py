@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import overload
 
+from pydantic import ValidationError
+
 from untaped_orchestration.application.mutations import (
     IntendedMutation,
     MutationExecutor,
@@ -18,6 +20,12 @@ from untaped_orchestration.application.results import (
     StoreLocation,
 )
 from untaped_orchestration.domain.canonical import CanonicalItem
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticCode,
+    DiagnosticError,
+    expected_diagnostic,
+)
 from untaped_orchestration.domain.evidence import EvidenceReference, EvidenceRelation
 from untaped_orchestration.domain.ids import DecisionId, Slug, StoreId, TaskId
 from untaped_orchestration.domain.models import (
@@ -30,16 +38,23 @@ from untaped_orchestration.domain.models import (
 )
 
 
-class ItemMutationConflict(ValueError):
-    pass
+class ItemMutationConflict(DiagnosticError):
+    code: DiagnosticCode = "ORC006"
+
+    def __init__(
+        self,
+        message: str,
+        diagnostics: tuple[Diagnostic, ...] | None = None,
+    ) -> None:
+        super().__init__(diagnostics or expected_diagnostic(self.code, message))
 
 
 class RevisionConflict(ItemMutationConflict):
-    pass
+    code: DiagnosticCode = "ORC007"
 
 
 class CreateConflict(ItemMutationConflict):
-    pass
+    code: DiagnosticCode = "ORC003"
 
 
 class ItemStateConflict(ItemMutationConflict):
@@ -47,7 +62,7 @@ class ItemStateConflict(ItemMutationConflict):
 
 
 class RelationConflict(ItemMutationConflict):
-    pass
+    code: DiagnosticCode = "ORC004"
 
 
 def validate_force_current(
@@ -224,11 +239,15 @@ def validated_copy(
 ) -> CanonicalItem:
     values = metadata.model_dump(by_alias=True)
     values.update(updates)
-    if isinstance(metadata, ActiveTask):
-        return ActiveTask.model_validate(values)
-    if isinstance(metadata, ArchivedTask):
-        return ArchivedTask.model_validate(values)
-    return Decision.model_validate(values)
+    try:
+        if isinstance(metadata, ActiveTask):
+            return ActiveTask.model_validate(values)
+        if isinstance(metadata, ArchivedTask):
+            return ArchivedTask.model_validate(values)
+        return Decision.model_validate(values)
+    except ValidationError as error:
+        message = error.errors()[0]["msg"]
+        raise ItemStateConflict(f"invalid item lifecycle state: {message}") from error
 
 
 def execute_mutation(

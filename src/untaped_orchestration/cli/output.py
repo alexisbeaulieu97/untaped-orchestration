@@ -63,6 +63,8 @@ class EncodedOutput:
 def result_exit_code(diagnostics: tuple[Diagnostic, ...], fallback: int) -> int:
     if any(value.code == "ORC007" and value.severity == "error" for value in diagnostics):
         return 4
+    if any(value.code == "ORC005" and value.severity == "error" for value in diagnostics):
+        return 3
     return fallback
 
 
@@ -325,7 +327,7 @@ def _bounded_brief(  # noqa: C901
 ) -> EncodedOutput:
     normalized = _value(result.data)
     assert isinstance(normalized, dict)
-    limit = normalized.get("max_total_bytes")
+    limit = 32768 if not result.complete and not normalized else normalized.get("max_total_bytes")
     if not isinstance(limit, int) or not 4096 <= limit <= 32768:
         raise ValueError("brief result has an invalid max_total_bytes")
     data = copy.deepcopy(normalized)
@@ -498,41 +500,36 @@ def emit_encoded(encoded: EncodedOutput) -> None:
     sys.stderr.buffer.flush()
 
 
-def _error_diagnostics(error: Exception) -> tuple[Diagnostic, ...]:
+def _typed_diagnostics(error: Exception) -> tuple[Diagnostic, ...] | None:
     diagnostics = getattr(error, "diagnostics", None)
-    if isinstance(diagnostics, tuple) and all(
-        isinstance(value, Diagnostic) for value in diagnostics
+    if (
+        diagnostics
+        and isinstance(diagnostics, tuple)
+        and all(isinstance(value, Diagnostic) for value in diagnostics)
     ):
         return diagnostics
-    code = "ORC007" if "revision" in error.__class__.__name__.lower() else "ORC002"
+    return None
+
+
+def _error_diagnostics(error: Exception) -> tuple[Diagnostic, ...]:
+    diagnostics = _typed_diagnostics(error)
+    if diagnostics is not None:
+        return diagnostics
     return (
         Diagnostic(
-            code=code,
+            code="ORC002",
             severity="error",
             path="",
             field="",
-            message=str(error) or error.__class__.__name__,
-            hint="Correct the reported condition and retry.",
+            message="internal orchestration failure",
+            hint="Retry with --debug to inspect the internal failure.",
         ),
     )
 
 
 def _exit_code(error: Exception) -> int:
-    name = error.__class__.__name__.lower()
-    diagnostics = getattr(error, "diagnostics", ())
-    typed_diagnostics = tuple(value for value in diagnostics if isinstance(value, Diagnostic))
-    if result_exit_code(typed_diagnostics, 0) == 4:
-        return 4
-    if "incomplete" in name or any(
-        isinstance(value, Diagnostic) and value.code == "ORC005" and value.severity == "error"
-        for value in diagnostics
-    ):
-        return 3
-    if "revision" in name or "lock" in name:
-        return 4
-    if isinstance(error, ValueError):
-        return 1
-    return 5
+    diagnostics = _typed_diagnostics(error)
+    return 5 if diagnostics is None else result_exit_code(diagnostics, 1)
 
 
 def exit_for(error: Exception) -> NoReturn:

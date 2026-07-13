@@ -282,7 +282,7 @@ path = "../../missing/.untaped/orchestration"
     )
     with pytest.raises(SystemExit) as raised:
         main()
-    assert raised.value.code == 1
+    assert raised.value.code == 3
     required = json.loads(capsys.readouterr().out)
     assert {value["severity"] for value in required["diagnostics"]} == {"error"}
 
