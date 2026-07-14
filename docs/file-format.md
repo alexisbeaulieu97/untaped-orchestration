@@ -28,6 +28,17 @@ tags, sorted links, and sorted evidence. The serializer reparses and validates
 its own output before replacement. A hand-edited item becomes canonical only
 when both `check` and `fmt --check` pass.
 
+## Bounded external files
+
+Import manifests and replacement front matter are each limited to exactly
+64 KiB; explicit import or repair body files are limited to exactly 1 MiB.
+They are captured once as immutable byte snapshots before mutation locks are
+resolved. The reader performs component-wise no-follow opens where the platform
+supports descriptor-relative `O_NOFOLLOW`. Its fallback requires cooperative writers,
+checks every component before and after the read, and rejects detected inode or
+component substitution. Every input must be a regular file and no path
+component may be a symlink.
+
 ## Identity and revisions
 
 Store, task, and decision IDs are caller-stable UUIDv7 values prefixed `sto_`,

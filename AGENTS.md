@@ -57,3 +57,10 @@ artifact directory and use a fresh virtual environment; it must never select a
 pre-existing `dist/` wheel. Keep README/docs, `CHANGELOG.md`, `py.typed`, the
 packaged skill, version metadata, lockfile, CI, and release contracts aligned
 with any public behavior change.
+
+Default local package acceptance is offline. It builds and audits the wheel and
+sdist outside `dist/` and reports exactly one explicit isolated-install skip.
+PR CI sets `UNTAPED_ISOLATED_WHEEL_TEST=1` for the
+dependency-resolving isolated install: the exact fresh wheel is installed
+outside the checkout with no `PYTHONPATH`, editable install, or
+development-site-packages fallback.

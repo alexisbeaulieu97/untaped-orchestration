@@ -1,7 +1,7 @@
 # Untaped Orchestration v1 — design specification
 
 Date: 2026-07-09
-Status: proposed, docs-only
+Status: implemented; unreleased
 Repository: `alexisbeaulieu97/untaped-orchestration`
 Package and console command: `untaped-orchestration`
 Import package: `untaped_orchestration`
@@ -20,8 +20,9 @@ roadmap gate. The SDK prerequisite is satisfied by `untaped==3.1.0`, core commit
 `80bb841`, and GitHub release/tag `v3.1.0`.
 
 The design was previously approved in conversation and pressure-tested before
-repository creation. This document is the owning-repository contract. It does
-not authorize implementation, publication, or fleet migration.
+repository creation. This document is the owning-repository contract and now
+describes the reviewed implementation. It does not authorize publication,
+self-adoption, or fleet migration.
 
 ### 1.1 Goals
 
@@ -1410,8 +1411,14 @@ baseline measurement rather than inventing them in this specification.
 
 - Ruff, formatting, strict mypy, pytest, and `uv build --no-sources` pass.
 - Architecture test enforces inward imports.
-- Installed wheel verifies help/version/init/check/fmt/render.
-- Wheel contains `py.typed` and skill; excludes repository store.
+- Offline acceptance builds a fresh wheel and sdist outside `dist/`, audits
+  exact dependency metadata, WHEEL, entry points, RECORD integrity, packaged
+  skill, `py.typed`, and repository-state exclusions in both archives, and
+  reports exactly one explicit isolated-install skip.
+- PR CI sets `UNTAPED_ISOLATED_WHEEL_TEST=1`; that test resolves dependencies
+  normally into a fresh environment outside the checkout and verifies
+  help/version/init/check/fmt/render from the exact built wheel without
+  `PYTHONPATH`, editable installation, or development-site-package leakage.
 - TestPyPI/PyPI release follows explicit approvals and burn-once versioning.
 - Fresh `uvx` smoke proves the released package before any fleet pin.
 
@@ -1463,8 +1470,8 @@ Health cannot establish an HTTPS base, a source OID/hash changes, an adoption
 branch exists, coverage lacks a disposition, public stores leak unfinished
 tasks, or an external action lacks explicit approval.
 
-The fresh implementation plan is
-`docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md`. After
-this contract clarification and that companion plan are reviewed and merged,
-the only next action is a fresh implementation branch grounded in verified
-repository main. No implementation code belongs in the planning PR.
+The implementation plan remains recorded at
+`docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md`.
+Implementation completion does not advance the external gates: publication,
+self-adoption, and every fleet cohort still require their separately reviewed
+approvals and verified prerequisites.

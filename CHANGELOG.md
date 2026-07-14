@@ -12,3 +12,7 @@
   front-matter recovery contracts.
 - Add the packaged agent skill, strict type marker, installed-wheel acceptance,
   CI, and approval-gated TestPyPI/PyPI release workflow.
+- Audit exact wheel/sdist archive metadata, contents, exclusions, and RECORD
+  integrity offline; PR CI additionally runs a dependency-resolving isolated
+  install of the exact fresh wheel without checkout or development-environment
+  leakage.

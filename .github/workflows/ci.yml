@@ -50,4 +50,5 @@ jobs:
           TERM: dumb
           NO_COLOR: "1"
           COLUMNS: "200"
+          UNTAPED_ISOLATED_WHEEL_TEST: "1"
         run: uv run pytest

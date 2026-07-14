@@ -25,10 +25,12 @@ the final encoded JSON or table output, including its trailing LF. `curate
 next` and recursive `fmt --check` preserve completeness, truncation, and
 ordered diagnostics in the top-level output contract.
 
-Federation is explicit in `registry.toml`. Reads recurse by default and
-`--local` restricts them; writes modify only the selected store. Partial reads
-may return `complete=false`. `next`, readiness/delivery, and structural changes
-fail closed when required federation is incomplete. Public stores are
+Federation is explicit in `registry.toml`. Reads recurse by default.
+`--local` is true-local: it selects only the chosen store and does not resolve
+or report registered children. Writes modify only the selected store, even
+when recursive validation locks and checks all resolved participants. Partial
+reads may return `complete=false`. `next`, readiness/delivery, and structural
+changes fail closed when required federation is incomplete. Public stores are
 decision-only; never place tasks in them.
 
 ## Output
@@ -54,6 +56,13 @@ Exit codes are 0 success, 1 invalid canonical data/stale views, 2 usage, 3
 required federation incomplete, 4 lock/revision conflict, and 5 I/O or
 unexpected internal failure. Partial-tolerant reads can exit 0 with
 `complete=false`; never treat that as readiness.
+
+Typed expected failures retain their exact public diagnostics and mapped exit
+code. Unexpected exceptions use a generic ORC002 and do not expose their
+message unless the operator explicitly requests `--debug`. A canonical writer
+failure also emits a failure receipt in JSON/table data: `intended_paths` is
+complete, while `changed_paths` contains only writer calls that returned
+successfully. Any such failure reports `views_current=false`.
 
 ## Release and rollout gates
 

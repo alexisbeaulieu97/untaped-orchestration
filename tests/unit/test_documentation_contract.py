@@ -64,3 +64,59 @@ def test_changelog_keeps_010_unreleased() -> None:
     assert "0.1.0" in changelog
     assert "Unreleased" in changelog
     assert "published" not in changelog.casefold()
+
+
+def test_reviewed_implementation_contracts_are_documented_without_releasing() -> None:
+    design = (REPO_ROOT / "docs/superpowers/specs/2026-07-09-orchestration-v1-design.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Status: implemented; unreleased" in design
+    assert "Status: proposed, docs-only" not in design
+    assert "does not authorize implementation" not in design
+    assert "No implementation code belongs in the planning PR." not in design
+
+    required_by_path = {
+        "README.md": (
+            "UNTAPED_ISOLATED_WHEEL_TEST=1",
+            "exactly one",
+            "outside `dist/`",
+        ),
+        "AGENTS.md": (
+            "dependency-resolving",
+            "isolated install",
+            "exactly one",
+            "outside `dist/`",
+        ),
+        "CHANGELOG.md": ("archive metadata", "dependency-resolving", "isolated"),
+        "SECURITY.md": ("generic ORC002", "failure receipt"),
+        "docs/cli.md": (
+            "Reads recurse by default",
+            "`--local` is true-local",
+            "failure receipt",
+        ),
+        "docs/file-format.md": (
+            "64 KiB",
+            "1 MiB",
+            "component-wise no-follow",
+            "cooperative writers",
+        ),
+        "docs/recovery.md": (
+            "acknowledged changed paths",
+            "generic ORC002",
+            "recursive participant locks",
+        ),
+        "src/untaped_orchestration/skills/untaped-orchestration/SKILL.md": (
+            "acknowledged changed paths",
+            "64 KiB",
+            "1 MiB",
+        ),
+        "docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md": (
+            "UNTAPED_ISOLATED_WHEEL_TEST=1",
+            "exactly one explicit isolated-install skip",
+            "outside `dist/`",
+        ),
+    }
+    for relative, terms in required_by_path.items():
+        content = " ".join((REPO_ROOT / relative).read_text(encoding="utf-8").split())
+        for term in terms:
+            assert term in content, f"{relative} is missing {term!r}"

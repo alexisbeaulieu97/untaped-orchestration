@@ -26,6 +26,7 @@ def test_ci_uses_reviewed_uv_cache_and_frozen_checks() -> None:
     assert "run: uv run pre-commit run --all-files --show-diff-on-failure" in workflow
     assert "run: uv run mypy" in workflow
     assert "run: uv run pytest" in workflow
+    assert 'UNTAPED_ISOLATED_WHEEL_TEST: "1"' in workflow
 
 
 def test_ci_cancels_superseded_branch_runs() -> None:

@@ -7,6 +7,7 @@ core .github/release/templates/test_release_workflow.py.tmpl — diff before mer
 
 from __future__ import annotations
 
+import hashlib
 import re
 import tomllib
 from pathlib import Path
@@ -33,6 +34,7 @@ CORE_RELEASE_TOOL_SHA = "80bb8411cd0017f3e0cde818656aaf6fd0233368"
 # ========================================================================
 
 EXPECTED_UV_VERSION = "0.11.26"
+EXPECTED_WORKFLOW_SHA256 = "d421d9b3e5cdd03e1cb12036b72fdbd723ee3e054523d896c3db27aa9f87421a"
 EXPECTED_ACTION_REFS = {
     "actions/checkout": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
     "actions/cache": "55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
@@ -52,6 +54,10 @@ FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 def _is_immutable_core_sha(ref: str) -> bool:
     return FULL_SHA_RE.fullmatch(ref) is not None
+
+
+def test_release_workflow_bytes_remain_canonical() -> None:
+    assert hashlib.sha256(WORKFLOW.read_bytes()).hexdigest() == EXPECTED_WORKFLOW_SHA256
 
 
 def _workflow_text() -> str:

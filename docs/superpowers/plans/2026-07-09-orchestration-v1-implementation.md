@@ -1198,11 +1198,14 @@ git commit -m "feat: expose orchestration CLI contracts"
 
 Assert the packaged skill contains and operationalizes all eleven section-14 rules, uses `brief --format json` first, reuses caller-stable IDs, passes guards, forbids agents from `--force-current`, generated-view reads/edits, public tasks, and fail-open readiness. Assert README/docs link the design, file format, recovery procedure, SDK plugin guide, install commands, and explicit post-release self-adoption gate.
 
-Installed-wheel tests must build the current checkout into a fresh temporary
-artifact directory, create a fresh virtual environment from that exact wheel,
-and verify help, exact version, init, check, fmt check, render check, packaged
-skill, `py.typed`, and exclusion of repository `.untaped/` state. The fixture
-must never reuse a pre-existing `dist/` artifact.
+Package tests must build the current checkout into a fresh temporary artifact
+directory outside `dist/`, never select a stale `dist/` artifact, and audit the
+exact wheel and sdist metadata, contents, RECORD, packaged skill, `py.typed`,
+and repository-state exclusions offline. The default run reports exactly one
+explicit isolated-install skip. PR CI sets `UNTAPED_ISOLATED_WHEEL_TEST=1` so
+that test resolves dependencies normally, installs the exact fresh wheel into
+a clean environment outside the checkout, and verifies help, exact version,
+init, check, fmt check, and render check without development-site leakage.
 
 Copy the canonical release workflow and contract test from core commit
 `80bb8411cd0017f3e0cde818656aaf6fd0233368`, changing only distribution,
@@ -1249,9 +1252,10 @@ git diff --check
 git status --short
 ```
 
-Then install that just-built wheel into a fresh Python 3.14 environment and
-repeat the console smoke. Review coverage misses as missing behavior rather
-than lowering the gate. Confirm no `TODO`, `TBD`, accidental stub
+Then independently audit the fresh external wheel/sdist. In the PR CI path,
+install that exact wheel with dependencies into a fresh Python 3.14 environment
+outside the checkout and repeat the console smoke. Review coverage misses as
+missing behavior rather than lowering the gate. Confirm no `TODO`, `TBD`, accidental stub
 `NotImplementedError`, journal/VCS/provider adapter, repository store, or
 untracked generated artifact remains.
 

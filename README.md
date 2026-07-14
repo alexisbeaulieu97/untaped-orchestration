@@ -38,6 +38,16 @@ STORE_ID="$(untaped-orchestration id new store --format raw)"
 untaped-orchestration init . --store-id "$STORE_ID" --name Example --timezone UTC
 ```
 
+## Source package acceptance
+
+The default local suite stays offline: it builds a fresh wheel and sdist in a
+temporary artifact directory outside `dist/`, audits their metadata and
+contents, and reports exactly one explicit dependency-resolving install skip.
+PR CI sets `UNTAPED_ISOLATED_WHEEL_TEST=1` so that skipped test installs the
+exact fresh wheel with its real dependencies into a clean external virtual
+environment and runs the console/store smoke. No checkout or development
+site-packages path is injected into that environment.
+
 ## Documentation
 
 - [CLI and output contracts](docs/cli.md)

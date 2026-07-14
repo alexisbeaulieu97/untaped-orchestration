@@ -47,3 +47,9 @@ If a mutation is interrupted, inspect the reported paths/revisions and
 and guarded intent. Otherwise preserve unrelated work and restore or repair
 only the affected paths. Never guess, broadly restore the store, invent a
 replacement ID, or edit a generated view.
+
+A failure receipt lists all intended paths but only acknowledged changed paths
+whose writer calls returned. False/empty means no write was acknowledged, not
+that an interrupted writer definitely left disk unchanged. Any receipt with
+`views_current=false` requires `check`; after confirmed canonical success use
+`render --write` to repair derived views.

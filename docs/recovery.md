@@ -16,6 +16,15 @@ hint:
 | `ORC008` | Generated view missing or stale |
 | `ORC009` | Visibility or capability policy violation |
 
+Typed expected failures own those public fields and preserve their exact exit
+mapping. Unexpected exceptions are redacted to a generic ORC002; their raw
+message is not copied into JSON/table output. Canonical writer failures can
+also carry a bounded receipt. Before any writer acknowledgement it is
+`applied=false`, `canonical_applied=false`, and has no changed paths. After one
+or more writer calls return, it reports the exact acknowledged changed paths,
+`applied=true`, and `canonical_applied=true`. In both cases
+`views_current=false`; typed failures keep their exact diagnostic and exit.
+
 After a valid hand edit, run `check`, then `fmt --check`. `fmt --write` can
 canonicalize valid TOML metadata under revision guards; it never invents a
 missing semantic value, renames an item, or changes the opaque body.
@@ -65,6 +74,13 @@ stdout is zero bytes.
 `repair frontmatter` validates replacement TOML and preserves a provable body
 boundary. If delimiters or UTF-8 corruption make that boundary unknowable, an
 explicit bounded `--body-file` is required; the tool never guesses.
+
+Repair captures external inputs once, then acquires recursive participant locks,
+rereads the exact raw revision, projects and validates the repaired federation
+before writing, and validates the durable reread before finalizing views. A
+canonical-success/view-failure receipt is recovered with `check` followed by
+`render --write`; a canonical write failure is recovered only from its
+acknowledged-path receipt plus the actual files and `git diff`.
 
 External manifests, replacement front matter, and body files are read once as
 bounded byte snapshots. Every path component must remain a nonsymlink, and the
