@@ -19,6 +19,11 @@ Base: `f9440f2e90be766b389a1b111cd8c50c92d5eee8`
    and exit 1 instead of leaking an internal-failure envelope and exit 5.
 5. Maintenance view-comparison fallbacks re-raise `DiagnosticError` unchanged;
    only untyped `OSError` and `ValueError` failures degrade to stale-view state.
+6. The shared `apply_views` boundary also re-raises typed failures from its
+   initial comparison and view-write phases. Direct application, format writes,
+   mutation finalization, and post-render comparisons preserve exact typed
+   failures, while untyped renderer and writer failures retain the existing
+   stale-view fallback.
 
 No documentation, packaged skill, version, dependencies, lockfile, CI, or
 release workflow changes were required: the public contracts already describe
@@ -38,15 +43,17 @@ bounded reads and typed diagnostics.
   then `3 passed`.
 - The first full-unit run exposed two atomic-temporary recovery regressions;
   both focused nodes then passed after inheriting the canonical target limit.
+- Shared view failure propagation: 4 expected failures and one already-correct
+  post-render comparison before implementation; then `5 passed, 67 deselected`.
 
 ## Verification
 
 - Affected unit/integration slice: `260 passed` with one known Cyclopts warning.
-- Full unit suite: `952 passed`.
+- Full unit suite: `957 passed` after the shared view follow-up.
 - Full integration suite: `102 passed, 1 skipped` with the expected offline
   isolated-install skip and one known Cyclopts warning.
-- Full default suite: `1055 passed, 1 skipped`, 92.29% coverage, and the same
-  one known Cyclopts warning.
+- Full default suite: `1060 passed, 1 skipped`, 92.30% coverage, and the same
+  one known Cyclopts warning after the shared view follow-up.
 - Ruff check: clean.
 - Ruff format check: 120 files formatted.
 - Strict mypy: no issues in 60 source files.

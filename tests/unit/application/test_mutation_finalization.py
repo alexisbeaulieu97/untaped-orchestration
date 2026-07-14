@@ -34,11 +34,11 @@ from untaped_orchestration.application.results import (
 )
 from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.cli.output import CommandResult, run_command
-from untaped_orchestration.domain.diagnostics import expected_diagnostic
-from untaped_orchestration.infrastructure.filesystem import location_from_root
+from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
+from untaped_orchestration.infrastructure.filesystem import PathSafetyError, location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
-from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
+from untaped_orchestration.infrastructure.views import MarkdownViewRenderer, ViewError
 
 
 class RecordingLocks:
@@ -151,6 +151,35 @@ class RecordingViews:
         if self.fail:
             raise OSError("renderer unavailable")
         return {PurePosixPath("views/decisions.md"): b"view\n"}
+
+
+class TypedFailingViews(RecordingViews):
+    def __init__(
+        self,
+        events: list[str],
+        locks: RecordingLocks,
+        error: DiagnosticError,
+    ) -> None:
+        super().__init__(events, locks)
+        self.error = error
+
+    def expected(self, snapshot) -> Mapping[PurePosixPath, bytes]:
+        del snapshot
+        assert self.locks.active
+        raise self.error
+
+
+class FailReadAfterFirstComparison(RecordingRepository):
+    def __init__(self, delegate, events, locks, error: DiagnosticError) -> None:
+        super().__init__(delegate, events, locks)
+        self.error = error
+        self.reads = 0
+
+    def read_file(self, location, path):
+        self.reads += 1
+        if self.reads == 2:
+            raise self.error
+        return super().read_file(location, path)
 
 
 def test_execute_mutation_invokes_one_scope_factory_immediately_before_execution() -> None:
@@ -599,6 +628,90 @@ def test_renderer_failure_preserves_complete_intended_view_paths(
         PurePosixPath("views/decisions.md"),
     )
     assert result.changed_paths == (PurePosixPath("registry.toml"),)
+
+
+def test_apply_views_preserves_typed_initial_comparison_failure(tmp_path: Path) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    error = ViewError("typed initial view failure")
+    locks.active = True
+
+    with pytest.raises(ViewError) as captured:
+        apply_views(
+            repository,
+            repository,
+            current.selected.location,
+            TypedFailingViews(events, locks, error),
+            current.selected,
+        )
+
+    assert captured.value is error
+
+
+def test_apply_views_preserves_typed_view_writer_failure(tmp_path: Path) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    error = StoreLockTimeout(current.selected.location)
+    writer = FailingCanonicalWriter(repository, events, locks, failure=error, fail_on=1)
+    locks.active = True
+
+    with pytest.raises(StoreLockTimeout) as captured:
+        apply_views(
+            repository,
+            writer,
+            current.selected.location,
+            RecordingViews(events, locks),
+            current.selected,
+        )
+
+    assert captured.value is error
+
+
+def test_apply_views_preserves_typed_post_render_comparison_failure(tmp_path: Path) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    error = PathSafetyError(PurePosixPath("views/decisions.md"), "unsafe rendered view")
+    reader = FailReadAfterFirstComparison(repository, events, locks, error)
+    locks.active = True
+
+    with pytest.raises(PathSafetyError) as captured:
+        apply_views(
+            reader,
+            repository,
+            current.selected.location,
+            RecordingViews(events, locks),
+            current.selected,
+        )
+
+    assert captured.value is error
+
+
+def test_mutation_finalization_preserves_typed_view_writer_failure(tmp_path: Path) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    error = StoreLockTimeout(current.selected.location)
+    writer = FailingCanonicalWriter(repository, events, locks, failure=error, fail_on=2)
+
+    with pytest.raises(StoreLockTimeout) as captured:
+        MutationExecutor(
+            repository,
+            writer,
+            locks,
+            RecordingViews(events, locks),
+            projector=repository,
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
+        )
+
+    assert captured.value is error
 
 
 def test_later_canonical_failure_receipt_preserves_acknowledged_paths(

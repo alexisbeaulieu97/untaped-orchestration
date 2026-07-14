@@ -13,6 +13,7 @@ from untaped_orchestration.application.ports import (
     ViewRenderer,
 )
 from untaped_orchestration.application.results import PathComparison
+from untaped_orchestration.domain.diagnostics import DiagnosticError
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,8 @@ def apply_views(
     managed = renderer.managed_paths()
     try:
         expected, before = view_comparisons(reader, location, renderer, snapshot)
+    except DiagnosticError:
+        raise
     except OSError, ValueError:
         return ViewState(
             () if not write else managed,
@@ -79,6 +82,8 @@ def apply_views(
                 writer.replace(location, FileReplacement(path, expected[path]))
             else:
                 writer.delete(location, FileDeletion(path))
+    except DiagnosticError:
+        raise
     except OSError, ValueError:
         pass
 

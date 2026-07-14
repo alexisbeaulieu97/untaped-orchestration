@@ -76,6 +76,17 @@ class FailAfterDurableViewWrite(RecordingWriter):
             raise OSError("view acknowledgement lost")
 
 
+class TypedFailingViewWriter(RecordingWriter):
+    def __init__(self, delegate: FilesystemStoreRepository, error: PathSafetyError) -> None:
+        super().__init__(delegate)
+        self.error = error
+
+    def replace(self, location, change) -> None:
+        if change.path.parts[0] == "views":
+            raise self.error
+        super().replace(location, change)
+
+
 def _initialized(tmp_path: Path):
     target = tmp_path / "repository"
     target.mkdir()
@@ -282,6 +293,27 @@ def test_fmt_view_failure_preserves_canonical_write_and_reports_stale_views(
     assert result.canonical_applied
     assert not result.views_current
     assert b"# comment" not in store.read_bytes()
+
+
+def test_fmt_write_preserves_typed_view_writer_failure(tmp_path: Path) -> None:
+    root, repository, locks, views = _initialized(tmp_path)
+    store = root / "store.toml"
+    store.write_bytes(b"# comment\n" + store.read_bytes())
+    root.joinpath("views/roadmap.md").write_bytes(b"stale\n")
+    location = location_from_root(root)
+    revision = repository.load_local(location, headers_only=True).store_revision
+    error = PathSafetyError(PurePosixPath("views/roadmap.md"), "unsafe view write")
+
+    with pytest.raises(PathSafetyError) as captured:
+        FormatStore(
+            repository,
+            TypedFailingViewWriter(repository, error),
+            locks,
+            views,
+            CanonicalStoreFormatter(),
+        ).write(location, expected_store_revision=revision)
+
+    assert captured.value is error
 
 
 def test_decision_only_conversion_diagnoses_and_deletes_all_sensitive_task_views(
