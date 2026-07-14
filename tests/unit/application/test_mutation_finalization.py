@@ -27,6 +27,7 @@ from untaped_orchestration.application.results import (
     FederationAnchor,
 )
 from untaped_orchestration.application.view_management import apply_views
+from untaped_orchestration.domain.diagnostics import expected_diagnostic
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -301,6 +302,95 @@ def test_finalizer_accepts_an_explicit_per_operation_validator(tmp_path: Path) -
     assert default_calls == 0
     assert operation_calls == 3
     assert callable(validate_selected_local)
+
+
+def test_finalizer_invokes_distinct_current_and_projected_validators_in_order(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = RecordingRepository(repository, events, locks)
+
+    def current_validator(snapshot: FederatedSnapshot):
+        del snapshot
+        events.append("validate-current-only")
+        return ()
+
+    def projected_validator(snapshot: FederatedSnapshot):
+        del snapshot
+        events.append("validate-projected-only")
+        return ()
+
+    MutationExecutor(
+        adapter,
+        adapter,
+        locks,
+        RecordingViews(events, locks),
+        projector=RecordingProjector(repository, events, locks),
+    ).execute(
+        locations=tuple(value.location for value in current.stores),
+        selected=current.selected.location,
+        load=lambda: current,
+        guard=lambda _: events.append("guard"),
+        build=lambda _: events.append("build") or IntendedMutation(),
+        current_validator=current_validator,
+        projected_validator=projected_validator,
+    )
+
+    assert events.index("validate-current-only") < events.index("guard")
+    assert events.index("guard") < events.index("build")
+    assert events.count("validate-current-only") == 1
+    assert events.count("validate-projected-only") == 2
+
+
+@pytest.mark.parametrize("failure", ["current", "projected"])
+def test_finalizer_validator_failure_prevents_canonical_writes(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = RecordingRepository(repository, events, locks)
+    diagnostics = expected_diagnostic("ORC002", f"{failure} state rejected")
+
+    def current_validator(snapshot: FederatedSnapshot):
+        del snapshot
+        events.append("validate-current-only")
+        return diagnostics if failure == "current" else ()
+
+    def projected_validator(snapshot: FederatedSnapshot):
+        del snapshot
+        events.append("validate-projected-only")
+        return diagnostics if failure == "projected" else ()
+
+    with pytest.raises(InvalidMutationState):
+        MutationExecutor(
+            adapter,
+            adapter,
+            locks,
+            RecordingViews(events, locks),
+            projector=RecordingProjector(repository, events, locks),
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: events.append("guard"),
+            build=lambda snapshot: (
+                events.append("build") or IntendedMutation(replacements=(_replacement(snapshot),))
+            ),
+            current_validator=current_validator,
+            projected_validator=projected_validator,
+        )
+
+    assert adapter.writes == []
+    if failure == "current":
+        assert "guard" not in events
+        assert "build" not in events
+        assert "validate-projected-only" not in events
+    else:
+        assert events.count("validate-projected-only") == 1
 
 
 @pytest.mark.parametrize("mode", ["missing", "extra", "wrong-selected"])

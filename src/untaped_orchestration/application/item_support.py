@@ -310,6 +310,8 @@ def execute_mutation(
     build: Callable[[FederatedSnapshot], IntendedMutation],
     *,
     validator: SnapshotValidator | None = None,
+    current_validator: SnapshotValidator | None = None,
+    projected_validator: SnapshotValidator | None = None,
     dry_run: bool = False,
 ) -> MutationReceipt:
     scope = scope_factory()
@@ -320,6 +322,8 @@ def execute_mutation(
         guard=guard,
         build=build,
         validator=validator,
+        current_validator=current_validator,
+        projected_validator=projected_validator,
         dry_run=dry_run,
     )
 

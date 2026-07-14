@@ -213,9 +213,8 @@ def register(app: App) -> None:  # noqa: C901
             context = CliContext.resolve(store)
             service = RepairService(
                 context.repository,
-                context.repository,
-                context.locks,
-                context.views,
+                context.executor,
+                context.scope,
                 external_files=context.repository,
                 duplicate_repair=context.tasks(),
             )

@@ -1,33 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from hashlib import sha256
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
-from untaped_orchestration.application.item_support import ItemMutationResult
+from untaped_orchestration.application.item_support import (
+    ItemMutationResult,
+    MutationScope,
+    execute_mutation,
+)
+from untaped_orchestration.application.mutations import IntendedMutation, MutationExecutor
 from untaped_orchestration.application.ports import (
-    CanonicalFormatter,
     ExternalFileReader,
     FileReplacement,
-    LockManager,
-    MutationProjector,
     StoreLocation,
     StoreReader,
-    StoreWriter,
     UnprovableBodyBoundary,
-    ViewRenderer,
 )
 from untaped_orchestration.application.results import (
-    Completeness,
     FederatedSnapshot,
-    ItemRevision,
     MutationReceipt,
-    StoreSnapshot,
 )
 from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.application.validation import validate_snapshot
-from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.domain.diagnostics import (
     Diagnostic,
     DiagnosticError,
@@ -35,8 +30,6 @@ from untaped_orchestration.domain.diagnostics import (
 )
 from untaped_orchestration.domain.limits import BODY_LIMIT, FRONTMATTER_LIMIT
 from untaped_orchestration.domain.models import Revision
-
-DEFAULT_LOCK_TIMEOUT = 10.0
 
 
 class RepairConflict(DiagnosticError):
@@ -48,13 +41,7 @@ class RepairConflict(DiagnosticError):
         super().__init__(diagnostics or expected_diagnostic("ORC002", message))
 
 
-class RepairRepository(
-    StoreReader,
-    StoreWriter,
-    CanonicalFormatter,
-    MutationProjector,
-    Protocol,
-):
+class RepairRepository(StoreReader, Protocol):
     def repaired_item_bytes(
         self,
         *,
@@ -86,52 +73,27 @@ class RepairFrontmatterResult:
     after: bytes
 
 
-def _federated(snapshot: StoreSnapshot) -> FederatedSnapshot:
-    return FederatedSnapshot(snapshot, (snapshot,), Completeness())
-
-
-def _receipt(
-    snapshot: StoreSnapshot,
-    *,
-    intended: tuple[PurePosixPath, ...],
-    changed: tuple[PurePosixPath, ...],
-    canonical_applied: bool,
-    views_current: bool,
-) -> MutationReceipt:
-    return MutationReceipt(
-        applied=bool(changed),
-        replayed=False,
-        canonical_applied=canonical_applied,
-        views_current=views_current,
-        intended_paths=intended,
-        changed_paths=changed,
-        item_revisions=tuple(
-            ItemRevision(value.path, value.revision) for value in snapshot.records
-        ),
-        store_revision=snapshot.store_revision,
-        registry_revision=snapshot.registry_revision,
-    )
+@dataclass(slots=True)
+class _PlannedRepair:
+    before: bytes | None = None
+    after: bytes | None = None
 
 
 class RepairService:
     def __init__(
         self,
         repository: RepairRepository,
-        writer: StoreWriter,
-        locks: LockManager,
-        views: ViewRenderer,
+        executor: MutationExecutor,
+        scope: MutationScope,
         *,
         external_files: ExternalFileReader,
         duplicate_repair: DuplicateRepair | None = None,
-        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     ) -> None:
         self._repository = repository
-        self._writer = writer
-        self._locks = locks
-        self._views = views
+        self._executor = executor
+        self._scope = scope
         self._external_files = external_files
         self._duplicate_repair = duplicate_repair
-        self._lock_timeout = lock_timeout
 
     def duplicate(self, request: RepairDuplicateRequest) -> ItemMutationResult:
         if self._duplicate_repair is None:
@@ -139,9 +101,40 @@ class RepairService:
         return self._duplicate_repair.repair_duplicate(request)
 
     def frontmatter(self, request: RepairFrontmatterRequest) -> RepairFrontmatterResult:
-        with self._locks.acquire((request.location,), timeout=self._lock_timeout):
-            before = self._repository.read_raw(request.location, request.path).content
-            if Revision(f"sha256:{sha256(before).hexdigest()}") != request.expected_revision:
+        replacement, body = self._replacement_inputs(request)
+        planned = _PlannedRepair()
+
+        def current_validator(snapshot: FederatedSnapshot) -> tuple[Diagnostic, ...]:
+            selected = replace(
+                snapshot.selected,
+                load_diagnostics=tuple(
+                    diagnostic
+                    for diagnostic in snapshot.selected.load_diagnostics
+                    if diagnostic.path != request.path.as_posix()
+                ),
+            )
+            stores = tuple(
+                selected if store.location.real_root == selected.location.real_root else store
+                for store in snapshot.stores
+            )
+            return validate_snapshot(
+                replace(snapshot, selected=selected, stores=stores),
+                require_children=False,
+            )
+
+        def guard(snapshot: FederatedSnapshot) -> None:
+            if snapshot.selected.location.real_root != request.location.real_root:
+                raise RepairConflict(
+                    "repair location does not match the selected mutation store",
+                    expected_diagnostic(
+                        "ORC007",
+                        "repair location does not match the selected mutation store",
+                        path=request.path.as_posix(),
+                        field="store",
+                    ),
+                )
+            raw = self._repository.read_raw(request.location, request.path)
+            if raw.revision != request.expected_revision:
                 raise RepairConflict(
                     "item revision guard does not match current revision",
                     expected_diagnostic(
@@ -151,20 +144,38 @@ class RepairService:
                         field="revision",
                     ),
                 )
-            after = self._planned_repair(request, before)
-            current = self._repository.load_local(request.location, headers_only=False)
-            projected = self._repository.project(
-                _federated(current),
-                request.location,
-                (FileReplacement(request.path, after),),
-                (),
-            )
-            diagnostics = validate_snapshot(projected.snapshot, require_children=True)
-            if any(value.severity == "error" for value in diagnostics):
-                raise RepairConflict("repair would leave an invalid store", diagnostics)
-            return self._finish(request, before, after, projected.snapshot.selected)
+            planned.before = raw.content
 
-    def _planned_repair(self, request: RepairFrontmatterRequest, before: bytes) -> bytes:
+        def build(snapshot: FederatedSnapshot) -> IntendedMutation:
+            del snapshot
+            assert planned.before is not None
+            planned.after = self._planned_repair(
+                request,
+                planned.before,
+                replacement,
+                body,
+            )
+            return IntendedMutation(replacements=(FileReplacement(request.path, planned.after),))
+
+        receipt = execute_mutation(
+            self._executor,
+            self._scope.recursive,
+            guard,
+            build,
+            current_validator=current_validator,
+            projected_validator=lambda snapshot: validate_snapshot(
+                snapshot,
+                require_children=False,
+            ),
+            dry_run=not request.apply,
+        )
+        assert planned.before is not None and planned.after is not None
+        return RepairFrontmatterResult(receipt, planned.before, planned.after)
+
+    def _replacement_inputs(
+        self,
+        request: RepairFrontmatterRequest,
+    ) -> tuple[bytes, bytes | None]:
         try:
             replacement = self._external_files.read_external(
                 request.frontmatter_file,
@@ -180,6 +191,23 @@ class RepairService:
                 if request.body_file is not None
                 else None
             )
+            return replacement, body
+        except DiagnosticError as error:
+            raise RepairConflict(
+                "replacement front matter or body is invalid",
+                error.diagnostics,
+            ) from error
+        except (OSError, ValueError) as error:
+            raise RepairConflict("replacement front matter or body is invalid") from error
+
+    def _planned_repair(
+        self,
+        request: RepairFrontmatterRequest,
+        before: bytes,
+        replacement: bytes,
+        body: bytes | None,
+    ) -> bytes:
+        try:
             return self._repository.repaired_item_bytes(
                 relative_path=request.path,
                 current=before,
@@ -203,46 +231,3 @@ class RepairService:
                     ),
                 ) from error
             raise RepairConflict("replacement front matter or body is invalid") from error
-
-    def _finish(
-        self,
-        request: RepairFrontmatterRequest,
-        before: bytes,
-        after: bytes,
-        projected: StoreSnapshot,
-    ) -> RepairFrontmatterResult:
-        changed: list[PurePosixPath] = []
-        if request.apply and after != before:
-            self._writer.replace(request.location, FileReplacement(request.path, after))
-            changed.append(request.path)
-        selected_after = (
-            self._repository.load_local(request.location, headers_only=False)
-            if changed
-            else projected
-        )
-        intended: tuple[PurePosixPath, ...] = (request.path,)
-        views_current = False
-        if request.apply:
-            view_state = apply_views(
-                self._repository,
-                self._writer,
-                request.location,
-                self._views,
-                selected_after,
-            )
-            changed.extend(view_state.changed_paths)
-            intended = (request.path, *view_state.intended_paths)
-            views_current = view_state.current
-        snapshot_for_receipt = (
-            selected_after
-            if request.apply
-            else self._repository.load_local(request.location, headers_only=False)
-        )
-        receipt = _receipt(
-            snapshot_for_receipt,
-            intended=intended,
-            changed=tuple(changed),
-            canonical_applied=request.apply and after != before,
-            views_current=views_current,
-        )
-        return RepairFrontmatterResult(receipt, before, after)

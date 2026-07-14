@@ -48,6 +48,12 @@ class MutationLockSetError(DiagnosticError):
         super().__init__(expected_diagnostic("ORC007", message, field="lock_set"))
 
 
+class MutationWriteError(OSError):
+    def __init__(self, message: str, receipt: MutationReceipt) -> None:
+        super().__init__(message)
+        self.receipt = receipt
+
+
 @dataclass(frozen=True, slots=True)
 class IntendedMutation:
     replacements: tuple[FileReplacement, ...] = ()
@@ -185,15 +191,19 @@ class MutationExecutor:
         build: MutationBuilder,
         replayed: bool = False,
         validator: SnapshotValidator | None = None,
+        current_validator: SnapshotValidator | None = None,
+        projected_validator: SnapshotValidator | None = None,
         dry_run: bool = False,
     ) -> MutationReceipt:
         operation_validator = validator or self._validator
+        current_state_validator = current_validator or operation_validator
+        projected_state_validator = projected_validator or operation_validator
         with self._locks.acquire(locations, timeout=self._lock_timeout):
             current_shape = inspect_store_shape(self._reader, selected)
             if current_shape.diagnostics:
                 raise InvalidMutationState(current_shape.diagnostics)
             current = load()
-            _valid_or_raise(current, operation_validator)
+            _valid_or_raise(current, current_state_validator)
             _validate_lock_set(locations, selected, current)
             guard(current)
             intended = build(current)
@@ -207,7 +217,7 @@ class MutationExecutor:
             if shape_diagnostics:
                 raise InvalidMutationState(shape_diagnostics)
             projected = projection.snapshot
-            _valid_or_raise(projected, operation_validator)
+            _valid_or_raise(projected, projected_state_validator)
 
             if dry_run:
                 return MutationReceipt(
@@ -231,12 +241,36 @@ class MutationExecutor:
                 )
 
             changed = []
-            for replacement in intended.replacements:
-                self._writer.replace(selected, replacement)
-                changed.append(replacement.path)
-            for deletion in intended.deletions:
-                self._writer.delete(selected, deletion)
-                changed.append(deletion.path)
+            try:
+                for replacement in intended.replacements:
+                    self._writer.replace(selected, replacement)
+                    changed.append(replacement.path)
+                for deletion in intended.deletions:
+                    self._writer.delete(selected, deletion)
+                    changed.append(deletion.path)
+            except (OSError, ValueError) as error:
+                raise MutationWriteError(
+                    str(error),
+                    MutationReceipt(
+                        applied=False,
+                        replayed=False,
+                        canonical_applied=False,
+                        views_current=False,
+                        intended_paths=tuple(
+                            (
+                                *(value.path for value in intended.replacements),
+                                *(value.path for value in intended.deletions),
+                            )
+                        ),
+                        changed_paths=(),
+                        item_revisions=tuple(
+                            ItemRevision(record.path, record.revision)
+                            for record in current.selected.records
+                        ),
+                        store_revision=current.selected.store_revision,
+                        registry_revision=current.selected.registry_revision,
+                    ),
+                ) from error
 
             canonical_applied = bool(intended.replacements or intended.deletions)
             after_shape = inspect_store_shape(self._reader, selected)
@@ -253,7 +287,7 @@ class MutationExecutor:
                 ),
                 projected.completeness,
             )
-            _valid_or_raise(after, operation_validator)
+            _valid_or_raise(after, projected_state_validator)
             if selected_after != projected.selected:
                 raise InvalidMutationState(
                     (
