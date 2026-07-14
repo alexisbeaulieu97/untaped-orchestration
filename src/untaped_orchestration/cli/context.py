@@ -75,22 +75,27 @@ class CliContext:
         override = Path(store) if store is not None else None
         location = repository.discover(Path.cwd(), override)
         federation = FederationService(repository, locks)
-        recursive_snapshot = federation.load(location, local=False, headers_only=True)
         unlocked_federation = FederationService(repository, AlreadyLocked())
 
-        def recursive() -> FederatedSnapshot:
+        def recursive_load() -> FederatedSnapshot:
             return unlocked_federation.load(location, local=False, headers_only=False)
 
-        def local() -> FederatedSnapshot:
+        def local_load() -> FederatedSnapshot:
             return unlocked_federation.load(location, local=True, headers_only=False)
 
-        scope = MutationScope(
-            MutationExecutionScope(
-                tuple(store.location for store in recursive_snapshot.stores),
+        def recursive_scope() -> MutationExecutionScope:
+            return MutationExecutionScope(
+                federation.optimistic_locations(location),
                 location,
-                recursive,
-            ),
-            MutationExecutionScope((location,), location, local),
+                recursive_load,
+            )
+
+        def selected_local_scope() -> MutationExecutionScope:
+            return MutationExecutionScope((location,), location, local_load)
+
+        scope = MutationScope(
+            recursive_scope,
+            selected_local_scope,
         )
         executor = MutationExecutor(repository, repository, locks, views, projector=repository)
         return cls(

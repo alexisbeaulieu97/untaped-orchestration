@@ -19,6 +19,7 @@ from untaped_orchestration.application.import_operations import (
 from untaped_orchestration.application.import_operations import (
     ImportService as ImportService,
 )
+from untaped_orchestration.application.mutations import validate_selected_local
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
     FileReplacement,
@@ -277,16 +278,28 @@ class RenderStore:
         location: StoreLocation,
         *,
         validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
     ) -> MaintenanceResult:
-        return self._execute(location, write=False, validation_snapshot=validation_snapshot)
+        return self._execute(
+            location,
+            write=False,
+            validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
+        )
 
     def write(
         self,
         location: StoreLocation,
         *,
         validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
     ) -> MaintenanceResult:
-        return self._execute(location, write=True, validation_snapshot=validation_snapshot)
+        return self._execute(
+            location,
+            write=True,
+            validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
+        )
 
     def _execute(
         self,
@@ -294,6 +307,7 @@ class RenderStore:
         *,
         write: bool,
         validation_snapshot: FederatedSnapshot | None,
+        selected_local_validation: bool,
     ) -> MaintenanceResult:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
             inspection = inspect_store_shape(self._reader, location)
@@ -306,7 +320,11 @@ class RenderStore:
             diagnostics = (
                 _validate(snapshot)
                 if validation_snapshot is None
-                else validate_snapshot(validation_snapshot, require_children=False)
+                else (
+                    validate_selected_local(validation_snapshot)
+                    if selected_local_validation
+                    else validate_snapshot(validation_snapshot, require_children=False)
+                )
             )
             if _invalid(diagnostics):
                 raise InvalidStoreState(diagnostics, _invalid_result(snapshot, diagnostics))
@@ -363,12 +381,14 @@ class FormatStore:
         location: StoreLocation,
         *,
         validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
     ) -> MaintenanceResult:
         return self._execute(
             location,
             write=False,
             expected_store_revision=None,
             validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
         )
 
     def write(
@@ -377,6 +397,7 @@ class FormatStore:
         *,
         expected_store_revision: Revision | str,
         validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
     ) -> MaintenanceResult:
         return self._execute(
             location,
@@ -387,6 +408,7 @@ class FormatStore:
                 else Revision(expected_store_revision)
             ),
             validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
         )
 
     def _execute(
@@ -396,6 +418,7 @@ class FormatStore:
         write: bool,
         expected_store_revision: Revision | None,
         validation_snapshot: FederatedSnapshot | None,
+        selected_local_validation: bool,
     ) -> MaintenanceResult:
         with self._locks.acquire((location,), timeout=self._lock_timeout):
             inspection = inspect_store_shape(self._reader, location)
@@ -408,7 +431,11 @@ class FormatStore:
             diagnostics = (
                 _validate(snapshot)
                 if validation_snapshot is None
-                else validate_snapshot(validation_snapshot, require_children=False)
+                else (
+                    validate_selected_local(validation_snapshot)
+                    if selected_local_validation
+                    else validate_snapshot(validation_snapshot, require_children=False)
+                )
             )
             if _invalid(diagnostics) or snapshot.store is None or snapshot.registry is None:
                 raise InvalidStoreState(diagnostics, _invalid_result(snapshot, diagnostics))
@@ -588,7 +615,7 @@ class RecursiveMaintenanceService:
     def fmt_check(self, request: RecursiveFormatRequest) -> RecursiveFormatResult:
         return self._federation.run(
             request.location,
-            local=False,
+            local=request.local,
             action=lambda lease: self._fmt_loaded(request, lease),
         )
 
@@ -604,7 +631,11 @@ class RecursiveMaintenanceService:
                 False,
                 sort_diagnostics(snapshot.completeness.diagnostics),
             )
-        diagnostics = validate_snapshot(snapshot, require_children=False)
+        diagnostics = (
+            validate_selected_local(snapshot)
+            if request.local
+            else validate_snapshot(snapshot, require_children=False)
+        )
         comparisons: list[StorePathComparison] = []
         stores = (snapshot.selected,) if request.local else snapshot.stores
         for store in stores:
@@ -642,7 +673,7 @@ class RecursiveMaintenanceService:
             raise RuntimeError("local formatter was not configured")
         return self._federation.run(
             request.location,
-            local=False,
+            local=True,
             action=lambda lease: self._fmt_write_locked(
                 request,
                 expected_store_revision,
@@ -669,6 +700,7 @@ class RecursiveMaintenanceService:
             request.location,
             expected_store_revision=expected_store_revision,
             validation_snapshot=lease.snapshot,
+            selected_local_validation=True,
         )
 
     def render_check(self, location: StoreLocation) -> MaintenanceResult:
@@ -676,7 +708,7 @@ class RecursiveMaintenanceService:
             raise RuntimeError("local renderer was not configured")
         return self._federation.run(
             location,
-            local=False,
+            local=True,
             action=lambda lease: self._render_locked(location, lease, write=False),
         )
 
@@ -685,7 +717,7 @@ class RecursiveMaintenanceService:
             raise RuntimeError("local renderer was not configured")
         return self._federation.run(
             location,
-            local=False,
+            local=True,
             action=lambda lease: self._render_locked(location, lease, write=True),
         )
 
@@ -704,4 +736,8 @@ class RecursiveMaintenanceService:
             )
         assert self._local_renderer is not None
         method = self._local_renderer.write if write else self._local_renderer.check
-        return method(location, validation_snapshot=lease.snapshot)
+        return method(
+            location,
+            validation_snapshot=lease.snapshot,
+            selected_local_validation=True,
+        )

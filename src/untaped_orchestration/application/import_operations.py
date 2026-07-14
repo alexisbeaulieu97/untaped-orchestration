@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -9,7 +8,11 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from untaped_orchestration.application.item_support import validated_copy
+from untaped_orchestration.application.item_support import (
+    MutationScopeFactory,
+    execute_mutation,
+    validated_copy,
+)
 from untaped_orchestration.application.mutations import IntendedMutation, MutationExecutor
 from untaped_orchestration.application.ports import (
     CanonicalFormatter,
@@ -283,15 +286,13 @@ class ImportService:
         views: ViewRenderer,
         *,
         external_files: ExternalFileReader,
-        locations: tuple[StoreLocation, ...],
-        load: Callable[[], FederatedSnapshot],
+        scope_factory: MutationScopeFactory,
     ) -> None:
         self._repository = repository
         self._executor = executor
         self._views = views
         self._external_files = external_files
-        self._locations = locations
-        self._load = load
+        self._scope_factory = scope_factory
 
     def _records(
         self,
@@ -376,12 +377,11 @@ class ImportService:
             records,
             set(),
         )
-        receipt = self._executor.execute(
-            locations=self._locations,
-            selected=request.location,
-            load=self._load,
-            guard=operation.guard,
-            build=operation.build,
+        receipt = execute_mutation(
+            self._executor,
+            self._scope_factory,
+            operation.guard,
+            operation.build,
             validator=operation.validator,
             dry_run=not request.apply,
         )

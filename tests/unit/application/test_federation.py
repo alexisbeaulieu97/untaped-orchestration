@@ -363,6 +363,21 @@ def test_recursive_resolution_uses_explicit_depth_first_and_global_lock_order() 
     assert reader.loads.count((grandchild, True)) == 3
 
 
+def test_optimistic_locations_include_invalid_unexposed_participants_without_locking() -> None:
+    root = Path("/work/root")
+    child_root = Path("/work/child")
+    selected = _snapshot(root, STORE_ID, (CHILD_STORE_ID, "../child"))
+    invalid_child = replace(_snapshot(child_root, CHILD_STORE_ID), store=None)
+    reader = ScriptedReader((selected, invalid_child))
+    locks = RecordingLocks()
+
+    locations = FederationService(reader, locks).optimistic_locations(selected.location)
+
+    assert locations == (invalid_child.location, selected.location)
+    assert reader.loads == [(root, True), (child_root, True)]
+    assert locks.calls == []
+
+
 def test_casefold_path_alias_is_incomplete_and_never_added_to_the_lock_set() -> None:
     root = Path("/work/root")
     upper = Path("/work/Child")

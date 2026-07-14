@@ -120,7 +120,10 @@ def _validate_lock_set(
     current: FederatedSnapshot,
 ) -> None:
     locked = tuple(_location_key(value) for value in locations)
-    resolved = tuple(_location_key(value.location) for value in current.stores)
+    resolved = tuple(
+        _location_key(value.location)
+        for value in (current.participants if current.participants else current.stores)
+    )
     selected_key = _location_key(selected)
     if (
         len(set(locked)) != len(locked)
@@ -130,7 +133,8 @@ def _validate_lock_set(
         or selected_key not in set(locked)
     ):
         raise MutationLockSetError(
-            "locked locations must exactly match resolved stores and include the selected store"
+            "locked locations must exactly match resolved participants "
+            "and include the selected store"
         )
 
 

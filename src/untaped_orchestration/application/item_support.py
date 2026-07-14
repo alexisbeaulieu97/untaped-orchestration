@@ -145,10 +145,13 @@ class MutationExecutionScope:
     load: Callable[[], FederatedSnapshot]
 
 
+type MutationScopeFactory = Callable[[], MutationExecutionScope]
+
+
 @dataclass(frozen=True, slots=True)
 class MutationScope:
-    recursive: MutationExecutionScope
-    selected_local: MutationExecutionScope
+    recursive: MutationScopeFactory
+    selected_local: MutationScopeFactory
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,13 +305,14 @@ def validated_copy(
 
 def execute_mutation(
     executor: MutationExecutor,
-    scope: MutationExecutionScope,
+    scope_factory: MutationScopeFactory,
     guard: Callable[[FederatedSnapshot], None],
     build: Callable[[FederatedSnapshot], IntendedMutation],
     *,
     validator: SnapshotValidator | None = None,
     dry_run: bool = False,
 ) -> MutationReceipt:
+    scope = scope_factory()
     return executor.execute(
         locations=scope.locations,
         selected=scope.selected,

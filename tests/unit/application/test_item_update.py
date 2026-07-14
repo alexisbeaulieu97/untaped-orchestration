@@ -65,7 +65,7 @@ def _state(tmp_path: Path):
         return FederatedSnapshot(selected, (selected,), Completeness())
 
     execution = MutationExecutionScope((location,), location, load)
-    scope = MutationScope(execution, execution)
+    scope = MutationScope(lambda: execution, lambda: execution)
     executor = MutationExecutor(repository, repository, locks, views, projector=repository)
     return repository, location, scope, executor
 
@@ -344,7 +344,7 @@ def test_decision_update_uses_selected_local_policy_for_unrelated_child_failure(
     child_id = StoreId("sto_019f0000000070008000000000000001")
 
     def incomplete_load() -> FederatedSnapshot:
-        current = scope.recursive.load()
+        current = scope.recursive().load()
         entry = IncompleteStore(
             child_id,
             reason,  # type: ignore[arg-type]
@@ -361,9 +361,9 @@ def test_decision_update_uses_selected_local_policy_for_unrelated_child_failure(
 
     result = UpdateDecision(executor, repository).execute(
         MutationScope(
-            MutationExecutionScope(
-                scope.recursive.locations,
-                scope.recursive.selected,
+            lambda: MutationExecutionScope(
+                scope.recursive().locations,
+                scope.recursive().selected,
                 incomplete_load,
             ),
             scope.selected_local,

@@ -113,7 +113,7 @@ def test_every_canonical_phase_recovers_and_final_ack_loss_replays(
     from untaped_orchestration.application.items import MutationExecutionScope, MutationScope
 
     execution = MutationExecutionScope((location,), location, load)
-    scope = MutationScope(execution, execution)
+    scope = MutationScope(lambda: execution, lambda: execution)
     executor = MutationExecutor(
         repository, repository, FileLockManager(), MarkdownViewRenderer(), projector=repository
     )
@@ -168,7 +168,7 @@ def test_successor_only_recovery_accepts_reversed_predecessor_order(tmp_path: Pa
     from untaped_orchestration.application.items import MutationExecutionScope, MutationScope
 
     execution = MutationExecutionScope((location,), location, load)
-    scope = MutationScope(execution, execution)
+    scope = MutationScope(lambda: execution, lambda: execution)
     executor = MutationExecutor(
         repository,
         repository,
@@ -214,7 +214,7 @@ def test_intermediate_phase_reports_inactive_pin_and_refuses_unrelated_divergenc
     from untaped_orchestration.application.items import MutationExecutionScope, MutationScope
 
     execution = MutationExecutionScope((location,), location, load)
-    scope = MutationScope(execution, execution)
+    scope = MutationScope(lambda: execution, lambda: execution)
     executor = MutationExecutor(
         repository,
         repository,

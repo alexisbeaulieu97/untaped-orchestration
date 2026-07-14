@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 from tests.builders import STORE_ID
 from untaped_orchestration.application.bootstrap import InitializeStore, InitRequest
+from untaped_orchestration.application.item_support import (
+    MutationExecutionScope,
+    execute_mutation,
+)
 from untaped_orchestration.application.mutations import (
     IntendedMutation,
     InvalidMutationState,
@@ -16,7 +21,11 @@ from untaped_orchestration.application.mutations import (
     validate_selected_local,
 )
 from untaped_orchestration.application.ports import FileDeletion, FileReplacement
-from untaped_orchestration.application.results import Completeness, FederatedSnapshot
+from untaped_orchestration.application.results import (
+    Completeness,
+    FederatedSnapshot,
+    FederationAnchor,
+)
 from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
@@ -120,6 +129,37 @@ class RecordingViews:
         if self.fail:
             raise OSError("renderer unavailable")
         return {PurePosixPath("views/decisions.md"): b"view\n"}
+
+
+def test_execute_mutation_invokes_one_scope_factory_immediately_before_execution() -> None:
+    location = location_from_root(Path("/"))
+    events: list[str] = []
+    sentinel = object()
+
+    def load() -> FederatedSnapshot:
+        raise AssertionError("fake executor must not invoke the loader")
+
+    def factory() -> MutationExecutionScope:
+        events.append("factory")
+        return MutationExecutionScope((location,), location, load)
+
+    class Executor:
+        def execute(self, **kwargs):
+            events.append("execute")
+            assert kwargs["locations"] == (location,)
+            assert kwargs["selected"] == location
+            assert kwargs["load"] is load
+            return sentinel
+
+    result = execute_mutation(
+        Executor(),  # type: ignore[arg-type]
+        factory,
+        lambda _: None,
+        lambda _: IntendedMutation(),
+    )
+
+    assert result is sentinel
+    assert events == ["factory", "execute"]
 
 
 def _state(tmp_path: Path):
@@ -305,6 +345,46 @@ def test_finalizer_rejects_any_lock_set_or_selected_location_mismatch_before_bui
         )
 
     assert adapter.writes == []
+
+
+def test_finalizer_exact_lock_set_includes_unexposed_participant_anchors(
+    tmp_path: Path,
+) -> None:
+    repository, resolved = _state(tmp_path)
+    participants = tuple(
+        FederationAnchor(
+            store.location,
+            store.store_config_revision,
+            store.registry_revision,
+        )
+        for store in resolved.stores
+    )
+    current = replace(
+        resolved,
+        stores=(resolved.selected,),
+        participants=participants,
+    )
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = RecordingRepository(repository, events, locks)
+
+    MutationExecutor(
+        adapter,
+        adapter,
+        locks,
+        RecordingViews(events, locks),
+        projector=RecordingProjector(repository, events, locks),
+    ).execute(
+        locations=tuple(anchor.location for anchor in participants),
+        selected=current.selected.location,
+        load=lambda: current,
+        guard=lambda _: None,
+        build=lambda _: IntendedMutation(),
+        validator=lambda _: (),
+        dry_run=True,
+    )
+
+    assert events[0] == "lock:2"
 
 
 def test_invalid_replacement_bytes_cannot_hide_behind_a_fabricated_snapshot(

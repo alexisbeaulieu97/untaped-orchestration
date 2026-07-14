@@ -256,6 +256,16 @@ class FederationService:
             action=lambda lease: lease.snapshot,
         )
 
+    def optimistic_locations(self, location: StoreLocation) -> tuple[StoreLocation, ...]:
+        """Resolve one recursive header snapshot for a mutation's lock set."""
+        resolution, _ = self._resolve_headers(location, local=False)
+        return tuple(
+            sorted(
+                (participant.snapshot.location for participant in resolution.participants.values()),
+                key=_location_sort_key,
+            )
+        )
+
     def run[T](
         self,
         location: StoreLocation,

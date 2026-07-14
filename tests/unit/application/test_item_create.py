@@ -63,7 +63,7 @@ def _services(tmp_path: Path):
         return FederatedSnapshot(selected, (selected,), Completeness())
 
     execution = MutationExecutionScope((location,), location, load)
-    scope = MutationScope(execution, execution)
+    scope = MutationScope(lambda: execution, lambda: execution)
     executor = MutationExecutor(
         repository,
         repository,

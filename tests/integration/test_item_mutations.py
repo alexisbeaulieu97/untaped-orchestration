@@ -91,7 +91,7 @@ def _fixture(tmp_path: Path, *, views=None, repository=None):
         projector=repository,
     )
     execution = MutationExecutionScope((location,), location, load)
-    return repository, location, MutationScope(execution, execution), executor
+    return repository, location, MutationScope(lambda: execution, lambda: execution), executor
 
 
 @pytest.mark.parametrize("family", ["create", "update", "link", "evidence"])
@@ -191,7 +191,7 @@ def test_create_acknowledgement_loss_after_final_fsync_replays_exact_durable_ite
         location,
         lambda: _load(fault_repository, location),
     )
-    fault_scope = MutationScope(fault_execution, fault_execution)
+    fault_scope = MutationScope(lambda: fault_execution, lambda: fault_execution)
     with pytest.raises(OSError, match="acknowledgement lost"):
         CreateTask(fault_executor, fault_repository, Clock()).execute(fault_scope, request)
 
@@ -237,7 +237,7 @@ def test_decision_create_acknowledgement_loss_replays_exact_durable_item(
         location,
         lambda: _load(fault_repository, location),
     )
-    fault_scope = MutationScope(fault_execution, fault_execution)
+    fault_scope = MutationScope(lambda: fault_execution, lambda: fault_execution)
     with pytest.raises(OSError, match="acknowledgement lost"):
         CreateDecision(fault_executor, fault_repository, Clock()).execute(fault_scope, request)
 
@@ -300,7 +300,7 @@ def test_boundary_create_fault_prefix_is_valid_and_retryable(
         location,
         lambda: _load(fault_repository, location),
     )
-    fault_scope = MutationScope(fault_execution, fault_execution)
+    fault_scope = MutationScope(lambda: fault_execution, lambda: fault_execution)
     with pytest.raises(OSError, match=f"replacement {fail_at}"):
         CreateTask(fault_executor, fault_repository, Clock()).execute(fault_scope, request)
 
@@ -351,7 +351,7 @@ def _local_scope(
         location,
         lambda: _load(repository, location),
     )
-    return MutationScope(execution, execution)
+    return MutationScope(lambda: execution, lambda: execution)
 
 
 def _register_child(
@@ -391,7 +391,7 @@ def _resolved_scope(
         resolved.selected.location,
         lambda: _load(repository, resolved.selected.location),
     )
-    return MutationScope(recursive, selected_local)
+    return MutationScope(lambda: recursive, lambda: selected_local)
 
 
 def _files(root: Path) -> dict[Path, bytes]:

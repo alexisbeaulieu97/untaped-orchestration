@@ -367,8 +367,7 @@ def register(app: App) -> None:  # noqa: C901
                 context.executor,
                 context.views,
                 external_files=context.repository,
-                locations=context.scope.recursive.locations,
-                load=context.scope.recursive.load,
+                scope_factory=context.scope.recursive,
             )
             result = service.execute(ImportRequest(context.location, manifest, apply, if_clean))
             return CommandResult("store import", result)

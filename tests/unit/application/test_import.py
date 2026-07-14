@@ -6,6 +6,7 @@ import pytest
 
 from tests.builders import DECISION_ID, STORE_ID, TASK_ID, decision_bytes, task_bytes
 from untaped_orchestration.application.bootstrap import InitializeStore, InitRequest
+from untaped_orchestration.application.item_support import MutationExecutionScope
 from untaped_orchestration.application.maintenance import (
     ImportConflict,
     ImportRequest,
@@ -36,6 +37,7 @@ def _fixture(
     public: bool = False,
     decisions_only: bool = False,
     external_files=None,
+    scope_calls: list[str] | None = None,
 ):
     target = tmp_path / "repository"
     target.mkdir()
@@ -58,14 +60,18 @@ def _fixture(
         selected = repository.load_local(location, headers_only=False)
         return FederatedSnapshot(selected, (selected,), Completeness())
 
+    def scope_factory() -> MutationExecutionScope:
+        if scope_calls is not None:
+            scope_calls.append("recursive")
+        return MutationExecutionScope((location,), location, load)
+
     executor = MutationExecutor(repository, repository, locks, views, projector=repository)
     service = ImportService(
         repository,
         executor,
         views,
         external_files=external_files or FilesystemExternalFileReader(),
-        locations=(location,),
-        load=load,
+        scope_factory=scope_factory,
     )
     return repository, location, service
 
@@ -152,6 +158,17 @@ def test_manifest_is_the_only_revision_authority_and_import_defaults_to_dry_run(
     assert result.records[0].revision.root.startswith("sha256:")
     assert not location.real_root.joinpath(*destination.parts).exists()
     assert "expected_store_revision" not in ImportRequest.__dataclass_fields__
+
+
+def test_import_invokes_its_recursive_scope_factory_exactly_once(tmp_path: Path) -> None:
+    calls: list[str] = []
+    repository, location, service = _fixture(tmp_path, scope_calls=calls)
+    base = repository.load_local(location, headers_only=False).store_revision
+    manifest = _manifest(tmp_path, base.root)
+
+    service.execute(ImportRequest(location, manifest))
+
+    assert calls == ["recursive"]
 
 
 def test_import_reads_each_bounded_external_snapshot_once(tmp_path: Path) -> None:

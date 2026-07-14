@@ -168,15 +168,7 @@ class CurationService:
         *,
         require_task: bool,
     ) -> ItemMutationResult:
-        initial = self._scope.selected_local.load()
-        initial_record = selected_record(initial, item_id)
-        if initial_record is None or not isinstance(
-            initial_record.metadata, (ActiveTask, Decision)
-        ):
-            raise ItemStateConflict("curation requires an active task or decision")
-        if require_task and not isinstance(initial_record.metadata, ActiveTask):
-            raise ItemStateConflict("task review requires an active task")
-        decision = isinstance(initial_record.metadata, Decision)
+        decision = isinstance(item_id, DecisionId)
         scope = self._scope.selected_local if decision else self._scope.recursive
         planned = PlannedRecord()
 
@@ -188,6 +180,8 @@ class CurationService:
                 or record.body is None
             ):
                 raise ItemStateConflict("curation requires an active task or decision")
+            if require_task and not isinstance(record.metadata, ActiveTask):
+                raise ItemStateConflict("task review requires an active task")
             if isinstance(record.metadata, Decision) and decision_inactive(
                 snapshot, record.metadata.id
             ):

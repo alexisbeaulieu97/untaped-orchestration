@@ -4,6 +4,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from untaped_orchestration.application.mutations import validate_selected_local
 from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
@@ -190,6 +191,57 @@ def test_relation_locality_and_cross_store_matrix(
 
     structural = relation_kind in {LinkRelation.DEPENDS_ON, LinkRelation.SUPERSEDES}
     assert any("same-store" in value.message for value in diagnostics) is structural
+
+
+@pytest.mark.parametrize(
+    ("relation_kind", "target"),
+    [
+        (LinkRelation.GOVERNED_BY, did(2)),
+        (LinkRelation.FOLLOW_UP_TO, tid(2)),
+    ],
+)
+def test_selected_local_validation_warns_for_unresolved_remote_navigation_without_children(
+    relation_kind: LinkRelation,
+    target: TaskId | DecisionId,
+) -> None:
+    source = task(1, links=(relation(relation_kind, target, OTHER),))
+    selected = store_snapshot(STORE, (loaded("tasks/source.md", source),))
+
+    diagnostics = validate_selected_local(snapshot(selected))
+
+    assert any(value.code == "ORC005" and value.severity == "warning" for value in diagnostics)
+    assert not any(value.code == "ORC004" for value in diagnostics)
+
+
+@pytest.mark.parametrize("relation_kind", [LinkRelation.DEPENDS_ON, LinkRelation.SUPERSEDES])
+def test_selected_local_validation_preserves_illegal_cross_store_structural_errors(
+    relation_kind: LinkRelation,
+) -> None:
+    source = task(1, links=(relation(relation_kind, tid(2), OTHER),))
+    selected = store_snapshot(STORE, (loaded("tasks/source.md", source),))
+
+    diagnostics = validate_selected_local(snapshot(selected))
+
+    assert any(value.code == "ORC004" and "same-store" in value.message for value in diagnostics)
+
+
+def test_selected_local_validation_preserves_missing_same_store_target_errors() -> None:
+    source = task(1, links=(relation(LinkRelation.DEPENDS_ON, tid(2), STORE),))
+    selected = store_snapshot(STORE, (loaded("tasks/source.md", source),))
+
+    diagnostics = validate_selected_local(snapshot(selected))
+
+    assert any(value.code == "ORC004" and "target item" in value.message for value in diagnostics)
+
+
+def test_recursive_validation_still_errors_for_missing_target_in_available_remote_store() -> None:
+    source = task(1, links=(relation(LinkRelation.GOVERNED_BY, did(2), OTHER),))
+    selected = store_snapshot(STORE, (loaded("tasks/source.md", source),))
+    other = store_snapshot(OTHER, ())
+
+    diagnostics = validate_snapshot(snapshot(selected, other), require_children=False)
+
+    assert any(value.code == "ORC004" and "target item" in value.message for value in diagnostics)
 
 
 def test_complete_federation_reports_missing_cross_store_target_but_incomplete_defers_it() -> None:

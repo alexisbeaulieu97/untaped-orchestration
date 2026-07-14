@@ -53,8 +53,8 @@ class _ScopeFederation:
         action: Callable[[FederationRead], T],
     ) -> T:
         del location, headers_only
-        execution = self._scope.selected_local if local else self._scope.recursive
-        return action(FederationRead(execution.load(), self._repository))
+        factory = self._scope.selected_local if local else self._scope.recursive
+        return action(FederationRead(factory().load(), self._repository))
 
 
 def _curation_reader(
@@ -270,9 +270,9 @@ def test_decision_curation_uses_selected_local_scope_without_recursive_resolutio
         raise AssertionError("decision curation must stay selected-local")
 
     guarded_scope = MutationScope(
-        MutationExecutionScope(
-            scope.recursive.locations,
-            scope.recursive.selected,
+        lambda: MutationExecutionScope(
+            scope.recursive().locations,
+            scope.recursive().selected,
             recursive_must_not_load,
         ),
         scope.selected_local,
@@ -314,7 +314,7 @@ def test_recursive_curate_next_fails_closed_but_local_ignores_unrelated_child_fa
         return FederatedSnapshot(selected, (selected,), Completeness((incomplete,)))
 
     recursive = MutationExecutionScope((location,), location, incomplete_load)
-    curation_scope = MutationScope(recursive, scope.selected_local)
+    curation_scope = MutationScope(lambda: recursive, scope.selected_local)
     reader = _curation_reader(repository, location, curation_scope)
     with pytest.raises(InvalidMutationState):
         reader.next(CurateNextRequest())
@@ -393,7 +393,7 @@ def test_recursive_curate_next_rejects_complete_but_semantically_invalid_federat
     )
     federation = FederatedSnapshot(invalid, (invalid,), Completeness())
     recursive = MutationExecutionScope((location,), location, lambda: federation)
-    curation_scope = MutationScope(recursive, scope.selected_local)
+    curation_scope = MutationScope(lambda: recursive, scope.selected_local)
     reader = _curation_reader(repository, location, curation_scope)
 
     with pytest.raises(InvalidMutationState) as failure:
@@ -432,7 +432,7 @@ def test_local_curate_next_ignores_unrelated_child_error_but_rejects_selected_er
     )
     federation = FederatedSnapshot(selected, (selected, child), Completeness())
     recursive = MutationExecutionScope((location, child_location), location, lambda: federation)
-    curation_scope = MutationScope(recursive, scope.selected_local)
+    curation_scope = MutationScope(lambda: recursive, scope.selected_local)
     reader = _curation_reader(repository, location, curation_scope)
 
     assert reader.next(CurateNextRequest(local=True)).entries == ()
@@ -453,7 +453,7 @@ def test_local_curate_next_ignores_unrelated_child_error_but_rejects_selected_er
     )
     selected_federation = FederatedSnapshot(selected_error, (selected_error,), Completeness())
     selected_local = MutationExecutionScope((location,), location, lambda: selected_federation)
-    selected_scope = MutationScope(selected_local, selected_local)
+    selected_scope = MutationScope(lambda: selected_local, lambda: selected_local)
     selected_reader = _curation_reader(repository, location, selected_scope)
     with pytest.raises(InvalidMutationState) as local_failure:
         selected_reader.next(CurateNextRequest(local=True))

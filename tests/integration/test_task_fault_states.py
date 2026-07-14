@@ -80,7 +80,7 @@ def fixture(tmp_path: Path, hook=None):
         return FederatedSnapshot(selected, (selected,), Completeness())
 
     execution = MutationExecutionScope((location,), location, load)
-    scope = MutationScope(execution, execution)
+    scope = MutationScope(lambda: execution, lambda: execution)
     executor = MutationExecutor(repository, repository, locks, views, projector=repository)
     return repository, location, scope, executor, TaskService(executor, repository, Clock(), scope)
 

@@ -59,7 +59,7 @@ def state(tmp_path: Path):
         return FederatedSnapshot(selected, (selected,), Completeness())
 
     execution = MutationExecutionScope((location,), location, load)
-    scope = MutationScope(execution, execution)
+    scope = MutationScope(lambda: execution, lambda: execution)
     executor = MutationExecutor(repository, repository, locks, views, projector=repository)
     return repository, location, scope, executor, TaskService(executor, repository, Clock(), scope)
 
@@ -425,7 +425,7 @@ def test_start_fails_closed_when_recursive_federation_is_incomplete(tmp_path: Pa
         return FederatedSnapshot(selected, (selected,), Completeness((missing,)))
 
     incomplete_execution = MutationExecutionScope((location,), location, incomplete_load)
-    incomplete_scope = MutationScope(incomplete_execution, scope.selected_local)
+    incomplete_scope = MutationScope(lambda: incomplete_execution, scope.selected_local)
     incomplete_service = TaskService(executor, repository, Clock(), incomplete_scope)
     current = repository.load_local(location, headers_only=False)
     with pytest.raises(InvalidMutationState):
