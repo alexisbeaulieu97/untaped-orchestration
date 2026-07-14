@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import tarfile
+import tomllib
 import zipfile
 from dataclasses import dataclass
 from email import policy
@@ -27,6 +28,19 @@ EXPECTED_REQUIREMENTS = (
     "tomli-w>=1.2,<2",
     "untaped>=3.1.0,<4",
 )
+EXPECTED_METADATA_FIELDS = {
+    "Metadata-Version": ("2.4",),
+    "Name": ("untaped-orchestration",),
+    "Version": ("0.1.0",),
+    "Summary": ("Git-native typed orchestration for repository tasks and decisions.",),
+    "Author": ("Alexis Beaulieu",),
+    "Author-email": ("Alexis Beaulieu <alexisbeaulieu97@gmail.com>",),
+    "License-Expression": ("MIT",),
+    "License-File": ("LICENSE",),
+    "Requires-Dist": EXPECTED_REQUIREMENTS,
+    "Requires-Python": (">=3.14",),
+    "Description-Content-Type": ("text/markdown",),
+}
 
 
 @dataclass(frozen=True)
@@ -105,21 +119,36 @@ def _message(raw: bytes) -> Message:
     return BytesParser(policy=policy.default).parsebytes(raw)
 
 
-def _expected_package_files() -> set[str]:
+def _expected_package_bytes() -> dict[str, bytes]:
     source = REPO_ROOT / "src"
     return {
-        path.relative_to(source).as_posix()
+        path.relative_to(source).as_posix(): path.read_bytes()
         for path in (source / "untaped_orchestration").rglob("*")
         if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
     }
 
 
 def _assert_metadata(raw: bytes) -> None:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["name"] == EXPECTED_METADATA_FIELDS["Name"][0]
+    assert project["version"] == EXPECTED_METADATA_FIELDS["Version"][0]
+    assert project["description"] == EXPECTED_METADATA_FIELDS["Summary"][0]
+    assert project["authors"] == [
+        {
+            "name": EXPECTED_METADATA_FIELDS["Author"][0],
+            "email": "alexisbeaulieu97@gmail.com",
+        }
+    ]
+    assert project["license"] == EXPECTED_METADATA_FIELDS["License-Expression"][0]
+    assert project["license-files"] == [EXPECTED_METADATA_FIELDS["License-File"][0]]
+    assert tuple(project["dependencies"]) == EXPECTED_REQUIREMENTS
+    assert project["requires-python"] == EXPECTED_METADATA_FIELDS["Requires-Python"][0]
+    assert project["readme"] == "README.md"
+
     metadata = _message(raw)
-    assert metadata["Name"] == "untaped-orchestration"
-    assert metadata["Version"] == "0.1.0"
-    assert metadata["Requires-Python"] == ">=3.14"
-    assert tuple(metadata.get_all("Requires-Dist", ())) == EXPECTED_REQUIREMENTS
+    actual = {name: tuple(metadata.get_all(name, ())) for name in dict.fromkeys(metadata.keys())}
+    assert actual == EXPECTED_METADATA_FIELDS
+    assert metadata.get_payload() == (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
 
 def _assert_repository_state_excluded(names: set[str]) -> None:
@@ -150,10 +179,33 @@ def test_fresh_wheel_and_sdist_are_built_outside_dist(
     assert built_artifacts.sdist not in stale_dist_artifacts
 
 
+@pytest.mark.parametrize(
+    "original,replacement",
+    (
+        (
+            b"Summary: Git-native typed orchestration for repository tasks and decisions.",
+            b"Summary: corrupted summary",
+        ),
+        (b"# untaped-orchestration", b"# corrupted description"),
+    ),
+)
+def test_metadata_contract_rejects_stable_header_or_body_corruption(
+    built_artifacts: BuiltArtifacts,
+    original: bytes,
+    replacement: bytes,
+) -> None:
+    with zipfile.ZipFile(built_artifacts.wheel) as archive:
+        raw = archive.read("untaped_orchestration-0.1.0.dist-info/METADATA")
+    assert original in raw
+
+    with pytest.raises(AssertionError):
+        _assert_metadata(raw.replace(original, replacement, 1))
+
+
 def test_wheel_metadata_record_and_package_contents_are_exact(
     built_artifacts: BuiltArtifacts,
 ) -> None:
-    expected_package = _expected_package_files()
+    checkout_bytes = _expected_package_bytes()
     with zipfile.ZipFile(built_artifacts.wheel) as archive:
         files = {value.filename for value in archive.infolist() if not value.is_dir()}
         dist_info = "untaped_orchestration-0.1.0.dist-info"
@@ -168,9 +220,12 @@ def test_wheel_metadata_record_and_package_contents_are_exact(
             record_name,
             f"{dist_info}/licenses/LICENSE",
         }
-        assert files == expected_package | metadata_files
+        assert files == set(checkout_bytes) | metadata_files
         _assert_repository_state_excluded(files)
         _assert_metadata(archive.read(metadata_name))
+        for path, expected_bytes in checkout_bytes.items():
+            assert archive.read(path) == expected_bytes, path
+        assert archive.read(f"{dist_info}/licenses/LICENSE") == (REPO_ROOT / "LICENSE").read_bytes()
 
         wheel_metadata = _message(archive.read(wheel_name))
         assert set(wheel_metadata.keys()) == {
@@ -210,12 +265,16 @@ def test_sdist_metadata_and_package_contents_are_exact(
     built_artifacts: BuiltArtifacts,
 ) -> None:
     root = "untaped_orchestration-0.1.0"
+    checkout_bytes = _expected_package_bytes()
+    support_bytes = {
+        "LICENSE": (REPO_ROOT / "LICENSE").read_bytes(),
+        "README.md": (REPO_ROOT / "README.md").read_bytes(),
+        "pyproject.toml": (REPO_ROOT / "pyproject.toml").read_bytes(),
+    }
     expected = {
-        f"{root}/LICENSE",
         f"{root}/PKG-INFO",
-        f"{root}/README.md",
-        f"{root}/pyproject.toml",
-        *(f"{root}/src/{path}" for path in _expected_package_files()),
+        *(f"{root}/{path}" for path in support_bytes),
+        *(f"{root}/src/{path}" for path in checkout_bytes),
     }
     with tarfile.open(built_artifacts.sdist, mode="r:gz") as archive:
         files = {value.name for value in archive.getmembers() if value.isfile()}
@@ -224,6 +283,14 @@ def test_sdist_metadata_and_package_contents_are_exact(
         package_info = archive.extractfile(f"{root}/PKG-INFO")
         assert package_info is not None
         _assert_metadata(package_info.read())
+        for path, expected_bytes in support_bytes.items():
+            member = archive.extractfile(f"{root}/{path}")
+            assert member is not None
+            assert member.read() == expected_bytes, path
+        for path, expected_bytes in checkout_bytes.items():
+            member = archive.extractfile(f"{root}/src/{path}")
+            assert member is not None
+            assert member.read() == expected_bytes, path
         skill = archive.extractfile(
             f"{root}/src/untaped_orchestration/skills/untaped-orchestration/SKILL.md"
         )

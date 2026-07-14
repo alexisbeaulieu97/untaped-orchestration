@@ -40,3 +40,5 @@ def test_package_acceptance_has_no_development_environment_workaround() -> None:
     assert "tarfile" in acceptance
     assert "RECORD" in acceptance
     assert "Requires-Dist" in acceptance
+    assert "_expected_package_bytes" in acceptance
+    assert "checkout_bytes" in acceptance

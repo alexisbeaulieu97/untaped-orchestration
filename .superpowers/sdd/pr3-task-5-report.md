@@ -31,6 +31,15 @@ skill, `py.typed`, and repository-state exclusions. The sdist audit verifies
 the exact top-level/package file set, PKG-INFO dependency metadata, skill,
 typing marker, and the same exclusions.
 
+The review follow-up makes the generated metadata contract complete without
+pinning backend-generated noise. METADATA and PKG-INFO must contain exactly the
+stable Metadata-Version, name, version, summary, author, author-email, license
+expression/file, ordered dependencies, Python requirement, and Markdown
+content-type fields, with no additional headers; their body must equal README
+text. Those expectations are explicit and cross-checked against pyproject.
+Every wheel package member and license, and every sdist source plus
+LICENSE/README/pyproject support member, is byte-compared with the checkout.
+
 An independent fresh build under `/private/tmp/untaped-task5-final-audit`
 produced one wheel and one sdist. ZIP integrity passed, the sdist contained 72
 members, the five dependency requirements and WHEEL/entry point matched, and
@@ -77,6 +86,12 @@ failures exposed live archive facts rather than product defects: source-tree
 file ends with one blank line. The final focused package/docs/CI suite passed
 30 tests with exactly 1 skip in 0.24s.
 
+The narrow artifact review RED produced 3 expected failures, 4 passes, and 1
+skip in 0.52s: corrupted Summary and README body were accepted, and no
+checkout-byte mapping existed. After the exact stable metadata/body and member
+byte checks, the focused artifact suite passed 7 tests with exactly 1 skip in
+0.13s.
+
 ## Verification
 
 - Full unit: 929 passed in 8.07s.
@@ -94,6 +109,18 @@ file ends with one blank line. The final focused package/docs/CI suite passed
 - Generated-artifact and archive-exclusion audits passed. `git diff --check`
   passed.
 - Pre-commit passed all hooks.
+
+Review-follow-up verification:
+
+- Unit: 929 passed in 7.84s.
+- Integration: 100 passed, exactly 1 isolated-install skip, and 1 pre-existing
+  warning in 3.35s.
+- Full default: 1030 passed, exactly 1 isolated-install skip, and 1
+  pre-existing warning in 16.24s; 92.22% coverage.
+- The dependency-resolving smoke path was unchanged, so the previously
+  recorded genuine network-enabled pass was not repeated.
+- Follow-up Ruff, format, mypy, pre-commit, release-byte, and `git diff --check`
+  gates all passed.
 
 No push, PR readiness change, merge, release, publication, self-adoption, or
 fleet work was performed.
