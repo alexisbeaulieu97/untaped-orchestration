@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
@@ -32,6 +33,7 @@ from untaped_orchestration.application.results import (
     FederationAnchor,
 )
 from untaped_orchestration.application.view_management import apply_views
+from untaped_orchestration.cli.output import CommandResult, run_command
 from untaped_orchestration.domain.diagnostics import expected_diagnostic
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
@@ -671,6 +673,91 @@ def test_canonical_writer_preserves_typed_diagnostic_error(tmp_path: Path) -> No
 
     assert captured.value is timeout
     assert captured.value.diagnostics[0].code == "ORC007"
+    assert captured.value.receipt.applied is False  # type: ignore[attr-defined]
+    assert captured.value.receipt.canonical_applied is False  # type: ignore[attr-defined]
+    assert captured.value.receipt.views_current is False  # type: ignore[attr-defined]
+    assert captured.value.receipt.changed_paths == ()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("fmt", ["json", "table"])
+def test_later_typed_writer_failure_emits_partial_receipt_and_exact_diagnostic(
+    tmp_path: Path,
+    fmt: str,
+    capfd,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    writer = FailingCanonicalWriter(
+        repository,
+        events,
+        locks,
+        failure=StoreLockTimeout(current.selected.location),
+        fail_on=2,
+    )
+    store_path = current.selected.location.root / "store.toml"
+    store_replacement = FileReplacement(
+        PurePosixPath("store.toml"),
+        store_path.read_bytes(),
+    )
+    executor = MutationExecutor(
+        repository,
+        writer,
+        locks,
+        RecordingViews(events, locks),
+        projector=repository,
+    )
+
+    def fail() -> CommandResult:
+        executor.execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda snapshot: IntendedMutation(
+                replacements=(store_replacement, _replacement(snapshot))
+            ),
+        )
+        raise AssertionError("typed writer failure was not raised")
+
+    with pytest.raises(SystemExit) as captured:
+        run_command(
+            "repair frontmatter",
+            fail,
+            fmt=fmt,  # type: ignore[arg-type]
+            allowed=("json", "table"),
+        )
+
+    assert captured.value.code == 4
+    output = capfd.readouterr()
+    assert "store.toml" in output.out
+    assert "registry.toml" in output.out
+    if fmt == "json":
+        payload = json.loads(output.out)
+        assert payload["data"]["applied"] is True
+        assert payload["data"]["canonical_applied"] is True
+        assert payload["data"]["views_current"] is False
+        assert payload["data"]["changed_paths"] == ["store.toml"]
+        assert payload["diagnostics"] == [
+            {
+                "code": "ORC007",
+                "severity": "error",
+                "path": current.selected.location.real_root.as_posix(),
+                "field": "lock",
+                "message": "timed out acquiring orchestration store lock",
+                "hint": "Retry after the current store mutation finishes.",
+            }
+        ]
+        assert output.err == ""
+    else:
+        assert output.out.startswith(
+            "applied\treplayed\tcanonical_applied\tviews_current\tintended_paths"
+        )
+        assert output.err == (
+            "ORC007: "
+            f"{current.selected.location.real_root.as_posix()}: "
+            "timed out acquiring orchestration store lock\n"
+        )
 
 
 def test_observe_only_renderer_failure_never_claims_view_write_intent(

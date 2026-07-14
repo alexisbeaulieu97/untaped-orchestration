@@ -22,10 +22,14 @@ from untaped_orchestration.application.query_models import (
     QualifiedItem,
     SearchHit,
 )
-from untaped_orchestration.application.results import MaintenanceResult, RawRecord
+from untaped_orchestration.application.results import (
+    MaintenanceResult,
+    MutationReceipt,
+    RawRecord,
+)
 from untaped_orchestration.cli.options import OutputFormat, validate_format
 from untaped_orchestration.domain.curation import CurationEntry
-from untaped_orchestration.domain.diagnostics import Diagnostic
+from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticError
 from untaped_orchestration.domain.models import Revision
 
 
@@ -529,8 +533,10 @@ def _error_diagnostics(error: Exception) -> tuple[Diagnostic, ...]:
 
 
 def _error_data(error: Exception) -> object:
-    if isinstance(error, MutationWriteError):
-        return error.receipt
+    if isinstance(error, MutationWriteError | DiagnosticError):
+        receipt = getattr(error, "receipt", None)
+        if isinstance(receipt, MutationReceipt):
+            return receipt
     return {}
 
 

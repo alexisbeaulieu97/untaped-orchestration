@@ -68,10 +68,13 @@ earlier acknowledged operation and reports `applied=true` and
 raised after a replacement but before its writer returns, remains false/empty.
 All canonical-write failures keep `views_current=false`.
 
-The CLI serializes this exact `MutationWriteError` receipt as failure data in
-JSON and table output while retaining the generic leak-free ORC002 diagnostic
-and exit 5. Typed `DiagnosticError` failures bypass the writer wrapper and keep
-their exact public diagnostic and mapped exit code.
+The CLI serializes the bounded mutation receipt as failure data in JSON and
+table output. `MutationWriteError` retains the generic leak-free ORC002
+diagnostic and exit 5. Typed `DiagnosticError` writer failures keep the same
+exception and exact public diagnostic/mapped exit code while carrying the same
+receipt truth as untyped writer failures. The CLI accepts failure data only
+from those two failure categories and only when the attached value is an exact
+`MutationReceipt`, so arbitrary exception data is not emitted.
 
 ## TDD evidence
 
@@ -94,6 +97,10 @@ their exact public diagnostic and mapped exit code.
   optional null diagnostic fields are intentionally omitted by the encoder.
   Focused GREEN: 5 passed in 0.38s; affected repair/mutation/CLI GREEN: 107
   passed in 1.38s.
+- Final re-review RED: 3 expected failures in 0.74s showed that first-call typed
+  writer failures lacked a conservative receipt and second-call typed failures
+  lost the acknowledged path in JSON/table data. Focused GREEN: 3 passed in
+  0.31s; affected repair/mutation/CLI GREEN: 109 passed in 1.38s.
 
 ## Verification
 
@@ -117,6 +124,9 @@ their exact public diagnostic and mapped exit code.
   source files, build produced the sdist and wheel, and pre-commit passed all
   hooks.
 - Review-fix full unit suite: 924 passed in 8.72s.
+- Final re-review full unit suite: 926 passed in 8.64s. Ruff and format passed
+  (120 files), mypy succeeded for 60 source files, and `git diff --check`
+  passed.
 
 ## Documentation assessment
 

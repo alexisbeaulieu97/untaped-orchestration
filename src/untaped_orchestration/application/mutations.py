@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from untaped_orchestration.application.ports import (
     FileDeletion,
@@ -240,7 +241,30 @@ class MutationExecutor:
                     registry_revision=current.selected.registry_revision,
                 )
 
-            changed = []
+            changed: list[PurePosixPath] = []
+
+            def failure_receipt() -> MutationReceipt:
+                acknowledged = bool(changed)
+                return MutationReceipt(
+                    applied=acknowledged,
+                    replayed=False,
+                    canonical_applied=acknowledged,
+                    views_current=False,
+                    intended_paths=tuple(
+                        (
+                            *(value.path for value in intended.replacements),
+                            *(value.path for value in intended.deletions),
+                        )
+                    ),
+                    changed_paths=tuple(changed),
+                    item_revisions=tuple(
+                        ItemRevision(record.path, record.revision)
+                        for record in current.selected.records
+                    ),
+                    store_revision=current.selected.store_revision,
+                    registry_revision=current.selected.registry_revision,
+                )
+
             try:
                 for replacement in intended.replacements:
                     self._writer.replace(selected, replacement)
@@ -248,31 +272,13 @@ class MutationExecutor:
                 for deletion in intended.deletions:
                     self._writer.delete(selected, deletion)
                     changed.append(deletion.path)
-            except DiagnosticError:
+            except DiagnosticError as error:
+                error.receipt = failure_receipt()  # type: ignore[attr-defined]
                 raise
             except (OSError, ValueError) as error:
-                acknowledged = bool(changed)
                 raise MutationWriteError(
                     str(error),
-                    MutationReceipt(
-                        applied=acknowledged,
-                        replayed=False,
-                        canonical_applied=acknowledged,
-                        views_current=False,
-                        intended_paths=tuple(
-                            (
-                                *(value.path for value in intended.replacements),
-                                *(value.path for value in intended.deletions),
-                            )
-                        ),
-                        changed_paths=tuple(changed),
-                        item_revisions=tuple(
-                            ItemRevision(record.path, record.revision)
-                            for record in current.selected.records
-                        ),
-                        store_revision=current.selected.store_revision,
-                        registry_revision=current.selected.registry_revision,
-                    ),
+                    failure_receipt(),
                 ) from error
 
             canonical_applied = bool(intended.replacements or intended.deletions)
