@@ -160,9 +160,25 @@ def _load_manifest(request: ImportRequest, reader: ExternalFileReader) -> Import
         raise ImportConflict("manifest does not match untaped.orchestration.import/v1") from error
 
 
-def _item_identity(frontmatter: bytes) -> tuple[TaskId | DecisionId, str]:
+def _item_identity(
+    frontmatter: bytes,
+    *,
+    path: Path,
+) -> tuple[TaskId | DecisionId, str]:
     try:
-        values = tomllib.loads(frontmatter.decode("utf-8"))
+        text = frontmatter.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ImportConflict(
+            "manifest front matter is not valid UTF-8",
+            expected_diagnostic(
+                "ORC001",
+                "manifest record front matter is not valid UTF-8",
+                path=path.absolute().as_posix(),
+                field="frontmatter",
+            ),
+        ) from error
+    try:
+        values = tomllib.loads(text)
         raw_id = values["id"]
         title = values["title"]
         if not isinstance(raw_id, str) or not isinstance(title, str):
@@ -170,7 +186,7 @@ def _item_identity(frontmatter: bytes) -> tuple[TaskId | DecisionId, str]:
         if raw_id.startswith("tsk_"):
             return TaskId(raw_id), title
         return DecisionId(raw_id), title
-    except (UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError, ValidationError) as error:
+    except (tomllib.TOMLDecodeError, KeyError, TypeError, ValidationError) as error:
         raise ImportConflict("manifest front matter is not a complete canonical item") from error
 
 
@@ -299,7 +315,10 @@ class ImportService:
                 limit=BODY_LIMIT,
                 field="body",
             )
-            item_id, title = _item_identity(frontmatter)
+            frontmatter_path = request.manifest.parent.joinpath(
+                *PurePosixPath(entry.frontmatter_file).parts
+            )
+            item_id, title = _item_identity(frontmatter, path=frontmatter_path)
             path = PurePosixPath(entry.destination.value) / item_filename(item_id, title)
             if path in seen:
                 raise ImportConflict(f"manifest destination collision: {path.as_posix()}")

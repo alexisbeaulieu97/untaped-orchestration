@@ -82,6 +82,19 @@ def _read_descriptor(descriptor: int, limit: int) -> bytes:
     return b"".join(chunks)
 
 
+def _verify_descriptor(
+    before: os.stat_result,
+    after: os.stat_result,
+    path: Path,
+    field: str,
+    limit: int,
+) -> None:
+    if not stat.S_ISREG(after.st_mode) or _identity(after) != _identity(before):
+        raise _unsafe(path, field, "external path changed while being read")
+    if after.st_size > limit:
+        raise _bounded(path, field, limit)
+
+
 class FilesystemExternalFileReader:
     """Read one bounded immutable snapshot without following path components.
 
@@ -149,6 +162,8 @@ class FilesystemExternalFileReader:
             self._event_hook("after-stat", path)
             self._event_hook("after-open", path)
             raw = _read_descriptor(descriptor, limit)
+            self._event_hook("after-read", path)
+            _verify_descriptor(final_stat, os.fstat(descriptor), path, field, limit)
             self._verify_components(identities, path, field)
             return raw
         finally:
@@ -170,10 +185,13 @@ class FilesystemExternalFileReader:
         self._event_hook("after-stat", path)
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         try:
-            if _identity(os.fstat(descriptor)) != identities[-1][1]:
+            descriptor_stat = os.fstat(descriptor)
+            if _identity(descriptor_stat) != identities[-1][1]:
                 raise _unsafe(path, field, "external path changed while being read")
             self._event_hook("after-open", path)
             raw = _read_descriptor(descriptor, limit)
+            self._event_hook("after-read", path)
+            _verify_descriptor(descriptor_stat, os.fstat(descriptor), path, field, limit)
             self._verify_components(identities, path, field)
             return raw
         finally:

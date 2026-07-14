@@ -423,6 +423,9 @@ def test_projection_reads_only_bounded_canonical_content_but_keeps_all_entries(
     spy.paths.clear()
     noise = {
         PurePosixPath("views/roadmap.md"): b"v" * (2 * 1024 * 1024),
+        PurePosixPath("tasks/notes.txt"): b"task-root noise",
+        PurePosixPath("decisions/import.toml"): b"decision-root noise",
+        PurePosixPath("archive/tasks/README"): b"archive-root noise",
         PurePosixPath("notes.txt"): b"unexpected",
         PurePosixPath(".orphan.tmp"): b"temporary",
         PurePosixPath("scratch.md~"): b"editor",

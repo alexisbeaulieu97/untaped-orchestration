@@ -48,6 +48,71 @@ def test_external_reader_rejects_growth_past_bound_during_read(tmp_path: Path) -
     assert _diagnostic(captured.value).code == "ORC001"
 
 
+@pytest.mark.parametrize("force_fallback", [False, True])
+def test_external_reader_rejects_growth_past_bound_after_eof(
+    tmp_path: Path,
+    force_fallback: bool,
+) -> None:
+    path = tmp_path / "body.md"
+    path.write_bytes(b"small")
+
+    def grow(event: str, opened: Path) -> None:
+        if event == "after-read":
+            with opened.open("ab") as stream:
+                stream.write(b"x" * 18)
+
+    with pytest.raises(DiagnosticError) as captured:
+        _reader(force_fallback=force_fallback, event_hook=grow).read_external(
+            path,
+            limit=16,
+            field="body",
+        )
+
+    assert _diagnostic(captured.value).code == "ORC001"
+
+
+@pytest.mark.parametrize("force_fallback", [False, True])
+@pytest.mark.parametrize("descriptor_change", ["identity", "file-type"])
+def test_external_reader_rejects_post_read_descriptor_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force_fallback: bool,
+    descriptor_change: str,
+) -> None:
+    module = _external_module()
+    path = tmp_path / "body.md"
+    path.write_bytes(b"body")
+    after_read = False
+    real_fstat = module.os.fstat
+
+    def mark_after_read(event: str, _opened: Path) -> None:
+        nonlocal after_read
+        if event == "after-read":
+            after_read = True
+
+    def changed_fstat(descriptor: int):
+        value = real_fstat(descriptor)
+        if not after_read:
+            return value
+        fields = list(value)
+        if descriptor_change == "identity":
+            fields[1] += 1
+        else:
+            fields[0] = (fields[0] & ~0o170000) | 0o010000
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(module.os, "fstat", changed_fstat)
+
+    with pytest.raises(DiagnosticError) as captured:
+        _reader(force_fallback=force_fallback, event_hook=mark_after_read).read_external(
+            path,
+            limit=16,
+            field="body",
+        )
+
+    assert _diagnostic(captured.value).code == "ORC003"
+
+
 @pytest.mark.parametrize("component", ("final", "ancestor"))
 def test_external_reader_rejects_symlink_components(tmp_path: Path, component: str) -> None:
     real = tmp_path / "real"

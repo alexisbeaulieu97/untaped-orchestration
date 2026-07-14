@@ -108,3 +108,80 @@ metadata-only.
 Task 3's true-local path policy and Task 4's repair transaction redesign are
 unchanged and intentionally deferred. This task adds no compatibility layer,
 release action, merge, push, PR mutation, or generated cross-repository state.
+
+## Follow-up review fix: post-read bounds and exact item projection
+
+### Scope and outcome
+
+The Important follow-up findings against Task 2 were verified and fixed on the
+exact base `0666406a75207bbaa325c8a64aaf552856f9f4bf`. The follow-up remains
+strictly inside Task 2 and is committed separately as
+`fix: close bounded-read review gaps`.
+
+- Both the descriptor-relative no-follow path and cooperative fallback now
+  perform a fresh `fstat` after the bounded read. The opened descriptor must
+  still be regular and retain the same device/inode/type identity; a post-read
+  size above the caller's limit is ORC001, while type or identity drift is
+  ORC003. A deterministic `after-read` seam proves growth after EOF rather
+  than relying on timing.
+- Repository mutation projection now treats only exact `.md` files directly
+  inside `tasks/`, `decisions/`, or `archive/tasks/` as item content. Non-Markdown
+  regular files in every item root remain in the complete `StoreEntry` map for
+  shape validation but are never content-read or parsed.
+- Import record identity extraction now separates `UnicodeDecodeError` from
+  TOML/schema failures. Invalid UTF-8 front matter emits a leak-free ORC001
+  diagnostic carrying the external record path and `frontmatter` field;
+  downstream body codec diagnostics and other typed failures remain intact.
+
+No command syntax, store format, public compatibility layer, true-local policy,
+or repair transaction behavior changed. Tasks 3 and 4 remain untouched.
+
+### TDD evidence
+
+The regression tests were added before production changes. The focused RED was:
+
+```text
+$ uv --cache-dir .uv-cache run pytest tests/unit/infrastructure/test_external_files.py tests/unit/infrastructure/test_repository.py::test_projection_reads_only_bounded_canonical_content_but_keeps_all_entries tests/unit/application/test_import.py::test_import_record_frontmatter_invalid_utf8_is_orc001_without_content_leak tests/unit/application/test_import.py::test_import_record_body_invalid_utf8_preserves_codec_diagnostic_without_content_leak -q --no-cov
+8 failed, 10 passed in 2.49s
+```
+
+The eight failures were exactly two primary/fallback growth-after-EOF cases,
+four primary/fallback post-read descriptor identity/type cases, one non-`.md`
+projection case spanning all three item roots, and the front-matter ORC002 to
+ORC001 classification gap. The invalid UTF-8 body case passed in RED because
+the existing codec-owned ORC001 diagnostic was already correct and needed to
+be preserved.
+
+The same focused slice passed after the minimal implementation:
+
+```text
+18 passed in 1.57s
+```
+
+### Verification
+
+- Affected unit slice from the original Task 2 report, with the new
+  regressions: `257 passed in 11.08s`.
+- Full unit suite: `877 passed in 70.37s`.
+- Full integration suite: `97 passed, 1 warning in 53.07s`; the warning is the
+  pre-existing Cyclopts no-token warning in the version contract test.
+- Coverage-enabled full suite: `975 passed, 1 warning in 135.48s`, with 92.20%
+  total coverage against the 80% floor.
+- `uv --cache-dir .uv-cache run ruff check .` — `All checks passed!`.
+- `uv --cache-dir .uv-cache run ruff format --check .` — `117 files already
+  formatted` after formatting the new import regressions.
+- `uv --cache-dir .uv-cache run mypy` — `Success: no issues found in 60 source
+  files`.
+- `git diff --check` — clean.
+
+### Self-review
+
+- Confirmed the post-read descriptor validation runs before component identity
+  verification in both adapter paths and never returns bytes after detected
+  descriptor growth, substitution, or type drift.
+- Confirmed projection spies cover metadata-only noise inside `tasks/`,
+  `decisions/`, and `archive/tasks/`, while existing top-level/view/artifact
+  coverage remains intact.
+- Confirmed invalid UTF-8 front matter includes only stable diagnostic context,
+  never source bytes, and invalid UTF-8 body still forwards the codec's typed
+  destination diagnostic unchanged.

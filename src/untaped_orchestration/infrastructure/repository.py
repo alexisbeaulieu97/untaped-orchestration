@@ -36,6 +36,7 @@ from untaped_orchestration.infrastructure.codec import (
 from untaped_orchestration.infrastructure.external_files import FilesystemExternalFileReader
 from untaped_orchestration.infrastructure.filesystem import (
     ADMIN_PATHS,
+    ITEM_ROOTS,
     AtomicFilesystem,
     PathSafetyError,
     StoreNotFoundError,
@@ -400,11 +401,9 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
 
 
 def _is_item_path(relative_path: PurePosixPath) -> bool:
-    return relative_path.parts[:-1] in {
-        ("tasks",),
-        ("decisions",),
-        ("archive", "tasks"),
-    }
+    return relative_path.suffix == ".md" and any(
+        relative_path.parts[:-1] == root.parts for root in ITEM_ROOTS
+    )
 
 
 def _is_unavailable_path(error: DiagnosticError) -> bool:

@@ -210,6 +210,46 @@ def test_import_manifest_invalid_utf8_is_orc001_without_content_leak(tmp_path: P
     assert "private-secret" not in diagnostic.message
 
 
+def test_import_record_frontmatter_invalid_utf8_is_orc001_without_content_leak(
+    tmp_path: Path,
+) -> None:
+    repository, location, service = _fixture(tmp_path)
+    base = repository.load_local(location, headers_only=False).store_revision
+    manifest = _manifest(tmp_path, base.root)
+    frontmatter = tmp_path / "records" / "decision.toml"
+    frontmatter.write_bytes(b"private-frontmatter-secret\xff")
+
+    with pytest.raises(ImportConflict) as captured:
+        service.execute(ImportRequest(location, manifest))
+
+    diagnostic = captured.value.diagnostics[0]
+    assert diagnostic.code == "ORC001"
+    assert diagnostic.path == frontmatter.as_posix()
+    assert diagnostic.field == "frontmatter"
+    assert "private-frontmatter-secret" not in diagnostic.message
+    assert "private-frontmatter-secret" not in str(captured.value)
+
+
+def test_import_record_body_invalid_utf8_preserves_codec_diagnostic_without_content_leak(
+    tmp_path: Path,
+) -> None:
+    repository, location, service = _fixture(tmp_path)
+    base = repository.load_local(location, headers_only=False).store_revision
+    manifest = _manifest(tmp_path, base.root)
+    body = tmp_path / "records" / "decision.md"
+    body.write_bytes(b"private-body-secret\xff")
+
+    with pytest.raises(ImportConflict) as captured:
+        service.execute(ImportRequest(location, manifest))
+
+    diagnostic = captured.value.diagnostics[0]
+    assert diagnostic.code == "ORC001"
+    assert diagnostic.path == (f"decisions/{DECISION_ID}-creme-brulee-import-contract.md")
+    assert diagnostic.field == ""
+    assert "private-body-secret" not in diagnostic.message
+    assert "private-body-secret" not in str(captured.value)
+
+
 def test_apply_requires_if_clean_and_inserts_canonical_tracked_by_evidence(
     tmp_path: Path,
 ) -> None:
