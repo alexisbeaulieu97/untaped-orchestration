@@ -14,6 +14,7 @@ from typing import Literal, NoReturn
 from pydantic import BaseModel, ConfigDict, Field
 
 from untaped_orchestration.application.item_support import ItemMutationResult
+from untaped_orchestration.application.mutations import MutationWriteError
 from untaped_orchestration.application.query_models import (
     ItemDetail,
     ItemRow,
@@ -527,6 +528,12 @@ def _error_diagnostics(error: Exception) -> tuple[Diagnostic, ...]:
     )
 
 
+def _error_data(error: Exception) -> object:
+    if isinstance(error, MutationWriteError):
+        return error.receipt
+    return {}
+
+
 def _exit_code(error: Exception) -> int:
     diagnostics = _typed_diagnostics(error)
     return 5 if diagnostics is None else result_exit_code(diagnostics, 1)
@@ -563,7 +570,7 @@ def run_command(
     except Exception as error:
         failure = CommandResult(
             command,
-            {},
+            _error_data(error),
             complete=False,
             diagnostics=_error_diagnostics(error),
         )

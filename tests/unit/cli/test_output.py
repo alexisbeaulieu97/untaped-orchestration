@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -10,8 +10,14 @@ from tests.builders import TASK_ID
 from untaped_orchestration.application.curation import CurationPage
 from untaped_orchestration.application.item_support import RevisionConflict
 from untaped_orchestration.application.maintenance import RecursiveFormatResult
+from untaped_orchestration.application.mutations import MutationWriteError
 from untaped_orchestration.application.queries import QueryIncompleteError
-from untaped_orchestration.application.results import RawRecord
+from untaped_orchestration.application.results import (
+    MutationReceipt,
+    RawRecord,
+    StoreLocation,
+    StoreLockTimeout,
+)
 from untaped_orchestration.cli.maintenance_commands import _format_result
 from untaped_orchestration.cli.output import (
     CommandResult,
@@ -416,6 +422,79 @@ def test_expected_failures_keep_json_envelope_and_stable_exit(
     assert payload["complete"] is False
     assert payload["data"] == {}
     assert payload["diagnostics"]
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("fmt", ["json", "table"])
+def test_mutation_write_failure_emits_receipt_without_leaking_internal_error(
+    fmt: str,
+    capfd,
+) -> None:
+    receipt = MutationReceipt(
+        applied=True,
+        replayed=False,
+        canonical_applied=True,
+        views_current=False,
+        intended_paths=(PurePosixPath("store.toml"), PurePosixPath("registry.toml")),
+        changed_paths=(PurePosixPath("store.toml"),),
+        item_revisions=(),
+        store_revision=REVISION,
+        registry_revision=None,
+    )
+
+    def fail() -> CommandResult:
+        raise MutationWriteError("secret writer detail", receipt)
+
+    with pytest.raises(SystemExit) as raised:
+        run_command(
+            "repair frontmatter",
+            fail,
+            fmt=fmt,  # type: ignore[arg-type]
+            allowed=("json", "table"),
+        )
+
+    assert raised.value.code == 5
+    captured = capfd.readouterr()
+    combined = captured.out + captured.err
+    assert "store.toml" in captured.out
+    assert "registry.toml" in captured.out
+    assert "secret writer detail" not in combined
+    assert "ORC002" in combined
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["data"]["applied"] is True
+        assert payload["data"]["canonical_applied"] is True
+        assert payload["data"]["views_current"] is False
+        assert payload["data"]["changed_paths"] == ["store.toml"]
+    else:
+        assert captured.out.startswith(
+            "applied\treplayed\tcanonical_applied\tviews_current\tintended_paths"
+        )
+
+
+def test_typed_diagnostic_failure_keeps_exact_cli_diagnostic_and_exit(capfd) -> None:
+    location = StoreLocation(Path("/selected"), Path("/resolved/selected"))
+
+    def fail() -> CommandResult:
+        raise StoreLockTimeout(location)
+
+    with pytest.raises(SystemExit) as raised:
+        run_command("repair frontmatter", fail, fmt="json", allowed=("json",))
+
+    assert raised.value.code == 4
+    captured = capfd.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["data"] == {}
+    assert payload["diagnostics"] == [
+        {
+            "code": "ORC007",
+            "severity": "error",
+            "path": "/resolved/selected",
+            "field": "lock",
+            "message": "timed out acquiring orchestration store lock",
+            "hint": "Retry after the current store mutation finishes.",
+        }
+    ]
     assert captured.err == ""
 
 

@@ -49,7 +49,8 @@ federation with `require_children=false`.
 | Outcome | `applied` | `canonical_applied` | `views_current` | Durable state |
 |---|---:|---:|---:|---|
 | Dry run | false | false | false | Canonical and views untouched |
-| Canonical writer interruption/failure | false | false | false | Conservative/unknown canonical outcome; no view write attempted |
+| First canonical writer interruption/failure, including a post-write exception without acknowledgement | false | false | false | Conservative/unknown canonical outcome; no view write attempted |
+| Later canonical writer interruption after one or more acknowledged operations | true | true | false | Receipt preserves the exact acknowledged changed paths; later intended paths remain unapplied/unknown |
 | View failure after durable canonical success | true | true | false | Canonical bytes durable; `check` reports stale views and `render --write` recovers |
 | Success | true | true | true | Canonical reread equals projection and views are current |
 
@@ -59,6 +60,18 @@ acknowledgement, so it reports false canonical/view flags and no changed path,
 even though fault inspection can observe the replacement already on disk. That
 on-disk state is valid and recoverable through `check`/`render`; no journal or
 third transaction was added.
+
+For a multi-file mutation, each path is acknowledged only after its writer call
+returns. A later writer failure therefore preserves `changed_paths` for every
+earlier acknowledged operation and reports `applied=true` and
+`canonical_applied=true`. A failure on the first operation, or an exception
+raised after a replacement but before its writer returns, remains false/empty.
+All canonical-write failures keep `views_current=false`.
+
+The CLI serializes this exact `MutationWriteError` receipt as failure data in
+JSON and table output while retaining the generic leak-free ORC002 diagnostic
+and exit 5. Typed `DiagnosticError` failures bypass the writer wrapper and keep
+their exact public diagnostic and mapped exit code.
 
 ## TDD evidence
 
@@ -75,6 +88,12 @@ third transaction was added.
 - Dry-run/view/canonical fault characterization: 4 passed in 2.53s.
 - Canonical failure-receipt RED: 2 failed in 4.50s because raw OSError carried
   no receipt. GREEN repair plus MutationExecutor slice: 23 passed in 6.78s.
+- Review-fix RED: 4 expected behavioral failures showed discarded earlier
+  acknowledgements, wrapped typed writer diagnostics, and missing JSON/table
+  receipt data. One additional test-fixture assertion was corrected because
+  optional null diagnostic fields are intentionally omitted by the encoder.
+  Focused GREEN: 5 passed in 0.38s; affected repair/mutation/CLI GREEN: 107
+  passed in 1.38s.
 
 ## Verification
 
@@ -93,6 +112,11 @@ third transaction was added.
 - Build produced the source distribution and wheel.
 - pre-commit passed all hooks.
 - `git diff --check` passed.
+- Review-fix full gate: 1022 passed, 1 pre-existing Cyclopts warning in 21.36s;
+  92.21% coverage. Ruff and format passed (120 files), mypy succeeded for 60
+  source files, build produced the sdist and wheel, and pre-commit passed all
+  hooks.
+- Review-fix full unit suite: 924 passed in 8.72s.
 
 ## Documentation assessment
 

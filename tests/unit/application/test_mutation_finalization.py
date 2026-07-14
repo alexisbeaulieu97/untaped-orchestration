@@ -18,9 +18,14 @@ from untaped_orchestration.application.mutations import (
     InvalidMutationState,
     MutationExecutor,
     MutationLockSetError,
+    MutationWriteError,
     validate_selected_local,
 )
-from untaped_orchestration.application.ports import FileDeletion, FileReplacement
+from untaped_orchestration.application.ports import (
+    FileDeletion,
+    FileReplacement,
+    StoreLockTimeout,
+)
 from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
@@ -113,6 +118,20 @@ class StaleReloadRepository(RecordingRepository):
         assert self.locks.active
         self.events.append("reload")
         return self.stale
+
+
+class FailingCanonicalWriter(RecordingRepository):
+    def __init__(self, delegate, events, locks, *, failure: Exception, fail_on: int) -> None:
+        super().__init__(delegate, events, locks)
+        self.failure = failure
+        self.fail_on = fail_on
+        self.calls = 0
+
+    def replace(self, location, change) -> None:
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise self.failure
+        super().replace(location, change)
 
 
 class RecordingViews:
@@ -578,6 +597,80 @@ def test_renderer_failure_preserves_complete_intended_view_paths(
         PurePosixPath("views/decisions.md"),
     )
     assert result.changed_paths == (PurePosixPath("registry.toml"),)
+
+
+def test_later_canonical_failure_receipt_preserves_acknowledged_paths(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    writer = FailingCanonicalWriter(
+        repository,
+        events,
+        locks,
+        failure=OSError("second canonical write failed"),
+        fail_on=2,
+    )
+    store_path = current.selected.location.root / "store.toml"
+    store_replacement = FileReplacement(
+        PurePosixPath("store.toml"),
+        store_path.read_bytes(),
+    )
+
+    with pytest.raises(MutationWriteError) as captured:
+        MutationExecutor(
+            repository,
+            writer,
+            locks,
+            RecordingViews(events, locks),
+            projector=repository,
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda snapshot: IntendedMutation(
+                replacements=(store_replacement, _replacement(snapshot))
+            ),
+        )
+
+    assert captured.value.receipt.applied is True
+    assert captured.value.receipt.canonical_applied is True
+    assert captured.value.receipt.views_current is False
+    assert captured.value.receipt.changed_paths == (PurePosixPath("store.toml"),)
+
+
+def test_canonical_writer_preserves_typed_diagnostic_error(tmp_path: Path) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    timeout = StoreLockTimeout(current.selected.location)
+    writer = FailingCanonicalWriter(
+        repository,
+        events,
+        locks,
+        failure=timeout,
+        fail_on=1,
+    )
+
+    with pytest.raises(StoreLockTimeout) as captured:
+        MutationExecutor(
+            repository,
+            writer,
+            locks,
+            RecordingViews(events, locks),
+            projector=repository,
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
+        )
+
+    assert captured.value is timeout
+    assert captured.value.diagnostics[0].code == "ORC007"
 
 
 def test_observe_only_renderer_failure_never_claims_view_write_intent(

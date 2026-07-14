@@ -491,6 +491,7 @@ def test_frontmatter_canonical_write_interruption_reports_false_flags_and_is_rec
     assert receipt.canonical_applied is False
     assert receipt.views_current is False
     assert receipt.applied is False
+    assert receipt.changed_paths == ()
     if phase == "before":
         assert item.read_bytes() == before
     else:

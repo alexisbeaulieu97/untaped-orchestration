@@ -248,13 +248,16 @@ class MutationExecutor:
                 for deletion in intended.deletions:
                     self._writer.delete(selected, deletion)
                     changed.append(deletion.path)
+            except DiagnosticError:
+                raise
             except (OSError, ValueError) as error:
+                acknowledged = bool(changed)
                 raise MutationWriteError(
                     str(error),
                     MutationReceipt(
-                        applied=False,
+                        applied=acknowledged,
                         replayed=False,
-                        canonical_applied=False,
+                        canonical_applied=acknowledged,
                         views_current=False,
                         intended_paths=tuple(
                             (
@@ -262,7 +265,7 @@ class MutationExecutor:
                                 *(value.path for value in intended.deletions),
                             )
                         ),
-                        changed_paths=(),
+                        changed_paths=tuple(changed),
                         item_revisions=tuple(
                             ItemRevision(record.path, record.revision)
                             for record in current.selected.records
