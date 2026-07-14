@@ -14,6 +14,7 @@ from untaped_orchestration.application.queries import (
     HistoryShowRequest,
     ListRequest,
     NextRequest,
+    QueryIncompleteError,
     QueryScope,
     QueryService,
     RawShowRequest,
@@ -32,6 +33,7 @@ from untaped_orchestration.application.results import (
     StoreLocation,
     StoreSnapshot,
 )
+from untaped_orchestration.domain.diagnostics import DiagnosticError
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import (
     ActiveTask,
@@ -86,6 +88,7 @@ class BodyReader:
     def __init__(self, bodies: dict[PurePosixPath, bytes]) -> None:
         self.bodies = bodies
         self.reads: list[PurePosixPath] = []
+        self.raw_reads: list[PurePosixPath] = []
 
     def read_item_body(self, location: StoreLocation, path: PurePosixPath) -> bytes:
         del location
@@ -94,6 +97,7 @@ class BodyReader:
 
     def read_raw(self, location: StoreLocation, path: PurePosixPath):
         del location
+        self.raw_reads.append(path)
         return RawRecord(path, _revision("9"), 3, b"bad")
 
 
@@ -204,6 +208,64 @@ def test_raw_show_uses_selected_filename_index_without_parsing_or_recursing() ->
     assert reader.reads == []
 
 
+def test_raw_inspect_runs_inside_the_selected_local_lease_without_loading_children() -> None:
+    from untaped_orchestration.application import query_models
+
+    scope, reader = _scope(incomplete=True)
+    local_snapshot = scope.local()
+    calls: list[str] = []
+
+    def unexpected_load():
+        raise AssertionError("inspect must not load outside the lease")
+
+    def unexpected_recursive_run(action):
+        del action
+        raise AssertionError("inspect must not acquire a recursive lease")
+
+    def local_run(action):
+        calls.append("local-run")
+        return action(local_snapshot, reader)
+
+    service = QueryService(
+        QueryScope(
+            unexpected_load,
+            unexpected_load,
+            recursive_run=unexpected_recursive_run,
+            local_run=local_run,
+        ),
+        reader,
+        Clock(),
+    )
+    path = PurePosixPath(f"tasks/{TASK_ID}-broken.md")
+
+    result = service.inspect_raw(query_models.RawInspectRequest(path))
+
+    assert result.data.content == b"bad"
+    assert calls == ["local-run"]
+    assert reader.raw_reads == [path]
+
+
+def test_raw_inspect_refuses_an_unavailable_reader_inside_the_lease() -> None:
+    from untaped_orchestration.application import query_models
+
+    scope, reader = _scope(incomplete=True)
+    local_snapshot = scope.local()
+    service = QueryService(
+        QueryScope(
+            scope.recursive,
+            scope.local,
+            local_run=lambda action: action(local_snapshot, None),
+        ),
+        reader,
+        Clock(),
+    )
+
+    with pytest.raises(QueryIncompleteError):
+        service.inspect_raw(
+            query_models.RawInspectRequest(PurePosixPath(f"tasks/{TASK_ID}-broken.md"))
+        )
+
+
 def test_streaming_search_retains_limit_and_reports_truncation() -> None:
     scope, reader = _scope()
     result = QueryService(scope, reader, Clock()).search(SearchRequest("body", limit=1))
@@ -212,6 +274,23 @@ def test_streaming_search_retains_limit_and_reports_truncation() -> None:
     assert result.truncated
     assert result.retained_bodies <= 1
     assert len(reader.reads) == 2
+
+
+@pytest.mark.parametrize(
+    "action",
+    (
+        lambda service: service.search(SearchRequest("")),
+        lambda service: service.history_search(HistorySearchRequest("")),
+    ),
+)
+def test_empty_search_query_is_a_typed_expected_input_failure(action) -> None:
+    scope, reader = _scope()
+
+    with pytest.raises(DiagnosticError) as captured:
+        action(QueryService(scope, reader, Clock()))
+
+    assert captured.value.diagnostics[0].code == "ORC002"
+    assert captured.value.diagnostics[0].field == "query"
 
 
 def test_partial_list_is_safe_but_next_fails_closed_unless_local() -> None:

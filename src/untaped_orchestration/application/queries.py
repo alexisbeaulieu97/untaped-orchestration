@@ -20,6 +20,7 @@ from untaped_orchestration.application.query_models import (
     QualifiedItem,
     QueryResult,
     QueryScope,
+    RawInspectRequest,
     RawShowRequest,
     SearchHit,
     SearchRequest,
@@ -94,6 +95,18 @@ class RawAmbiguityError(DiagnosticError):
 class QueryResolutionError(DiagnosticError):
     def __init__(self, message: str) -> None:
         super().__init__(expected_diagnostic("ORC003", message, field="id"))
+
+
+class QueryInputError(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            expected_diagnostic(
+                "ORC002",
+                message,
+                field="query",
+                hint="Provide a nonempty search query.",
+            )
+        )
 
 
 def _limit(value: int) -> int:
@@ -257,10 +270,21 @@ class QueryService:
 
         return self._within(True, action)
 
+    def inspect_raw(self, request: RawInspectRequest) -> QueryResult[RawRecord]:
+        def action(
+            snapshot: FederatedSnapshot, reader: StoreReader | None
+        ) -> QueryResult[RawRecord]:
+            if reader is None:
+                raise QueryIncompleteError(snapshot.completeness.diagnostics)
+            raw = reader.read_raw(snapshot.selected.location, request.path)
+            return self._result(snapshot, raw, local=True, retained=1)
+
+        return self._within(True, action)
+
     def search(self, request: SearchRequest) -> QueryResult[tuple[SearchHit, ...]]:
         limit = _limit(request.limit)
         if not request.query:
-            raise ValueError("search query must be nonempty")
+            raise QueryInputError("search query must be nonempty")
 
         def action(
             snapshot: FederatedSnapshot, reader: StoreReader | None
@@ -412,7 +436,7 @@ class QueryService:
     def history_search(self, request: HistorySearchRequest) -> QueryResult[tuple[SearchHit, ...]]:
         limit = _limit(request.limit)
         if not request.query:
-            raise ValueError("search query must be nonempty")
+            raise QueryInputError("search query must be nonempty")
 
         def action(
             snapshot: FederatedSnapshot, reader: StoreReader | None

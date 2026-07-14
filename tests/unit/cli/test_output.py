@@ -12,6 +12,7 @@ from untaped_orchestration.application.item_support import RevisionConflict
 from untaped_orchestration.application.maintenance import RecursiveFormatResult
 from untaped_orchestration.application.mutations import MutationWriteError
 from untaped_orchestration.application.queries import QueryIncompleteError
+from untaped_orchestration.application.query_models import QueryResult
 from untaped_orchestration.application.results import (
     MutationReceipt,
     RawRecord,
@@ -25,7 +26,7 @@ from untaped_orchestration.cli.output import (
     encode_result,
     run_command,
 )
-from untaped_orchestration.cli.read_commands import _curation_result
+from untaped_orchestration.cli.read_commands import _curation_result, _result
 from untaped_orchestration.domain.curation import CurationEntry, CurationKind
 from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticError
 from untaped_orchestration.domain.ids import StoreId, TaskId
@@ -173,6 +174,42 @@ def test_curation_page_lock_conflict_preserves_partial_payload_and_exits_four() 
     assert result.data == ()
     assert not result.complete
     assert result.exit_code == 4
+
+
+@pytest.mark.parametrize(("code", "expected_exit"), (("ORC007", 4), ("ORC005", 3)))
+@pytest.mark.parametrize("fmt", ("json", "table", "pipe"))
+def test_query_result_diagnostics_drive_exit_code_in_every_encoder(
+    code: str,
+    expected_exit: int,
+    fmt: str,
+    capfd,
+) -> None:
+    diagnostic = Diagnostic.model_validate(
+        {
+            "code": code,
+            "severity": "error",
+            "path": "registry.toml",
+            "field": "children",
+            "message": "query could not produce a safe result",
+            "hint": "retry after restoring the federation",
+        }
+    )
+    command = _result(
+        "search",
+        QueryResult((), False, False, (diagnostic,), ()),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        run_command(
+            "search",
+            lambda: command,
+            fmt=fmt,  # type: ignore[arg-type]
+            allowed=(fmt,),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == expected_exit
+    captured = capfd.readouterr()
+    assert code in captured.out + captured.err
 
 
 def test_recursive_fmt_propagates_incomplete_warning_to_every_encoder() -> None:

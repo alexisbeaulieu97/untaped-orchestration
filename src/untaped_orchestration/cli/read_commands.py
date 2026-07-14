@@ -14,6 +14,7 @@ from untaped_orchestration.application.query_models import (
     ListRequest,
     NextRequest,
     QueryResult,
+    RawInspectRequest,
     RawShowRequest,
     SearchRequest,
     ShowRequest,
@@ -55,6 +56,7 @@ def _result[T](
         truncated=value.truncated,
         diagnostics=value.diagnostics,
         pipe_kind=kind,
+        exit_code=result_exit_code(value.diagnostics, 0),
     )
 
 
@@ -202,8 +204,8 @@ def register(app: App) -> None:  # noqa: C901
         run_command(
             "inspect",
             lambda: (
-                lambda context: CommandResult(
-                    "inspect", context.repository.read_raw(context.location, path)
+                lambda context: _result(
+                    "inspect", context.queries().inspect_raw(RawInspectRequest(path))
                 )
             )(CliContext.resolve(store)),
             fmt=selected,

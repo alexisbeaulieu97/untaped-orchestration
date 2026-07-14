@@ -25,7 +25,7 @@ from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
-from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
+from untaped_orchestration.infrastructure.views import MarkdownViewRenderer, ViewError
 
 
 def _relative(parent: Path, child: Path) -> str:
@@ -65,6 +65,17 @@ class FailingChildViews(MarkdownViewRenderer):
     def expected(self, snapshot):
         if snapshot.location.real_root == self.child:
             raise ValueError("child renderer failed")
+        return super().expected(snapshot)
+
+
+class TypedFailingLocationViews(MarkdownViewRenderer):
+    def __init__(self, location: Path, error: Exception) -> None:
+        self.location = location.resolve()
+        self.error = error
+
+    def expected(self, snapshot):
+        if snapshot.location.real_root == self.location:
+            raise self.error
         return super().expected(snapshot)
 
 
@@ -145,6 +156,28 @@ def test_recursive_check_only_evaluates_selected_views_and_never_writes_child(
 
     assert set(views.locations) == {parent.resolve(), child.resolve()}
     assert before == _durable_files(child)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failing_store", ("parent", "child"))
+def test_recursive_check_preserves_typed_view_diagnostic_from_each_comparison_path(
+    tmp_path: Path,
+    failing_store: str,
+) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    _registry(parent, child)
+    _render_local(parent)
+    _render_local(child)
+    error = ViewError("typed view failure")
+    target = parent if failing_store == "parent" else child
+
+    with pytest.raises(ViewError) as captured:
+        _service(TypedFailingLocationViews(target, error)).check(
+            RecursiveCheckRequest(location_from_root(parent))
+        )
+
+    assert captured.value is error
 
 
 @pytest.mark.integration

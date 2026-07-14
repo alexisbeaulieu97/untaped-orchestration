@@ -15,7 +15,7 @@ from untaped_orchestration.application.maintenance import (
     RevisionConflict,
 )
 from untaped_orchestration.infrastructure.codec import CanonicalStoreFormatter
-from untaped_orchestration.infrastructure.filesystem import location_from_root
+from untaped_orchestration.infrastructure.filesystem import PathSafetyError, location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
 from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
@@ -52,6 +52,15 @@ class ExplodingViews(FailingViews):
     def expected(self, snapshot):
         del snapshot
         raise AssertionError("invalid state must not be rendered")
+
+
+class TypedFailingViews(FailingViews):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def expected(self, snapshot):
+        del snapshot
+        raise self.error
 
 
 class FailAfterDurableViewWrite(RecordingWriter):
@@ -113,6 +122,23 @@ def test_check_and_check_modes_never_call_the_writer(tmp_path: Path) -> None:
     assert fmt.matches
     assert render.matches
     assert recording.replacements == []
+
+
+def test_fmt_check_preserves_typed_path_diagnostic_from_view_comparison(tmp_path: Path) -> None:
+    root, repository, locks, _ = _initialized(tmp_path)
+    location = location_from_root(root)
+    error = PathSafetyError(PurePosixPath("views/roadmap.md"), "unsafe generated view")
+
+    with pytest.raises(PathSafetyError) as captured:
+        FormatStore(
+            repository,
+            repository,
+            locks,
+            TypedFailingViews(error),
+            CanonicalStoreFormatter(),
+        ).check(location)
+
+    assert captured.value is error
 
 
 def test_render_write_is_a_fixpoint_and_repairs_every_applicable_view(tmp_path: Path) -> None:

@@ -17,7 +17,7 @@ from untaped_orchestration.application.results import (
     FileReplacement,
 )
 from untaped_orchestration.domain.diagnostics import DiagnosticError
-from untaped_orchestration.domain.limits import FRONTMATTER_LIMIT, ITEM_FILE_LIMIT
+from untaped_orchestration.domain.limits import BODY_LIMIT, FRONTMATTER_LIMIT, ITEM_FILE_LIMIT
 from untaped_orchestration.infrastructure.codec import CodecError, ItemCodec
 from untaped_orchestration.infrastructure.filesystem import (
     AtomicFilesystem,
@@ -28,6 +28,15 @@ from untaped_orchestration.infrastructure.filesystem import (
     store_revision,
 )
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
+
+
+class RecordingExternalReader:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Path, int, str]] = []
+
+    def read_external(self, path: Path, *, limit: int, field: str) -> bytes:
+        self.calls.append((path, limit, field))
+        return path.read_bytes()
 
 
 class InjectedBoundaryError(RuntimeError):
@@ -400,6 +409,89 @@ def test_load_local_accepts_exact_item_limit_and_rejects_limit_plus_one(
             headers_only=True,
         )
     assert captured.value.diagnostics[0].code == "ORC001"
+
+
+@pytest.mark.parametrize(
+    ("relative", "expected_limit"),
+    (
+        (PurePosixPath("store.toml"), FRONTMATTER_LIMIT),
+        (PurePosixPath("registry.toml"), FRONTMATTER_LIMIT),
+        (PurePosixPath("AGENTS.md"), FRONTMATTER_LIMIT),
+        (PurePosixPath("CLAUDE.md"), FRONTMATTER_LIMIT),
+        (PurePosixPath("views/roadmap.md"), BODY_LIMIT),
+        (PurePosixPath(f"decisions/{DECISION_ID}-choice.md"), ITEM_FILE_LIMIT),
+    ),
+)
+def test_read_file_uses_an_explicit_bounded_reader_for_each_permitted_category(
+    local_store: Path,
+    relative: PurePosixPath,
+    expected_limit: int,
+) -> None:
+    target = local_store.joinpath(*relative.parts)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if relative.parts[0] == "decisions":
+        target.write_bytes(decision_bytes())
+    elif relative.parts[0] == "views":
+        target.write_bytes(b"generated view\n")
+    recorder = RecordingExternalReader()
+
+    result = FilesystemStoreRepository(external_files=recorder).read_file(
+        location_from_root(local_store), relative
+    )
+
+    assert result.content == target.read_bytes()
+    assert recorder.calls == [(target, expected_limit, "")]
+
+
+@pytest.mark.parametrize("method", ("read_raw", "read_item_body"))
+def test_item_specific_direct_reads_use_the_item_file_limit(
+    local_store: Path,
+    method: str,
+) -> None:
+    relative = PurePosixPath(f"decisions/{DECISION_ID}-choice.md")
+    target = local_store.joinpath(*relative.parts)
+    target.parent.mkdir()
+    target.write_bytes(decision_bytes())
+    recorder = RecordingExternalReader()
+    repository = FilesystemStoreRepository(external_files=recorder)
+
+    getattr(repository, method)(location_from_root(local_store), relative)
+
+    assert recorder.calls == [(target, ITEM_FILE_LIMIT, "")]
+
+
+@pytest.mark.parametrize("mutation", ("growth", "substitution"))
+def test_direct_raw_read_rejects_deterministic_change_after_snapshot(
+    local_store: Path,
+    mutation: str,
+) -> None:
+    from untaped_orchestration.infrastructure.external_files import FilesystemExternalFileReader
+
+    relative = PurePosixPath(f"decisions/{DECISION_ID}-choice.md")
+    target = local_store.joinpath(*relative.parts)
+    target.parent.mkdir()
+    target.write_bytes(decision_bytes())
+
+    def mutate(event: str, path: Path) -> None:
+        if event != "after-read":
+            return
+        if mutation == "growth":
+            with path.open("ab") as stream:
+                stream.write(b"x" * ITEM_FILE_LIMIT)
+        else:
+            moved = path.with_suffix(".moved")
+            path.replace(moved)
+            path.write_bytes(decision_bytes())
+
+    repository = FilesystemStoreRepository(
+        external_files=FilesystemExternalFileReader(event_hook=mutate)
+    )
+
+    with pytest.raises(DiagnosticError) as captured:
+        repository.read_raw(location_from_root(local_store), relative)
+
+    assert captured.value.diagnostics[0].code in {"ORC001", "ORC003"}
+    assert captured.value.diagnostics[0].path == relative.as_posix()
 
 
 def test_projection_reads_only_bounded_canonical_content_but_keeps_all_entries(

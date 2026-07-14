@@ -24,7 +24,7 @@ from untaped_orchestration.application.ports import (
 )
 from untaped_orchestration.domain.canonical import CanonicalItem
 from untaped_orchestration.domain.diagnostics import Diagnostic, DiagnosticError, sort_diagnostics
-from untaped_orchestration.domain.limits import FRONTMATTER_LIMIT, ITEM_FILE_LIMIT
+from untaped_orchestration.domain.limits import BODY_LIMIT, FRONTMATTER_LIMIT, ITEM_FILE_LIMIT
 from untaped_orchestration.domain.models import Registry, StoreConfig
 from untaped_orchestration.infrastructure.codec import (
     CodecError,
@@ -37,9 +37,11 @@ from untaped_orchestration.infrastructure.external_files import FilesystemExtern
 from untaped_orchestration.infrastructure.filesystem import (
     ADMIN_PATHS,
     ITEM_ROOTS,
+    VIEW_PATHS,
     AtomicFilesystem,
     PathSafetyError,
     StoreNotFoundError,
+    canonical_atomic_temporary_target,
     canonical_input_paths,
     discover_location,
     file_revision,
@@ -79,6 +81,15 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
     ) -> bytes:
         limit = ITEM_FILE_LIMIT if _is_item_path(relative_path) else FRONTMATTER_LIMIT
         absolute = location.real_root.joinpath(*relative_path.parts)
+        return self._read_bounded(absolute, relative_path, limit=limit)
+
+    def _read_bounded(
+        self,
+        absolute: Path,
+        relative_path: PurePosixPath,
+        *,
+        limit: int,
+    ) -> bytes:
         try:
             return self.read_external(absolute, limit=limit, field="")
         except DiagnosticError as error:
@@ -186,7 +197,8 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
         )
 
     def read_raw(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord:
-        raw = safe_raw_path(location, relative_path).read_bytes()
+        absolute = safe_raw_path(location, relative_path)
+        raw = self._read_bounded(absolute, relative_path, limit=ITEM_FILE_LIMIT)
         return RawRecord(
             path=relative_path,
             revision=file_revision(raw),
@@ -195,7 +207,12 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
         )
 
     def read_file(self, location: StoreLocation, relative_path: PurePosixPath) -> RawRecord:
-        raw = safe_read_path(location, relative_path).read_bytes()
+        absolute = safe_read_path(location, relative_path)
+        raw = self._read_bounded(
+            absolute,
+            relative_path,
+            limit=_read_file_limit(relative_path),
+        )
         return RawRecord(
             path=relative_path,
             revision=file_revision(raw),
@@ -204,7 +221,10 @@ class FilesystemStoreRepository(StoreReader, StoreWriter, CanonicalFormatter):
         )
 
     def read_item_body(self, location: StoreLocation, relative_path: PurePosixPath) -> bytes:
-        raw = safe_read_path(location, relative_path).read_bytes()
+        if not _is_item_path(relative_path):
+            raise PathSafetyError(relative_path, "item body reads require an exact item path")
+        absolute = safe_read_path(location, relative_path)
+        raw = self._read_bounded(absolute, relative_path, limit=ITEM_FILE_LIMIT)
         document = self._items.parse(raw, relative_path=relative_path)
         return document.body
 
@@ -404,6 +424,27 @@ def _is_item_path(relative_path: PurePosixPath) -> bool:
     return relative_path.suffix == ".md" and any(
         relative_path.parts[:-1] == root.parts for root in ITEM_ROOTS
     )
+
+
+def _read_file_limit(relative_path: PurePosixPath) -> int:
+    temporary_target = canonical_atomic_temporary_target(relative_path)
+    if temporary_target is not None:
+        return _read_file_limit(temporary_target)
+    if _is_item_path(relative_path):
+        return ITEM_FILE_LIMIT
+    if relative_path in VIEW_PATHS:
+        return BODY_LIMIT
+    if relative_path in {
+        PurePosixPath("store.toml"),
+        PurePosixPath("registry.toml"),
+    }:
+        return FRONTMATTER_LIMIT
+    if relative_path in {
+        PurePosixPath("AGENTS.md"),
+        PurePosixPath("CLAUDE.md"),
+    }:
+        return FRONTMATTER_LIMIT
+    raise PathSafetyError(relative_path, "reads are restricted to canonical store paths")
 
 
 def _is_unavailable_path(error: DiagnosticError) -> bool:

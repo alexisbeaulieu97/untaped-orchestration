@@ -474,6 +474,8 @@ class FormatStore:
                 try:
                     _, managed = view_comparisons(self._reader, location, self._views, after)
                     views_current = all(managed.values())
+                except DiagnosticError:
+                    raise
                 except OSError, ValueError:
                     views_current = False
             result_comparisons = (
@@ -523,6 +525,8 @@ class RecursiveMaintenanceService:
                 store,
             )
             return all(managed.values())
+        except DiagnosticError:
+            raise
         except OSError, ValueError:
             return False
 
@@ -572,6 +576,8 @@ class RecursiveMaintenanceService:
                                 hint="Run render --write locally in the selected store.",
                             )
                         )
+            except DiagnosticError:
+                raise
             except OSError, ValueError:
                 selected_views_current = False
         checks = []

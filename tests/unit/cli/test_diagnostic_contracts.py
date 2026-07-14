@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from tests.builders import DECISION_ID
+from tests.builders import DECISION_ID, write_store
 from untaped_orchestration.application.bootstrap import InitConflictError
 from untaped_orchestration.application.federation import (
     RegistryMutationConflict,
@@ -144,6 +144,34 @@ def test_query_resolution_failure_is_typed_orc003() -> None:
     error_type = queries.QueryResolutionError
     error = error_type("item does not resolve uniquely")
     assert error.diagnostics[0].code == "ORC003"
+
+
+@pytest.mark.parametrize(
+    ("argv", "stream"),
+    (
+        (("search", "", "--local", "--format", "json"), "out"),
+        (("history", "search", "", "--local", "--format", "table"), "err"),
+    ),
+)
+def test_empty_search_cli_is_orc002_exit_one_without_internal_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd,
+    argv: tuple[str, ...],
+    stream: str,
+) -> None:
+    root = write_store(tmp_path / "repository")
+    monkeypatch.chdir(root.parents[1])
+
+    with pytest.raises(SystemExit) as raised:
+        app(argv, exit_on_error=False)
+
+    assert raised.value.code == 1
+    captured = capfd.readouterr()
+    rendered = getattr(captured, stream)
+    assert "ORC002" in rendered
+    assert "internal orchestration failure" not in captured.out + captured.err
+    assert "Traceback" not in captured.err
 
 
 @pytest.mark.parametrize("error", (ValueError("secret value"), OSError("secret path")))

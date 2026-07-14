@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath
 
 from untaped_orchestration.application.ports import StoreReader
 from untaped_orchestration.application.results import FederatedSnapshot
@@ -69,6 +70,11 @@ class ShowRequest:
 @dataclass(frozen=True, slots=True)
 class RawShowRequest:
     item_id: TaskId | DecisionId
+
+
+@dataclass(frozen=True, slots=True)
+class RawInspectRequest:
+    path: PurePosixPath
 
 
 @dataclass(frozen=True, slots=True)

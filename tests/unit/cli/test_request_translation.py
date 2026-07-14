@@ -118,9 +118,9 @@ CASES = (
     _Case(
         read_commands,
         ("inspect", f"tasks/{TASK_ID}-x.md", "--raw"),
-        "repository.read_raw",
-        None,
-        {},
+        "queries.inspect_raw",
+        "RawInspectRequest",
+        {"path": PurePosixPath(f"tasks/{TASK_ID}-x.md")},
     ),
     _Case(
         read_commands,
@@ -602,7 +602,7 @@ def _plain(value: object) -> object:
 
 
 def _expected_formats(case: _Case) -> tuple[str, ...]:
-    if case.method in {"queries.show_raw", "repository.read_raw"}:
+    if case.method in {"queries.show_raw", "queries.inspect_raw"}:
         return ("raw", "json")
     if case.method in {
         "queries.list",

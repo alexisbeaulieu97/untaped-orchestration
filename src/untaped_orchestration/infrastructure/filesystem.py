@@ -366,15 +366,22 @@ def _is_writable_canonical_path(relative_path: PurePosixPath) -> bool:
     )
 
 
-def _is_canonical_atomic_temporary(relative_path: PurePosixPath) -> bool:
+def canonical_atomic_temporary_target(
+    relative_path: PurePosixPath,
+) -> PurePosixPath | None:
     marker = ".untaped-tmp-"
     name = relative_path.name
     if not name.startswith(".") or marker not in name:
-        return False
+        return None
     target_name, suffix = name[1:].split(marker, 1)
     if not target_name or not suffix:
-        return False
-    return _is_writable_canonical_path(relative_path.parent / target_name)
+        return None
+    target = relative_path.parent / target_name
+    return target if _is_writable_canonical_path(target) else None
+
+
+def _is_canonical_atomic_temporary(relative_path: PurePosixPath) -> bool:
+    return canonical_atomic_temporary_target(relative_path) is not None
 
 
 def safe_write_path(location: StoreLocation, relative_path: PurePosixPath) -> Path:
