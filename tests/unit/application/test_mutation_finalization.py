@@ -32,9 +32,10 @@ from untaped_orchestration.application.results import (
     FederatedSnapshot,
     FederationAnchor,
     ItemRevision,
+    PathComparison,
 )
 from untaped_orchestration.application.view_management import apply_views
-from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.cli.output import CommandResult, mutation_result, run_command
 from untaped_orchestration.domain.diagnostics import DiagnosticError, expected_diagnostic
 from untaped_orchestration.infrastructure.filesystem import PathSafetyError, location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
@@ -188,15 +189,16 @@ class TypedFailingViews(RecordingViews):
 
 
 class FailReadAfterFirstComparison(RecordingRepository):
-    def __init__(self, delegate, events, locks, error: DiagnosticError) -> None:
+    def __init__(self, delegate, events, locks, error: Exception) -> None:
         super().__init__(delegate, events, locks)
         self.error = error
         self.reads = 0
 
     def read_file(self, location, path):
-        self.reads += 1
-        if self.reads == 2:
-            raise self.error
+        if path == PurePosixPath("views/decisions.md"):
+            self.reads += 1
+            if self.reads == 2:
+                raise self.error
         return super().read_file(location, path)
 
 
@@ -705,6 +707,137 @@ def test_apply_views_preserves_typed_post_render_comparison_failure(tmp_path: Pa
         )
 
     assert captured.value is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("post-render read failed"), ValueError("post-render read invalid")],
+    ids=["os-error", "value-error"],
+)
+def test_apply_views_degrades_untyped_post_render_read_failure_to_stale_state(
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    reader = FailReadAfterFirstComparison(repository, events, locks, error)
+    locks.active = True
+
+    result = apply_views(
+        reader,
+        repository,
+        current.selected.location,
+        RecordingViews(events, locks),
+        current.selected,
+    )
+
+    assert result.current is False
+    assert result.intended_paths == (PurePosixPath("views/decisions.md"),)
+    assert result.changed_paths == (PurePosixPath("views/decisions.md"),)
+    assert result.comparisons == (PathComparison(PurePosixPath("views/decisions.md"), False),)
+
+
+def test_mutation_finalization_preserves_acknowledged_view_after_untyped_post_read_failure(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = FailReadAfterFirstComparison(
+        repository,
+        events,
+        locks,
+        OSError("post-render read failed"),
+    )
+
+    receipt = MutationExecutor(
+        adapter,
+        adapter,
+        locks,
+        RecordingViews(events, locks),
+        projector=repository,
+    ).execute(
+        locations=tuple(value.location for value in current.stores),
+        selected=current.selected.location,
+        load=lambda: current,
+        guard=lambda _: None,
+        build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
+    )
+
+    durable = repository.load_local(current.selected.location, headers_only=False)
+    assert receipt.canonical_applied is True
+    assert receipt.views_current is False
+    assert receipt.intended_paths == (
+        PurePosixPath("registry.toml"),
+        PurePosixPath("views/decisions.md"),
+    )
+    assert receipt.changed_paths == receipt.intended_paths
+    assert receipt.item_revisions == tuple(
+        ItemRevision(record.path, record.revision) for record in durable.records
+    )
+    assert receipt.store_revision == durable.store_revision
+    assert receipt.registry_revision == durable.registry_revision
+
+
+@pytest.mark.parametrize("fmt", ["json", "table"])
+def test_untyped_post_render_read_failure_emits_stale_receipt_and_exit_one(
+    tmp_path: Path,
+    fmt: str,
+    capfd,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    adapter = FailReadAfterFirstComparison(
+        repository,
+        events,
+        locks,
+        ValueError("post-render read invalid"),
+    )
+    executor = MutationExecutor(
+        adapter,
+        adapter,
+        locks,
+        RecordingViews(events, locks),
+        projector=repository,
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        run_command(
+            "task update",
+            lambda: mutation_result(
+                "task update",
+                executor.execute(
+                    locations=tuple(value.location for value in current.stores),
+                    selected=current.selected.location,
+                    load=lambda: current,
+                    guard=lambda _: None,
+                    build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
+                ),
+            ),
+            fmt=fmt,  # type: ignore[arg-type]
+            allowed=("json", "table"),
+        )
+
+    assert captured.value.code == 1
+    output = capfd.readouterr()
+    assert "registry.toml" in output.out
+    assert "views/decisions.md" in output.out
+    if fmt == "json":
+        payload = json.loads(output.out)
+        assert payload["data"]["canonical_applied"] is True
+        assert payload["data"]["views_current"] is False
+        assert payload["data"]["changed_paths"] == [
+            "registry.toml",
+            "views/decisions.md",
+        ]
+        assert output.err == ""
+    else:
+        assert output.out.startswith(
+            "applied\treplayed\tcanonical_applied\tviews_current\tintended_paths"
+        )
+        assert output.err == ""
 
 
 def test_mutation_finalization_preserves_typed_view_writer_failure(tmp_path: Path) -> None:

@@ -105,6 +105,13 @@ def apply_views(
     except DiagnosticError as error:
         setattr(error, _ACKNOWLEDGED_VIEW_PATHS, tuple(acknowledged))
         raise
+    except OSError, ValueError:
+        return ViewState(
+            intended,
+            tuple(acknowledged),
+            tuple(PathComparison(path, False) for path in managed),
+            False,
+        )
     changed = tuple(path for path in intended if not before[path] and after[path])
     comparisons = tuple(PathComparison(path, after[path]) for path in managed)
     return ViewState(intended, changed, comparisons, all(after.values()))

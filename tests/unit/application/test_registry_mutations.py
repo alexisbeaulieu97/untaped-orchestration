@@ -298,6 +298,65 @@ def test_registry_typed_view_failure_receipt_uses_durable_post_canonical_state(
     assert captured.value.receipt.registry_revision == durable.registry_revision  # type: ignore[attr-defined]
 
 
+def test_registry_post_render_read_failure_keeps_acknowledged_view_and_stale_receipt(
+    tmp_path: Path,
+) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    location = location_from_root(parent)
+    view_path = PurePosixPath("views/decisions.md")
+
+    class FailSecondViewRead(FilesystemStoreRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.view_reads = 0
+
+        def read_file(self, store_location, relative_path):
+            if relative_path == view_path:
+                self.view_reads += 1
+                if self.view_reads == 2:
+                    raise OSError("post-render read failed")
+            return super().read_file(store_location, relative_path)
+
+    class OneView:
+        def managed_paths(self):
+            return (view_path,)
+
+        def expected(self, snapshot):
+            del snapshot
+            return {view_path: b"decisions\n"}
+
+    repository = FailSecondViewRead()
+    before = repository.load_local(location, headers_only=True)
+    service = FederationRegistryService(
+        repository,
+        repository,
+        FileLockManager(),
+        OneView(),
+        repository,
+    )
+
+    receipt = service.add_child(
+        AddChildRequest(
+            location,
+            CHILD_STORE_ID,
+            _relative(parent, child),
+            expected_registry_revision=before.registry_revision,
+        )
+    )
+
+    durable = repository.load_local(location, headers_only=False)
+    assert receipt.canonical_applied is True
+    assert receipt.views_current is False
+    assert receipt.intended_paths == (PurePosixPath("registry.toml"), view_path)
+    assert receipt.changed_paths == receipt.intended_paths
+    assert receipt.item_revisions == tuple(
+        ItemRevision(record.path, record.revision) for record in durable.records
+    )
+    assert receipt.store_revision == durable.store_revision
+    assert receipt.registry_revision == durable.registry_revision
+
+
 def test_add_rejects_registry_change_that_would_discover_an_unlocked_path(
     tmp_path: Path,
 ) -> None:
