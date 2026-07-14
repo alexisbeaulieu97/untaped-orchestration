@@ -24,6 +24,10 @@ also carry a bounded receipt. Before any writer acknowledgement it is
 or more writer calls return, it reports the exact acknowledged changed paths,
 `applied=true`, and `canonical_applied=true`. In both cases
 `views_current=false`; typed failures keep their exact diagnostic and exit.
+When a typed view failure follows canonical success, the receipt uses the
+durable post-canonical revisions and contains only acknowledged canonical paths
+plus view paths whose writer calls returned; it does not infer the failed view
+path.
 
 After a valid hand edit, run `check`, then `fmt --check`. `fmt --write` can
 canonicalize valid TOML metadata under revision guards; it never invents a

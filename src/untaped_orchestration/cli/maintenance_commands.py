@@ -20,7 +20,12 @@ from untaped_orchestration.application.results import MaintenanceResult
 from untaped_orchestration.application.tasks import RepairDuplicateRequest
 from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, usage_value
-from untaped_orchestration.cli.output import CommandResult, result_exit_code, run_command
+from untaped_orchestration.cli.output import (
+    CommandResult,
+    mutation_result,
+    result_exit_code,
+    run_command,
+)
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import Revision
 from untaped_orchestration.domain.time import CalendarDate, IanaTimezone
@@ -100,7 +105,7 @@ def register(app: App) -> None:  # noqa: C901
                     decisions_only,
                 )
             )
-            return CommandResult("init", receipt)
+            return mutation_result("init", receipt)
 
         run_command("init", action, fmt=format, allowed=("table", "json"), columns=columns)
 
@@ -228,7 +233,7 @@ def register(app: App) -> None:  # noqa: C901
                     apply,
                 )
             )
-            return CommandResult("repair frontmatter", result)
+            return mutation_result("repair frontmatter", result)
 
         run_command(
             "repair frontmatter",
@@ -263,7 +268,7 @@ def register(app: App) -> None:  # noqa: C901
                     apply,
                 )
             )
-            return CommandResult("repair duplicate", result)
+            return mutation_result("repair duplicate", result)
 
         run_command(
             "repair duplicate",
@@ -296,7 +301,7 @@ def register(app: App) -> None:  # noqa: C901
             result = context.curation().acknowledge(
                 AcknowledgeRequest(typed, _revision(if_revision), force_current)
             )
-            return CommandResult("curate acknowledge", result)
+            return mutation_result("curate acknowledge", result)
 
         run_command(
             "curate acknowledge",
@@ -333,7 +338,7 @@ def register(app: App) -> None:  # noqa: C901
                     force_current,
                 )
             )
-            return CommandResult("curate snooze", result)
+            return mutation_result("curate snooze", result)
 
         run_command(
             "curate snooze",
@@ -369,7 +374,7 @@ def register(app: App) -> None:  # noqa: C901
                 scope_factory=context.scope.recursive,
             )
             result = service.execute(ImportRequest(context.location, manifest, apply, if_clean))
-            return CommandResult("store import", result)
+            return mutation_result("store import", result)
 
         run_command(
             "store import",

@@ -19,6 +19,7 @@ from untaped_orchestration.application.results import (
     StoreLocation,
     StoreLockTimeout,
 )
+from untaped_orchestration.cli import output as output_module
 from untaped_orchestration.cli.maintenance_commands import _format_result
 from untaped_orchestration.cli.output import (
     CommandResult,
@@ -34,6 +35,21 @@ from untaped_orchestration.domain.models import Revision
 from untaped_orchestration.domain.time import CalendarDate
 
 REVISION = Revision(f"sha256:{'a' * 64}")
+
+
+def _mutation_receipt(*, canonical: bool, views_current: bool) -> MutationReceipt:
+    paths = (PurePosixPath("registry.toml"),) if canonical else ()
+    return MutationReceipt(
+        applied=canonical,
+        replayed=False,
+        canonical_applied=canonical,
+        views_current=views_current,
+        intended_paths=paths,
+        changed_paths=paths,
+        item_revisions=(),
+        store_revision=REVISION,
+        registry_revision=None,
+    )
 
 
 def _reported_failure(message: str) -> DiagnosticError:
@@ -507,6 +523,60 @@ def test_mutation_write_failure_emits_receipt_without_leaking_internal_error(
         assert captured.out.startswith(
             "applied\treplayed\tcanonical_applied\tviews_current\tintended_paths"
         )
+
+
+@pytest.mark.parametrize("fmt", ("json", "table", "pipe", "raw"))
+def test_receipt_aware_result_exits_one_for_canonical_success_with_stale_views(
+    fmt: str,
+    capfd,
+) -> None:
+    result = output_module.mutation_result(
+        "store child add",
+        _mutation_receipt(canonical=True, views_current=False),
+        pipe_kind="orchestration.mutation",
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        run_command(
+            "store child add",
+            lambda: result,
+            fmt=fmt,  # type: ignore[arg-type]
+            allowed=(fmt,),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == 1
+    captured = capfd.readouterr()
+    assert captured.out
+    if fmt in {"json", "table", "pipe"}:
+        assert "registry.toml" in captured.out
+
+
+def test_receipt_aware_result_preserves_success_and_diagnostic_precedence() -> None:
+    success = output_module.mutation_result(
+        "task update",
+        _mutation_receipt(canonical=True, views_current=True),
+    )
+    dry_run = output_module.mutation_result(
+        "repair frontmatter",
+        _mutation_receipt(canonical=False, views_current=False),
+    )
+    conflict = Diagnostic(
+        code="ORC007",
+        severity="error",
+        path="registry.toml",
+        field="revision",
+        message="stale",
+        hint="retry",
+    )
+    degraded = output_module.mutation_result(
+        "store child add",
+        _mutation_receipt(canonical=True, views_current=False),
+        diagnostics=(conflict,),
+    )
+
+    assert success.exit_code == 0
+    assert dry_run.exit_code == 0
+    assert degraded.exit_code == 4
 
 
 def test_typed_diagnostic_failure_keeps_exact_cli_diagnostic_and_exit(capfd) -> None:

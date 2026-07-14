@@ -62,7 +62,12 @@ code. Unexpected exceptions use a generic ORC002 and do not expose their
 message unless the operator explicitly requests `--debug`. A canonical writer
 failure also emits a failure receipt in JSON/table data: `intended_paths` is
 complete, while `changed_paths` contains only writer calls that returned
-successfully. Any such failure reports `views_current=false`.
+successfully. A typed view-finalization failure after canonical success emits
+the durable post-canonical revisions and only the canonical and view paths
+whose writer calls returned successfully; it never guesses the failed path.
+Any such failure reports `views_current=false`. A mutation that returns a
+canonical-success/stale-view receipt exits 1, unless a typed diagnostic maps to
+a higher-precedence exit code.
 
 ## Release and rollout gates
 

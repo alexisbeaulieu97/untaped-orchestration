@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -15,11 +15,11 @@ from untaped_orchestration.application.federation import (
     RegistryRevisionConflict,
     RemoveChildRequest,
 )
-from untaped_orchestration.application.results import StoreLocation
+from untaped_orchestration.application.results import ItemRevision, StoreLocation
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
-from untaped_orchestration.infrastructure.views import MarkdownViewRenderer
+from untaped_orchestration.infrastructure.views import MarkdownViewRenderer, ViewError
 
 
 def _relative(parent: Path, child: Path) -> str:
@@ -246,6 +246,56 @@ def test_renderer_failure_returns_truthful_canonical_receipt(tmp_path: Path) -> 
     assert not result.views_current
     assert result.changed_paths == (Path("registry.toml"),)
     assert len(result.intended_paths) == 5
+
+
+def test_registry_typed_view_failure_receipt_uses_durable_post_canonical_state(
+    tmp_path: Path,
+) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    repository = FilesystemStoreRepository()
+    location = location_from_root(parent)
+    before = repository.load_local(location, headers_only=True)
+    error = ViewError("typed registry view failure")
+
+    class TypedFailingViews(MarkdownViewRenderer):
+        def expected(self, snapshot):
+            del snapshot
+            raise error
+
+    service = FederationRegistryService(
+        repository,
+        repository,
+        FileLockManager(),
+        TypedFailingViews(),
+        repository,
+    )
+
+    with pytest.raises(ViewError) as captured:
+        service.add_child(
+            AddChildRequest(
+                location,
+                CHILD_STORE_ID,
+                _relative(parent, child),
+                expected_registry_revision=before.registry_revision,
+            )
+        )
+
+    assert captured.value is error
+    durable = repository.load_local(location, headers_only=False)
+    assert captured.value.receipt.canonical_applied is True  # type: ignore[attr-defined]
+    assert captured.value.receipt.views_current is False  # type: ignore[attr-defined]
+    assert captured.value.receipt.intended_paths == (  # type: ignore[attr-defined]
+        PurePosixPath("registry.toml"),
+    )
+    assert captured.value.receipt.changed_paths == (  # type: ignore[attr-defined]
+        PurePosixPath("registry.toml"),
+    )
+    assert captured.value.receipt.item_revisions == tuple(  # type: ignore[attr-defined]
+        ItemRevision(record.path, record.revision) for record in durable.records
+    )
+    assert captured.value.receipt.store_revision == durable.store_revision  # type: ignore[attr-defined]
+    assert captured.value.receipt.registry_revision == durable.registry_revision  # type: ignore[attr-defined]
 
 
 def test_add_rejects_registry_change_that_would_discover_an_unlocked_path(

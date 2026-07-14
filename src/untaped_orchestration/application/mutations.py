@@ -28,7 +28,7 @@ from untaped_orchestration.application.scaffold import (
     validate_store_shape,
 )
 from untaped_orchestration.application.validation import validate_snapshot
-from untaped_orchestration.application.view_management import apply_views
+from untaped_orchestration.application.view_management import finalize_views
 from untaped_orchestration.domain.diagnostics import (
     Diagnostic,
     DiagnosticError,
@@ -311,12 +311,14 @@ class MutationExecutor:
                     )
                 )
 
-            view_state = apply_views(
+            view_state = finalize_views(
                 self._reader,
                 self._writer,
                 selected,
                 self._views,
                 selected_after,
+                canonical_paths=tuple(changed),
+                replayed=replayed or intended.replayed,
                 write=intended.finalize_views,
             )
             changed.extend(view_state.changed_paths)

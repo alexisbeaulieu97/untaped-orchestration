@@ -73,6 +73,27 @@ def result_exit_code(diagnostics: tuple[Diagnostic, ...], fallback: int) -> int:
     return fallback
 
 
+def mutation_result(
+    command: str,
+    data: object,
+    *,
+    diagnostics: tuple[Diagnostic, ...] = (),
+    pipe_kind: str | None = None,
+    fallback: int = 0,
+) -> CommandResult:
+    receipt = data if isinstance(data, MutationReceipt) else getattr(data, "receipt", None)
+    if not isinstance(receipt, MutationReceipt):
+        raise TypeError("mutation command result requires a mutation receipt")
+    stale_views = receipt.canonical_applied and not receipt.views_current
+    return CommandResult(
+        command,
+        data,
+        diagnostics=diagnostics,
+        pipe_kind=pipe_kind,
+        exit_code=result_exit_code(diagnostics, 1 if stale_views else fallback),
+    )
+
+
 def _value(value: object) -> object:  # noqa: C901
     if isinstance(value, ItemMutationResult):
         return _value(value.receipt)

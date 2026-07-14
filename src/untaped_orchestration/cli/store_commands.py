@@ -15,7 +15,7 @@ from untaped_orchestration.cli.options import (
     usage_value,
     validate_limit,
 )
-from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.cli.output import CommandResult, mutation_result, run_command
 from untaped_orchestration.domain.ids import StoreId
 from untaped_orchestration.domain.models import Revision
 
@@ -65,7 +65,7 @@ def register(app: App) -> None:
                     force_current,
                 )
             )
-            return CommandResult("store child add", receipt)
+            return mutation_result("store child add", receipt)
 
         run_command(
             "store child add",
@@ -100,7 +100,7 @@ def register(app: App) -> None:
                     force_current,
                 )
             )
-            return CommandResult("store child remove", receipt)
+            return mutation_result("store child remove", receipt)
 
         run_command(
             "store child remove",

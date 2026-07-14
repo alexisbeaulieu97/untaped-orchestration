@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from tests.builders import CHILD_STORE_ID, DECISION_ID, STORE_ID, TASK_ID
+from untaped_orchestration.application.results import MutationReceipt
 from untaped_orchestration.cli import (
     app,
     decision_commands,
@@ -17,6 +18,7 @@ from untaped_orchestration.cli import (
     store_commands,
     task_commands,
 )
+from untaped_orchestration.domain.models import Revision
 
 REVISION = f"sha256:{'a' * 64}"
 
@@ -32,6 +34,20 @@ class _UniversalResult:
     checks: tuple[()] = ()
     valid: bool = True
     matches: bool = True
+
+    @property
+    def receipt(self) -> MutationReceipt:
+        return MutationReceipt(
+            applied=True,
+            replayed=False,
+            canonical_applied=True,
+            views_current=True,
+            intended_paths=(),
+            changed_paths=(),
+            item_revisions=(),
+            store_revision=Revision(REVISION),
+            registry_revision=None,
+        )
 
 
 class _Recorder:

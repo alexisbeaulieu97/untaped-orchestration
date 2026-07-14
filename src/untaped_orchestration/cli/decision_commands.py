@@ -21,7 +21,7 @@ from untaped_orchestration.cli.options import (
     read_body_file,
     usage_value,
 )
-from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.cli.output import CommandResult, mutation_result, run_command
 from untaped_orchestration.domain.ids import DecisionId, Slug
 from untaped_orchestration.domain.models import Revision
 
@@ -105,7 +105,7 @@ def register(app: App) -> None:
                     _required_revision(if_store_revision),
                 ),
             )
-            return CommandResult("decision create", result)
+            return mutation_result("decision create", result)
 
         run_command(
             "decision create",
@@ -154,7 +154,7 @@ def register(app: App) -> None:
                     else (None if tag is None else tuple(_slug(value) for value in tag)),
                 ),
             )
-            return CommandResult("decision update", result)
+            return mutation_result("decision update", result)
 
         run_command(
             "decision update",
@@ -202,7 +202,7 @@ def register(app: App) -> None:
                     force_current,
                 )
             )
-            return CommandResult("decision supersede", result)
+            return mutation_result("decision supersede", result)
 
         run_command(
             "decision supersede",
@@ -231,7 +231,7 @@ def register(app: App) -> None:
         _guard(if_store_revision, force_current)
         run_command(
             "decision retire",
-            lambda: CommandResult(
+            lambda: mutation_result(
                 "decision retire",
                 CliContext.resolve(store)
                 .decisions()

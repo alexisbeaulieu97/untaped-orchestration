@@ -31,6 +31,7 @@ from untaped_orchestration.application.results import (
     Completeness,
     FederatedSnapshot,
     FederationAnchor,
+    ItemRevision,
 )
 from untaped_orchestration.application.view_management import apply_views
 from untaped_orchestration.cli.output import CommandResult, run_command
@@ -151,6 +152,23 @@ class RecordingViews:
         if self.fail:
             raise OSError("renderer unavailable")
         return {PurePosixPath("views/decisions.md"): b"view\n"}
+
+
+class MultipleRecordingViews(RecordingViews):
+    def managed_paths(self) -> tuple[PurePosixPath, ...]:
+        return (
+            PurePosixPath("views/decisions.md"),
+            PurePosixPath("views/roadmap.md"),
+        )
+
+    def expected(self, snapshot) -> Mapping[PurePosixPath, bytes]:
+        del snapshot
+        assert self.locks.active
+        self.events.append("render")
+        return {
+            PurePosixPath("views/decisions.md"): b"decisions\n",
+            PurePosixPath("views/roadmap.md"): b"roadmap\n",
+        }
 
 
 class TypedFailingViews(RecordingViews):
@@ -712,6 +730,127 @@ def test_mutation_finalization_preserves_typed_view_writer_failure(tmp_path: Pat
         )
 
     assert captured.value is error
+    durable = repository.load_local(current.selected.location, headers_only=False)
+    assert captured.value.receipt.canonical_applied is True  # type: ignore[attr-defined]
+    assert captured.value.receipt.views_current is False  # type: ignore[attr-defined]
+    assert captured.value.receipt.intended_paths == (  # type: ignore[attr-defined]
+        PurePosixPath("registry.toml"),
+    )
+    assert captured.value.receipt.changed_paths == (  # type: ignore[attr-defined]
+        PurePosixPath("registry.toml"),
+    )
+    assert captured.value.receipt.item_revisions == tuple(  # type: ignore[attr-defined]
+        ItemRevision(record.path, record.revision) for record in durable.records
+    )
+    assert captured.value.receipt.store_revision == durable.store_revision  # type: ignore[attr-defined]
+    assert captured.value.receipt.registry_revision == durable.registry_revision  # type: ignore[attr-defined]
+
+
+def test_mutation_finalization_receipt_includes_only_acknowledged_view_paths(
+    tmp_path: Path,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    error = StoreLockTimeout(current.selected.location)
+    writer = FailingCanonicalWriter(repository, events, locks, failure=error, fail_on=3)
+    roadmap_path = current.selected.location.root / "views" / "roadmap.md"
+    roadmap_before = roadmap_path.read_bytes()
+
+    with pytest.raises(StoreLockTimeout) as captured:
+        MutationExecutor(
+            repository,
+            writer,
+            locks,
+            MultipleRecordingViews(events, locks),
+            projector=repository,
+        ).execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
+        )
+
+    assert captured.value is error
+    assert captured.value.receipt.intended_paths == (  # type: ignore[attr-defined]
+        PurePosixPath("registry.toml"),
+        PurePosixPath("views/decisions.md"),
+    )
+    assert captured.value.receipt.changed_paths == (  # type: ignore[attr-defined]
+        PurePosixPath("registry.toml"),
+        PurePosixPath("views/decisions.md"),
+    )
+    assert current.selected.location.root.joinpath("views/decisions.md").read_bytes() == (
+        b"decisions\n"
+    )
+    assert roadmap_path.read_bytes() == roadmap_before
+
+
+@pytest.mark.parametrize("fmt", ["json", "table"])
+def test_typed_view_finalization_failure_emits_durable_receipt_and_exact_exit(
+    tmp_path: Path,
+    fmt: str,
+    capfd,
+) -> None:
+    repository, current = _state(tmp_path)
+    events: list[str] = []
+    locks = RecordingLocks(events)
+    writer = FailingCanonicalWriter(
+        repository,
+        events,
+        locks,
+        failure=StoreLockTimeout(current.selected.location),
+        fail_on=2,
+    )
+    executor = MutationExecutor(
+        repository,
+        writer,
+        locks,
+        RecordingViews(events, locks),
+        projector=repository,
+    )
+
+    def fail() -> CommandResult:
+        executor.execute(
+            locations=tuple(value.location for value in current.stores),
+            selected=current.selected.location,
+            load=lambda: current,
+            guard=lambda _: None,
+            build=lambda snapshot: IntendedMutation(replacements=(_replacement(snapshot),)),
+        )
+        raise AssertionError("typed view failure was not raised")
+
+    with pytest.raises(SystemExit) as captured:
+        run_command(
+            "task update",
+            fail,
+            fmt=fmt,  # type: ignore[arg-type]
+            allowed=("json", "table"),
+        )
+
+    assert captured.value.code == 4
+    output = capfd.readouterr()
+    assert "registry.toml" in output.out
+    if fmt == "json":
+        payload = json.loads(output.out)
+        durable = repository.load_local(current.selected.location, headers_only=False)
+        assert payload["data"]["canonical_applied"] is True
+        assert payload["data"]["views_current"] is False
+        assert payload["data"]["intended_paths"] == ["registry.toml"]
+        assert payload["data"]["changed_paths"] == ["registry.toml"]
+        assert payload["data"]["store_revision"] == durable.store_revision.root
+        assert payload["data"]["registry_revision"] == durable.registry_revision.root
+        assert output.err == ""
+    else:
+        assert output.out.startswith(
+            "applied\treplayed\tcanonical_applied\tviews_current\tintended_paths"
+        )
+        assert output.err == (
+            "ORC007: "
+            f"{current.selected.location.real_root.as_posix()}: "
+            "timed out acquiring orchestration store lock\n"
+        )
 
 
 def test_later_canonical_failure_receipt_preserves_acknowledged_paths(

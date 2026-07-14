@@ -7,7 +7,7 @@ from cyclopts import App
 from untaped_orchestration.application.item_support import EvidenceRequest, LinkRequest
 from untaped_orchestration.cli.context import CliContext
 from untaped_orchestration.cli.options import ColumnsOption, OutputFormat, usage_value
-from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.cli.output import CommandResult, mutation_result, run_command
 from untaped_orchestration.domain.evidence import EvidenceReference, EvidenceRelation
 from untaped_orchestration.domain.ids import DecisionId, StoreId, TaskId
 from untaped_orchestration.domain.models import LinkRelation, Revision
@@ -63,7 +63,7 @@ def register(app: App) -> None:
                         force_current,
                     ),
                 )
-                return CommandResult(f"link {name}", result)
+                return mutation_result(f"link {name}", result)
 
             run_command(
                 f"link {name}",
@@ -110,7 +110,7 @@ def register(app: App) -> None:
                         force_current,
                     ),
                 )
-                return CommandResult(f"evidence {name}", result)
+                return mutation_result(f"evidence {name}", result)
 
             run_command(
                 f"evidence {name}",

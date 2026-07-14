@@ -19,7 +19,7 @@ from untaped_orchestration.cli.options import (
     read_body_file,
     usage_value,
 )
-from untaped_orchestration.cli.output import CommandResult, run_command
+from untaped_orchestration.cli.output import CommandResult, mutation_result, run_command
 from untaped_orchestration.domain.ids import Slug, TaskId
 from untaped_orchestration.domain.models import Revision, TaskOutcome, TaskPriority, TaskStage
 from untaped_orchestration.domain.ordering import PlacementAnchor, PlacementAnchorKind
@@ -120,7 +120,7 @@ def register(app: App) -> None:  # noqa: C901
                     _required_revision(if_store_revision),
                 ),
             )
-            return CommandResult("task create", result)
+            return mutation_result("task create", result)
 
         run_command("task create", action, fmt=format, allowed=("table", "json"), columns=columns)
 
@@ -182,7 +182,7 @@ def register(app: App) -> None:  # noqa: C901
                     ),
                 ),
             )
-            return CommandResult("task update", result)
+            return mutation_result("task update", result)
 
         run_command("task update", action, fmt=format, allowed=("table", "json"), columns=columns)
 
@@ -195,7 +195,7 @@ def register(app: App) -> None:  # noqa: C901
     ) -> None:
         run_command(
             command,
-            lambda: CommandResult(
+            lambda: mutation_result(
                 command,
                 (
                     CliContext.resolve(store).tasks().transition(request)
@@ -318,7 +318,7 @@ def register(app: App) -> None:  # noqa: C901
         _guard(if_revision, force_current)
         run_command(
             "task review",
-            lambda: CommandResult(
+            lambda: mutation_result(
                 "task review",
                 CliContext.resolve(store)
                 .tasks()
@@ -361,7 +361,7 @@ def register(app: App) -> None:  # noqa: C901
             raise SystemExit(2)
         run_command(
             "task close",
-            lambda: CommandResult(
+            lambda: mutation_result(
                 "task close",
                 CliContext.resolve(store)
                 .tasks()

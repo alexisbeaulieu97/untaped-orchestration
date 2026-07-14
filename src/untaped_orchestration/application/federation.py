@@ -35,7 +35,7 @@ from untaped_orchestration.application.results import (
     StoreSnapshot,
 )
 from untaped_orchestration.application.validation import validate_snapshot
-from untaped_orchestration.application.view_management import apply_views
+from untaped_orchestration.application.view_management import finalize_views
 from untaped_orchestration.domain.diagnostics import (
     Diagnostic,
     DiagnosticCode,
@@ -940,12 +940,13 @@ class FederationRegistryService:
             registry_path = PurePosixPath("registry.toml")
             self._writer.replace(request.location, FileReplacement(registry_path, raw))
             after = self._reader.load_local(request.location, headers_only=False)
-            view_state = apply_views(
+            view_state = finalize_views(
                 self._reader,
                 self._writer,
                 request.location,
                 self._views,
                 after,
+                canonical_paths=(registry_path,),
             )
             return MutationReceipt(
                 applied=True,
