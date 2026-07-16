@@ -1,0 +1,10 @@
+schema = "untaped.orchestration.decision/v1"
+id = "dec_019f68b6c69772609adcfad1532c7626"
+kind = "decision"
+title = "Git plus guarded atomic files is recovery; no WAL/transaction journal"
+created_at = "2026-07-16T00:23:30.000Z"
+tags = []
+
+[[evidence]]
+relation = "tracked-by"
+reference = "git:01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md#sha256:52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"

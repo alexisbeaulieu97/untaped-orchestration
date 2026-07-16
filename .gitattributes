@@ -1,0 +1,3 @@
+# Exact imported Markdown bodies preserve source terminal blank-line LFs.
+.untaped/orchestration/decisions/*.md whitespace=-blank-at-eof
+docs/orchestration-adoption/records/*.md whitespace=-blank-at-eof

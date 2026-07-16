@@ -69,6 +69,29 @@ def test_documented_adoption_commands_match_cli_scope() -> None:
     assert "render --check --local" not in design
 
 
+def test_self_adoption_and_rollout_authority_are_current() -> None:
+    design_path = REPO_ROOT / "docs/superpowers/specs/2026-07-09-orchestration-v1-design.md"
+    design = design_path.read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    cli = (REPO_ROOT / "docs/cli.md").read_text(encoding="utf-8")
+
+    assert design_path.is_file()
+    assert "normative" in design
+    assert "self-adoption gate cleared" in design
+    assert "2026-07-15" in design
+    assert "completed and accepted for workflow validation" in design
+    assert "not content authority" in design
+    assert "10 decisions" in design
+    assert "325f5c5f9ac3977838f46ab1555824e1d7746a2e" in design
+    assert "b5cb8187398af4fee52b720c6890129f602c33d8c8c44c38b646c5b45d18f3ce" in design
+    assert "superseded-by-current-source" in design
+    assert "045fed8bf1c240b8a93bd7a25389cfbe38f0bc8d" in design
+    for content in (readme, cli):
+        assert "0.1.0" in content
+        assert "self-adoption approved" in content
+        assert "may begin only after" not in content
+
+
 def test_changelog_records_010_release_date() -> None:
     changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "## 0.1.0 (2026-07-15)" in changelog

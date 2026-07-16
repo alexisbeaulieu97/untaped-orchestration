@@ -20,9 +20,10 @@ roadmap gate. The SDK prerequisite is satisfied by `untaped==3.1.0`, core commit
 `80bb841`, and GitHub release/tag `v3.1.0`.
 
 The design was previously approved in conversation and pressure-tested before
-repository creation. This document is the owning-repository contract and now
-describes the reviewed implementation. It does not authorize publication,
-self-adoption, or fleet migration.
+repository creation. This normative document is the owning-repository contract
+and now describes the reviewed implementation. Version `0.1.0` was released and
+the self-adoption gate cleared on 2026-07-15 after explicit approval. This does
+not authorize later repository adoption or fleet migration.
 
 ### 1.1 Goals
 
@@ -1258,15 +1259,16 @@ state, and proves installed-wheel `--version`. Version stdout is exactly
 Release templates use reviewed core checker commit
 `80bb8411cd0017f3e0cde818656aaf6fd0233368`.
 
-Implementation CI may use the local source until `0.1.0` exists. After an
-approved release, a separate self-adoption PR uses the exact released pin.
+Version `0.1.0` is released. The separately approved self-adoption uses that
+exact released pin in its dedicated workflow.
 
 ## 16. Fleet rollout
 
 Rollout is staged, not a simultaneous eleven-repository mutation:
 
 1. Dry-run pilot using temporary copies of the private hub and one public
-   content-bearing decision store.
+   content-bearing decision store. This pilot is
+   completed and accepted for workflow validation. It is not content authority.
 2. Content cohort: core, GitHub, Recipe, Market, and the orchestration tool.
 3. Empty-store cohort: AWX, Ansible, Jira, Workspace, and Apple Health.
 4. Private hub last, after every child store is accepted.
@@ -1318,13 +1320,13 @@ compatible range may be considered only after the schema and CLI stabilize.
 | `untaped` | Public, decision-only | 7 current core decisions | SDK 3.1.0 commit `80bb8411cd0017f3e0cde818656aaf6fd0233368`; includes the tool-version ruling |
 | `untaped-awx` | Public, decision-only | Empty initial store | Verified main |
 | `untaped-ansible` | Public, decision-only | Empty initial store | Verified main |
-| `untaped-github` | Public, decision-only | 5 decisions | Frozen source `045fed8bf1c240b8a93bd7a25389cfbe38f0bc8d` |
+| `untaped-github` | Public, decision-only | 10 decisions | Current source `325f5c5f9ac3977838f46ab1555824e1d7746a2e`, SHA-256 `b5cb8187398af4fee52b720c6890129f602c33d8c8c44c38b646c5b45d18f3ce`; pilot source `045fed8bf1c240b8a93bd7a25389cfbe38f0bc8d` is `superseded-by-current-source` historical input |
 | `untaped-jira` | Public, decision-only | Empty initial store | Verified main |
 | `untaped-market` | Private repository, decision-only policy | 6 decisions | PR #6 on verified main; frozen source `cd792a03cf33625871ed176348a2120d85b21c42` |
 | `untaped-recipe` | Public, decision-only | 8 decisions | Frozen source `0fd6f8164329477f4627ba68987ed56ebea4ccb5` |
 | `untaped-workspace` | Public, decision-only | Empty initial store | Verified main |
 | `untaped-apple-health` | Private repository, decision-only policy | Empty initial store | Verified HTTPS `FETCH_HEAD` |
-| `untaped-orchestration` | Public, decision-only | Tool architecture decisions | Post-release self-adoption |
+| `untaped-orchestration` | Public, decision-only | 6 selected tool architecture decisions | Released `0.1.0`; explicitly approved self-adoption represented here |
 
 The committed hub migration-input manifest owns full source hashes and exact
 snapshot paths. A local-only historical source OID is evidence, not authority;
@@ -1472,6 +1474,7 @@ tasks, or an external action lacks explicit approval.
 
 The implementation plan remains recorded at
 `docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md`.
-Implementation completion does not advance the external gates: publication,
-self-adoption, and every fleet cohort still require their separately reviewed
-approvals and verified prerequisites.
+Implementation completion did not itself advance external gates. Publication
+and this repository's self-adoption now have their separate verified approval;
+every later repository adoption and fleet cohort still requires its own review,
+approval, and verified prerequisites.

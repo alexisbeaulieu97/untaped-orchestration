@@ -79,10 +79,10 @@ retries a fresh published-wheel smoke, and creates a GitHub release only after
 the production smoke. A failed post-upload version may be burned and requires a
 patch bump.
 
-Self-adoption is a separate gate: it may begin only after
-`untaped-orchestration==0.1.0` is published, a fresh released-package smoke
-passes, and Alexis grants approval. It then uses the exact released pin in its
-own reviewed PR.
+Self-adoption is a separate gate: version `0.1.0` is released, its fresh
+released-package smoke passed, and self-adoption approved state is represented
+by this repository's public decision-only store. The dedicated workflow uses
+the exact released pin; later repository adoptions remain separately gated.
 
 Fleet adoption order is:
 

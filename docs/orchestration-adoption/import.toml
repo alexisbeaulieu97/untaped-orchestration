@@ -1,0 +1,40 @@
+schema = "untaped.orchestration.import/v1"
+target_store_id = "sto_019f68b6b1c4721b8cd64f9e1426c34d"
+expected_store_revision = "sha256:b54c70dc0200999adc380334b32472d1fe80eee1e6cbe708bb65476b6541da29"
+require_empty_items = true
+
+[[records]]
+destination = "decisions"
+frontmatter_file = "records/decision-01.toml"
+body_file = "records/decision-01.md"
+source_ref = "git:01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md#sha256:52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"
+
+[[records]]
+destination = "decisions"
+frontmatter_file = "records/decision-02.toml"
+body_file = "records/decision-02.md"
+source_ref = "git:01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md#sha256:52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"
+
+[[records]]
+destination = "decisions"
+frontmatter_file = "records/decision-03.toml"
+body_file = "records/decision-03.md"
+source_ref = "git:01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md#sha256:52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"
+
+[[records]]
+destination = "decisions"
+frontmatter_file = "records/decision-04.toml"
+body_file = "records/decision-04.md"
+source_ref = "git:01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md#sha256:52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"
+
+[[records]]
+destination = "decisions"
+frontmatter_file = "records/decision-05.toml"
+body_file = "records/decision-05.md"
+source_ref = "git:01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md#sha256:52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"
+
+[[records]]
+destination = "decisions"
+frontmatter_file = "records/decision-06.toml"
+body_file = "records/decision-06.md"
+source_ref = "git:01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae:docs/superpowers/specs/2026-07-09-orchestration-v1-design.md#sha256:52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"

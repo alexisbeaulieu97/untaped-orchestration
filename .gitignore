@@ -21,3 +21,14 @@ htmlcov/
 
 # Editor noise
 .DS_Store
+
+# Local orchestration runtime/editor artifacts only; canonical state and views are tracked.
+.untaped/orchestration/**/.lock
+.untaped/orchestration/**/.DS_Store
+.untaped/orchestration/**/.*.untaped-tmp-*
+.untaped/orchestration/**/*~
+.untaped/orchestration/**/*.swp
+.untaped/orchestration/**/*.swo
+.untaped/orchestration/**/*.tmp
+.untaped/orchestration/**/.#*
+.untaped/orchestration/**/#*

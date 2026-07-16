@@ -1,0 +1,65 @@
+schema = "untaped.orchestration.decision-sources/v1"
+scope = "selected-tool-decisions"
+full_file_coverage = false
+source_repository = "untaped-orchestration"
+source_oid = "01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae"
+source_path = "docs/superpowers/specs/2026-07-09-orchestration-v1-design.md"
+source_sha256 = "52d973e40559b2607c04031afc6ac84bc8a341bf599d653abf27501f99db1320"
+source_bytes = 75697
+source_lines = 1477
+source_timestamp = "2026-07-16T00:23:30.000Z"
+nonselected_lines = "All non-selected lines remain authoritative in the normative design and are neither migrated nor dispositioned."
+
+[[selections]]
+line_range = "60-84"
+terminal_line = 84
+source_bytes = 794
+block_sha256 = "995136f375e960f9583deb5bbc750808d4c7fdbe5087bfe0d794e0fc90020de0"
+destination_id = "dec_019f68b6c25074f4b375bba75634cf4d"
+body_includes_terminal_line_lf = true
+review_status = "pending-review"
+
+[[selections]]
+line_range = "284-306"
+terminal_line = 306
+source_bytes = 942
+block_sha256 = "d1eba38f23b779e0aa22644a08e53eede24adf843a47a11fd8c650025931ba16"
+destination_id = "dec_019f68b6c3677043928e09f4e89ecab6"
+body_includes_terminal_line_lf = true
+review_status = "pending-review"
+
+[[selections]]
+line_range = "637-666"
+terminal_line = 666
+source_bytes = 1694
+block_sha256 = "6408f6f12e6ce9230e3f1fecb9444a61dfd1a34eda7b9b43af0ee091876a1b0e"
+destination_id = "dec_019f68b6c48576e49388dec9e464b5b6"
+body_includes_terminal_line_lf = true
+review_status = "pending-review"
+
+[[selections]]
+line_range = "848-882"
+terminal_line = 882
+source_bytes = 1964
+block_sha256 = "42e0140fa25359cb3b02131d225ed4dd81351ee3a4234008c2dbc8fc407fce0c"
+destination_id = "dec_019f68b6c58f73bc92ac6dbfd1983fab"
+body_includes_terminal_line_lf = true
+review_status = "pending-review"
+
+[[selections]]
+line_range = "1032-1093"
+terminal_line = 1093
+source_bytes = 6326
+block_sha256 = "b44c3ee526609916bdffb1b1f05d148242bfbde7b66ebc34bd8346c6e1ebaee6"
+destination_id = "dec_019f68b6c69772609adcfad1532c7626"
+body_includes_terminal_line_lf = true
+review_status = "pending-review"
+
+[[selections]]
+line_range = "1206-1226"
+terminal_line = 1226
+source_bytes = 809
+block_sha256 = "d8c7dd119aa4711d976ba83c651d4d6eb79f62809c6108a7c39a11cddee73944"
+destination_id = "dec_019f68b6c79e7153b69b0137e8aaed5d"
+body_includes_terminal_line_lf = true
+review_status = "pending-review"
