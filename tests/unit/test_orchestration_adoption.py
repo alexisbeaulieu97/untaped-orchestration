@@ -145,7 +145,15 @@ def test_selected_source_manifest_explicitly_does_not_cover_full_design() -> Non
     assert [entry["block_sha256"] for entry in selections] == list(BLOCK_HASHES)
     assert [entry["destination_id"] for entry in selections] == list(DECISION_IDS)
     assert all(entry["body_includes_terminal_line_lf"] is True for entry in selections)
-    assert {entry["review_status"] for entry in selections} == {"pending-review"}
+    assert manifest["review_evidence"] == "review.md"
+    assert {entry["review_status"] for entry in selections} == {"accepted"}
+    review = (ADOPTION / "review.md").read_text(encoding="utf-8")
+    assert "## Verdict: ACCEPT" in review
+    assert "Independent reviewer: Codex review subagent `market_permission_auditor`" in review
+    assert (
+        "01318c5a6ecf58a8afb897d4f34cc5b350a5c6ae..dbd3f856eab8af1c91ce8393b923f89d9d1da615"
+    ) in review
+    assert SOURCE_SHA in review
 
 
 def test_import_pointer_agent_rules_ignores_and_workflow() -> None:
