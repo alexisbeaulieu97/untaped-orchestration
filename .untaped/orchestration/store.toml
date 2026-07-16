@@ -1,0 +1,26 @@
+schema = "untaped.orchestration.store/v1"
+id = "sto_019f68b6b1c4721b8cd64f9e1426c34d"
+name = "untaped-orchestration"
+visibility = "public"
+timezone = "UTC"
+
+[capabilities]
+active_tasks = false
+
+[curation]
+inbox_review_days = 7
+in_progress_review_days = 14
+
+[brief]
+pinned_decisions = [
+    "dec_019f68b6c25074f4b375bba75634cf4d",
+    "dec_019f68b6c3677043928e09f4e89ecab6",
+    "dec_019f68b6c48576e49388dec9e464b5b6",
+    "dec_019f68b6c58f73bc92ac6dbfd1983fab",
+    "dec_019f68b6c69772609adcfad1532c7626",
+    "dec_019f68b6c79e7153b69b0137e8aaed5d",
+]
+max_decision_body_bytes = 4096
+max_total_body_bytes = 16384
+max_rows_per_section = 10
+max_total_bytes = 32768

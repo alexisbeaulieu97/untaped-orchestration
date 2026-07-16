@@ -53,6 +53,7 @@ site-packages path is injected into that environment.
 - [CLI and output contracts](docs/cli.md)
 - [Canonical file format](docs/file-format.md)
 - [Diagnostics and recovery](docs/recovery.md)
+- [Current technical decisions](docs/decisions.md)
 - [Authoritative v1 design](docs/superpowers/specs/2026-07-09-orchestration-v1-design.md)
 - [SDK plugin guide](https://github.com/alexisbeaulieu97/untaped/blob/main/docs/plugins.md)
 - [Contributing](CONTRIBUTING.md) and [security reporting](SECURITY.md)
@@ -66,10 +67,10 @@ while readiness, delivery, and structural mutations fail closed.
 
 ## Release and self-adoption gate
 
-Release publication and self-adoption are separate gates. Self-adoption may
-begin only after `untaped-orchestration==0.1.0` is published, its fresh `uvx`
-smoke passes, and Alexis gives separate approval. Adoption uses the exact
-released pin in its own reviewed PR.
+Release publication and self-adoption are separate gates. Version `0.1.0` is
+released, its fresh `uvx` smoke passed, and self-adoption approved state is
+represented by the public decision-only store in this repository. Its CI uses
+the exact published pin; later repository adoptions require separate approval.
 
 Fleet rollout is staged: dry-run pilot, content cohort, empty-store cohort, and
 the private hub last. Every repository receives one separately reviewed

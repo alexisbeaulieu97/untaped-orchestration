@@ -11,10 +11,15 @@ Git-native typed task/decision store with bounded agent bootstrap output.
   imports come only from `untaped.api`.
 - The tool performs local validation and offline evidence normalization. It
   does not call Git, GitHub, PyPI, or another provider.
-- Do not add `.untaped/orchestration`, adoption workflows, migration manifests,
-  cohort state, or fleet-repository content on the implementation branch.
+- This repository owns one public decision-only local store under
+  `.untaped/orchestration/`; it contains no tasks, cohort state, child registry,
+  or fleet-repository content. Use the CLI with revision guards for canonical
+  mutations, and never use `--force-current` as an agent.
+- Generated views are generated human output: do not use them as tool input or
+  edit them directly. Run `check --local`, `fmt --check --local`, and
+  `render --check` after store changes.
 - Pushes, PRs, merges, workflow dispatches, releases, tags, publication,
-  environment changes, and self-adoption each require explicit approval.
+  environment changes, and later adoption work each require explicit approval.
 - Commits are unsigned (`--no-gpg-sign`).
 
 ## Module ownership
