@@ -59,21 +59,44 @@ def test_operator_docs_cover_store_output_recovery_privacy_and_rollout_contracts
         assert term in corpus
 
 
-def test_changelog_keeps_010_unreleased() -> None:
-    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "0.1.0" in changelog
-    assert "Unreleased" in changelog
-    assert "published" not in changelog.casefold()
-
-
-def test_reviewed_implementation_contracts_are_documented_without_releasing() -> None:
+def test_documented_adoption_commands_match_cli_scope() -> None:
     design = (REPO_ROOT / "docs/superpowers/specs/2026-07-09-orchestration-v1-design.md").read_text(
         encoding="utf-8"
     )
-    assert "Status: implemented; unreleased" in design
+    assert "untaped-orchestration check --local" in design
+    assert "untaped-orchestration fmt --check --local" in design
+    assert "untaped-orchestration render --check" in design
+    assert "render --check --local" not in design
+
+
+def test_changelog_records_010_release_date() -> None:
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## 0.1.0 (2026-07-15)" in changelog
+    assert "0.1.0 (Unreleased)" not in changelog
+
+
+def test_reviewed_implementation_contracts_use_durable_release_wording() -> None:
+    design = (REPO_ROOT / "docs/superpowers/specs/2026-07-09-orchestration-v1-design.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Status: implemented" in design
+    assert "Status: implemented; unreleased" not in design
     assert "Status: proposed, docs-only" not in design
     assert "does not authorize implementation" not in design
     assert "No implementation code belongs in the planning PR." not in design
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    cli = (REPO_ROOT / "docs/cli.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+    normalized_cli = " ".join(cli.split())
+    assert "Package-index availability is the source of truth" in normalized_readme
+    assert (
+        "Release availability is determined by package indexes and GitHub releases"
+        in normalized_cli
+    )
+    for content in (readme, cli):
+        assert "0.1.0 is implemented but unreleased" not in content
+        assert "Version 0.1.0 remains unreleased" not in content
 
     required_by_path = {
         "README.md": (

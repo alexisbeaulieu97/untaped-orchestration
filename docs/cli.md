@@ -71,16 +71,18 @@ a higher-precedence exit code.
 
 ## Release and rollout gates
 
-Version 0.1.0 remains unreleased until Alexis separately approves the release
-workflow dispatch. The workflow verifies the version and unused target before
-publication, validates internal dependency availability, smokes the exact local
-wheel, publishes with trusted publishing, retries a fresh published-wheel
-smoke, and creates a GitHub release only after the production smoke. A failed
-post-upload version may be burned and requires a patch bump.
+Release availability is determined by package indexes and GitHub releases, not
+this document. The 0.1.0 release workflow is approval-gated: it verifies the
+version and unused target before publication, validates internal dependency
+availability, smokes the exact local wheel, publishes with trusted publishing,
+retries a fresh published-wheel smoke, and creates a GitHub release only after
+the production smoke. A failed post-upload version may be burned and requires a
+patch bump.
 
-No self-store is allowed until `untaped-orchestration==0.1.0` is published, a
-fresh released-package smoke passes, and Alexis grants separate approval.
-Self-adoption then uses the exact released pin in its own reviewed PR.
+Self-adoption is a separate gate: it may begin only after
+`untaped-orchestration==0.1.0` is published, a fresh released-package smoke
+passes, and Alexis grants approval. It then uses the exact released pin in its
+own reviewed PR.
 
 Fleet adoption order is:
 

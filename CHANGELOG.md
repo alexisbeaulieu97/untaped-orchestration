@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (Unreleased)
+## 0.1.0 (2026-07-15)
 
 - Add strict TOML-front-matter task and decision stores with opaque Markdown
   bodies, explicit federation, deterministic generated views, and typed IDs.
