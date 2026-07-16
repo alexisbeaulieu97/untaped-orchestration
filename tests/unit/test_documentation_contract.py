@@ -86,6 +86,7 @@ def test_self_adoption_and_rollout_authority_are_current() -> None:
     assert "b5cb8187398af4fee52b720c6890129f602c33d8c8c44c38b646c5b45d18f3ce" in design
     assert "superseded-by-current-source" in design
     assert "045fed8bf1c240b8a93bd7a25389cfbe38f0bc8d" in design
+    assert "`untaped-apple-health` | Public repository, decision-only policy" in design
     for content in (readme, cli):
         assert "0.1.0" in content
         assert "self-adoption approved" in content

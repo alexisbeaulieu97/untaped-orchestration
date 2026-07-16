@@ -1325,7 +1325,7 @@ compatible range may be considered only after the schema and CLI stabilize.
 | `untaped-market` | Private repository, decision-only policy | 6 decisions | PR #6 on verified main; frozen source `cd792a03cf33625871ed176348a2120d85b21c42` |
 | `untaped-recipe` | Public, decision-only | 8 decisions | Frozen source `0fd6f8164329477f4627ba68987ed56ebea4ccb5` |
 | `untaped-workspace` | Public, decision-only | Empty initial store | Verified main |
-| `untaped-apple-health` | Private repository, decision-only policy | Empty initial store | Verified HTTPS `FETCH_HEAD` |
+| `untaped-apple-health` | Public repository, decision-only policy | Empty initial store | Verified HTTPS `FETCH_HEAD` |
 | `untaped-orchestration` | Public, decision-only | 6 selected tool architecture decisions | Released `0.1.0`; explicitly approved self-adoption represented here |
 
 The committed hub migration-input manifest owns full source hashes and exact
