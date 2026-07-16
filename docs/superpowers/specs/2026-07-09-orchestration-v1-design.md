@@ -1,7 +1,7 @@
 # Untaped Orchestration v1 — design specification
 
 Date: 2026-07-09
-Status: implemented; unreleased
+Status: implemented
 Repository: `alexisbeaulieu97/untaped-orchestration`
 Package and console command: `untaped-orchestration`
 Import package: `untaped_orchestration`
@@ -1287,7 +1287,7 @@ independent of that workspace manifest.
 Each adoption PR adds canonical store files, local views, concise store/root
 instructions, a stable `docs/decisions.md` pointer, exact ignore rules, and a
 dedicated read-only CI workflow running released `untaped-orchestration==0.1.0`
-with `check --local`, `fmt --check --local`, and `render --check --local`.
+with `check --local`, `fmt --check --local`, and `render --check`.
 
 The workflow invokes the released distribution directly:
 
@@ -1297,7 +1297,7 @@ uvx --python 3.14 --from 'untaped-orchestration==0.1.0' \
 uvx --python 3.14 --from 'untaped-orchestration==0.1.0' \
   untaped-orchestration fmt --check --local
 uvx --python 3.14 --from 'untaped-orchestration==0.1.0' \
-  untaped-orchestration render --check --local
+  untaped-orchestration render --check
 ```
 
 Every dedicated `.github/workflows/orchestration.yml` uses full-commit-SHA

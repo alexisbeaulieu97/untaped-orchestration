@@ -5,19 +5,19 @@ repository tasks and decisions. Canonical state is reviewable text under
 `.untaped/orchestration/`; agents use bounded queries and guarded mutations
 instead of loading or rewriting the store directly.
 
-Status: **0.1.0 is implemented but unreleased**. The repository does not
-contain a self-adoption store, and the commands below do not imply that a PyPI
-publication has happened.
+Status: **the 0.1.0 implementation is complete**. Package-index availability is
+the source of truth for installable releases; this document does not infer
+publication state from the repository contents.
 
 ## Install
 
-After the separately approved 0.1.0 release:
+For the released package:
 
 ```sh
 uv tool install untaped-orchestration
 ```
 
-For source evaluation before release:
+To evaluate the current source directly:
 
 ```sh
 uv tool install 'git+https://github.com/alexisbeaulieu97/untaped-orchestration.git'
@@ -66,11 +66,10 @@ while readiness, delivery, and structural mutations fail closed.
 
 ## Release and self-adoption gate
 
-Do not create `.untaped/orchestration` in this repository until
-`untaped-orchestration==0.1.0` is published, its fresh `uvx` smoke passes, and
-Alexis gives separate approval for self-adoption. Adoption is a later,
-separately reviewed PR using the exact released pin; it is not part of this
-implementation branch.
+Release publication and self-adoption are separate gates. Self-adoption may
+begin only after `untaped-orchestration==0.1.0` is published, its fresh `uvx`
+smoke passes, and Alexis gives separate approval. Adoption uses the exact
+released pin in its own reviewed PR.
 
 Fleet rollout is staged: dry-run pilot, content cohort, empty-store cohort, and
 the private hub last. Every repository receives one separately reviewed
