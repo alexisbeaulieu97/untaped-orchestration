@@ -834,9 +834,9 @@ git commit -m "feat: add guarded item mutations"
 
 - [ ] **Step 1: Write failing lifecycle and interruption matrices**
 
-Exercise every allowed/rejected transition, backlog `revisit_when`, one-time `started_at`, same-stage backlog trigger replacement, default last placement, explicit first/last/before/after anchors, current-parent assertion including explicit none, primary/store/anchor revision guards, blocked start and delivery under incomplete federation, and task review as an alias of the kind-aware curation acknowledge use case. Test generic acknowledge/snooze routing for both tasks and decisions without CLI kind inspection.
+Exercise every allowed/rejected transition, backlog `revisit_when`, one-time `started_at`, same-stage backlog trigger-only replacement with ignored last placement and refused first/before/after placement, default last placement for stage changes, explicit first/last/before/after anchors, current-parent assertion including explicit none, primary/store/anchor revision guards, blocked start and delivery under incomplete federation, and task review as an alias of the kind-aware curation acknowledge use case. Test generic acknowledge/snooze routing for both tasks and decisions without CLI kind inspection.
 
-Exercise all four close outcomes and preconditions; archive shape; body/field preservation; archive-before-active-delete ordering; duplicate active/archive detection; exact duplicate repair; ordinary acknowledgement replay after deletion; superseded successor-link-first order; predecessor/successor guards; exact final-state replay; and divergent refusal. Inject a stop after every rebalance, final move/transition primary fsync before stdout, successor-link, archive, delete, and final close fsync. Exact final move/transition state is replayed idempotently; a merely stale or divergent state still conflicts.
+Exercise all four close outcomes and preconditions; archive shape; body/field preservation; archive-before-active-delete ordering; duplicate active/archive detection; exact duplicate repair; ordinary acknowledgement replay after deletion; superseded successor-link-first order; predecessor/successor guards; exact close final-state replay; and divergent refusal. Inject a stop after every rebalance, final move/transition primary fsync before stdout, successor-link, archive, delete, and final close fsync. An old stale move/transition request always conflicts because overwritten source rank/timestamp state cannot be proven from hashes without a journal or source snapshot. After rereading, fresh full guards against an exact final target return an `applied=false`, `replayed=false` idempotent no-op.
 
 - [ ] **Step 2: Run lifecycle tests and confirm they fail before services exist**
 
@@ -864,8 +864,9 @@ ordered locks while writing only the selected store. Validate every guard,
 compute and validate the complete intended result, execute a rank rebalance
 fully before the final primary replacement, render selected-store views, and
 expose changed/intended paths plus current revisions. Fresh guards are required
-unless the service proves an exact accepted final move, transition, or close
-state after acknowledgement loss.
+for move and transition recovery; an already exact target is a guarded no-op.
+Close may reuse old guards only when reverse projection proves an exact accepted
+archive/successor/base-store state after acknowledgement loss.
 
 - [ ] **Step 4: Prove every accepted intermediate state remains safe**
 
@@ -895,7 +896,16 @@ git commit -m "feat: implement task lifecycle recovery"
 
 - [ ] **Step 1: Write failing lifecycle, pin-order, and replay tests**
 
-Cover active/superseded/retired derivation, state-by-command mutation matrix, one successor per predecessor, multi-predecessor consolidation, same-store/kind requirements, retired-vs-superseded exclusion, required retirement note, predecessor and store guards, exact successor reuse after interruption, divergent incoming successor refusal, linked-successor-before-pins ordering, retirement-fields-before-pin-removal ordering, earliest-predecessor pin placement, unrelated pin order, duplicate removal, inactive-pin diagnostics, and acknowledgement loss after final fsync.
+Cover active/superseded/retired derivation, state-by-command mutation matrix,
+one successor per predecessor, order-independent multi-predecessor
+consolidation, same-store/kind requirements, retired-vs-superseded exclusion,
+required retirement note, predecessor and store guards, exact successor reuse
+only before pin replacement, stale-old-guard refusal after pin replacement,
+fresh-guard final no-op, divergent successor content/evidence/set refusal,
+linked-successor-before-pins ordering, retirement-fields-before-pin-removal
+ordering, earliest-predecessor pin placement, unrelated pin order, duplicate
+removal, inactive-pin diagnostics, acknowledgement loss after final fsync, and
+bounded recognition with a large predecessor set.
 
 - [ ] **Step 2: Run focused tests and observe missing decision service**
 
@@ -912,8 +922,13 @@ class DecisionService:
 Recognize only exact accepted phases from design section 12.2. The service
 validates the complete federated final snapshot before the first selected-store
 write, writes the successor or retirement fields first, then replaces
-`store.toml` pins, renders views through the shared finalizer, and returns
-replay only after proving the requested final content and predecessor set.
+`store.toml` pins and renders views through the shared finalizer. Supersede
+old-guard recovery is limited to the successor-only phase; after pin rewrite,
+destroyed pin history is not brute-forced from the one-way hash. A reread with
+fresh full guards may accept the exact final state as an idempotent no-op that
+observes but does not write derived views; stale views remain explicit for
+`render --write`.
+Retirement retains bounded reverse projection for its one known removed pin.
 
 - [ ] **Step 4: Run decision, validation, and fault suites**
 
@@ -960,7 +975,10 @@ loader.
 Extend maintenance with default recursive `check`, `check --local`, warning-only
 missing children, `--require-children` promotion, all invalid children in one
 report, recursive read-only `fmt --check`, local-only `fmt --write`, and
-always-local render. Prove recursive check never renders or writes a child.
+always-local render. Recursive check may render expected child view bytes purely
+in memory for byte-exact comparison, but it never writes or reconciles child
+views; `render --write` remains selected-local. Prove recursive check never
+writes a child.
 
 For queries, pin deterministic list filters including `--waiting-on`, parsed
 show/history-show recursive defaults plus `--local`, selected-store-only raw
@@ -1180,11 +1198,14 @@ git commit -m "feat: expose orchestration CLI contracts"
 
 Assert the packaged skill contains and operationalizes all eleven section-14 rules, uses `brief --format json` first, reuses caller-stable IDs, passes guards, forbids agents from `--force-current`, generated-view reads/edits, public tasks, and fail-open readiness. Assert README/docs link the design, file format, recovery procedure, SDK plugin guide, install commands, and explicit post-release self-adoption gate.
 
-Installed-wheel tests must build the current checkout into a fresh temporary
-artifact directory, create a fresh virtual environment from that exact wheel,
-and verify help, exact version, init, check, fmt check, render check, packaged
-skill, `py.typed`, and exclusion of repository `.untaped/` state. The fixture
-must never reuse a pre-existing `dist/` artifact.
+Package tests must build the current checkout into a fresh temporary artifact
+directory outside `dist/`, never select a stale `dist/` artifact, and audit the
+exact wheel and sdist metadata, contents, RECORD, packaged skill, `py.typed`,
+and repository-state exclusions offline. The default run reports exactly one
+explicit isolated-install skip. PR CI sets `UNTAPED_ISOLATED_WHEEL_TEST=1` so
+that test resolves dependencies normally, installs the exact fresh wheel into
+a clean environment outside the checkout, and verifies help, exact version,
+init, check, fmt check, and render check without development-site leakage.
 
 Copy the canonical release workflow and contract test from core commit
 `80bb8411cd0017f3e0cde818656aaf6fd0233368`, changing only distribution,
@@ -1231,9 +1252,10 @@ git diff --check
 git status --short
 ```
 
-Then install that just-built wheel into a fresh Python 3.14 environment and
-repeat the console smoke. Review coverage misses as missing behavior rather
-than lowering the gate. Confirm no `TODO`, `TBD`, accidental stub
+Then independently audit the fresh external wheel/sdist. In the PR CI path,
+install that exact wheel with dependencies into a fresh Python 3.14 environment
+outside the checkout and repeat the console smoke. Review coverage misses as
+missing behavior rather than lowering the gate. Confirm no `TODO`, `TBD`, accidental stub
 `NotImplementedError`, journal/VCS/provider adapter, repository store, or
 untracked generated artifact remains.
 

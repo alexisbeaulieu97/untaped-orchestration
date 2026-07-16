@@ -1,0 +1,23 @@
+# Python bytecode and build output
+__pycache__/
+*.py[codz]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments and tool caches
+.venv/
+.uv-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local secrets and environment files
+.env
+.envrc
+
+# Editor noise
+.DS_Store

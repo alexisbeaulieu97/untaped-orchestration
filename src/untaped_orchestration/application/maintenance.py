@@ -1,0 +1,749 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+
+from untaped_orchestration.application.federation import FederationRead, FederationService
+from untaped_orchestration.application.import_operations import (
+    ImportConflict as ImportConflict,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportedRecord as ImportedRecord,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportRequest as ImportRequest,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportResult as ImportResult,
+)
+from untaped_orchestration.application.import_operations import (
+    ImportService as ImportService,
+)
+from untaped_orchestration.application.mutations import validate_selected_local
+from untaped_orchestration.application.ports import (
+    CanonicalFormatter,
+    FileReplacement,
+    LockManager,
+    StoreLocation,
+    StoreReader,
+    StoreWriter,
+    ViewRenderer,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairConflict as RepairConflict,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairFrontmatterRequest as RepairFrontmatterRequest,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairFrontmatterResult as RepairFrontmatterResult,
+)
+from untaped_orchestration.application.repair_operations import (
+    RepairService as RepairService,
+)
+from untaped_orchestration.application.results import (
+    CheckResult,
+    Completeness,
+    FederatedSnapshot,
+    ItemRevision,
+    MaintenanceResult,
+    MutationReceipt,
+    PathComparison,
+    StoreSnapshot,
+)
+from untaped_orchestration.application.scaffold import ShapeInspection, inspect_store_shape
+from untaped_orchestration.application.validation import validate_snapshot
+from untaped_orchestration.application.view_management import apply_views, view_comparisons
+from untaped_orchestration.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticError,
+    expected_diagnostic,
+    sort_diagnostics,
+)
+from untaped_orchestration.domain.models import Revision
+
+DEFAULT_LOCK_TIMEOUT = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class RecursiveCheckRequest:
+    location: StoreLocation
+    local: bool = False
+    require_children: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RecursiveFormatRequest:
+    location: StoreLocation
+    local: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StorePathComparison:
+    store_id: str | None
+    path: PurePosixPath
+    matches: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RecursiveCheckResult:
+    valid: bool
+    complete: bool
+    checks: tuple[CheckResult, ...]
+    diagnostics: tuple[Diagnostic, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RecursiveFormatResult:
+    comparisons: tuple[StorePathComparison, ...]
+    complete: bool
+    diagnostics: tuple[Diagnostic, ...]
+
+    @property
+    def matches(self) -> bool:
+        return not any(value.severity == "error" for value in self.diagnostics) and all(
+            value.matches for value in self.comparisons
+        )
+
+
+class InvalidStoreState(DiagnosticError):
+    def __init__(self, diagnostics: tuple[Diagnostic, ...], result: CheckResult) -> None:
+        self.diagnostics = diagnostics
+        self.result = result
+        super().__init__(diagnostics)
+        self.args = ("store state is invalid",)
+
+
+class RevisionConflict(DiagnosticError):
+    def __init__(self, message: str) -> None:
+        super().__init__(expected_diagnostic("ORC007", message, field="revision"))
+
+
+def _federated(snapshot: StoreSnapshot) -> FederatedSnapshot:
+    return FederatedSnapshot(snapshot, (snapshot,), Completeness())
+
+
+def _validate(snapshot: StoreSnapshot) -> tuple[Diagnostic, ...]:
+    return validate_snapshot(_federated(snapshot), require_children=True)
+
+
+def _invalid(diagnostics: tuple[Diagnostic, ...]) -> bool:
+    return any(value.severity == "error" for value in diagnostics)
+
+
+def _store_id(snapshot: StoreSnapshot) -> str | None:
+    if snapshot.store is not None:
+        return snapshot.store.id.root
+    if snapshot.registry is not None:
+        return snapshot.registry.store_id.root
+    return None
+
+
+def _invalid_result(
+    snapshot: StoreSnapshot,
+    diagnostics: tuple[Diagnostic, ...],
+) -> CheckResult:
+    return CheckResult(
+        store_id=_store_id(snapshot),
+        store_revision=snapshot.store_revision,
+        registry_revision=snapshot.registry_revision,
+        valid=False,
+        views_current=False,
+        diagnostics=diagnostics,
+    )
+
+
+def _shape_result(
+    reader: StoreReader,
+    location: StoreLocation,
+    inspection: ShapeInspection,
+) -> CheckResult:
+    administrative = reader.inspect_administrative(location)
+    return CheckResult(
+        store_id=administrative.store_id,
+        store_revision=None,
+        registry_revision=administrative.registry_revision,
+        valid=False,
+        views_current=False,
+        diagnostics=inspection.diagnostics,
+    )
+
+
+def _comparisons(
+    reader: StoreReader,
+    location: StoreLocation,
+    expected: dict[PurePosixPath, bytes],
+) -> tuple[PathComparison, ...]:
+    values = []
+    for path, content in expected.items():
+        try:
+            matches = reader.read_file(location, path).content == content
+        except FileNotFoundError:
+            matches = False
+        values.append(PathComparison(path, matches))
+    return tuple(values)
+
+
+def _receipt(
+    snapshot: StoreSnapshot,
+    *,
+    intended: tuple[PurePosixPath, ...],
+    changed: tuple[PurePosixPath, ...],
+    canonical_applied: bool,
+    views_current: bool,
+) -> MutationReceipt:
+    return MutationReceipt(
+        applied=bool(changed),
+        replayed=False,
+        canonical_applied=canonical_applied,
+        views_current=views_current,
+        intended_paths=intended,
+        changed_paths=changed,
+        item_revisions=tuple(
+            ItemRevision(value.path, value.revision) for value in snapshot.records
+        ),
+        store_revision=snapshot.store_revision,
+        registry_revision=snapshot.registry_revision,
+    )
+
+
+class CheckStore:
+    def __init__(
+        self,
+        reader: StoreReader,
+        locks: LockManager,
+        views: ViewRenderer,
+        *,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+    ) -> None:
+        self._reader = reader
+        self._locks = locks
+        self._views = views
+        self._lock_timeout = lock_timeout
+
+    def execute(self, location: StoreLocation) -> CheckResult:
+        with self._locks.acquire((location,), timeout=self._lock_timeout):
+            inspection = inspect_store_shape(self._reader, location)
+            if not inspection.load_safe:
+                return _shape_result(self._reader, location, inspection)
+            snapshot = self._reader.load_local(location, headers_only=False)
+            semantic_diagnostics = _validate(snapshot)
+            diagnostics = list(semantic_diagnostics)
+            diagnostics.extend(inspection.diagnostics)
+            view_matches = False
+            if snapshot.store is not None and not _invalid(tuple(diagnostics)):
+                _, managed = view_comparisons(self._reader, location, self._views, snapshot)
+                view_matches = all(managed.values())
+                for path, matches in managed.items():
+                    if not matches:
+                        diagnostics.append(
+                            Diagnostic(
+                                code="ORC008",
+                                severity="error",
+                                path=path.as_posix(),
+                                field="",
+                                message="generated view is missing, stale, or inapplicable",
+                                hint="Run render --write to reconcile the managed view set.",
+                            )
+                        )
+            ordered = sort_diagnostics(diagnostics)
+            return CheckResult(
+                store_id=_store_id(snapshot),
+                store_revision=snapshot.store_revision,
+                registry_revision=snapshot.registry_revision,
+                valid=not _invalid(ordered),
+                views_current=view_matches,
+                diagnostics=ordered,
+            )
+
+
+class RenderStore:
+    def __init__(
+        self,
+        reader: StoreReader,
+        writer: StoreWriter,
+        locks: LockManager,
+        views: ViewRenderer,
+        *,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._locks = locks
+        self._views = views
+        self._lock_timeout = lock_timeout
+
+    def check(
+        self,
+        location: StoreLocation,
+        *,
+        validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
+    ) -> MaintenanceResult:
+        return self._execute(
+            location,
+            write=False,
+            validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
+        )
+
+    def write(
+        self,
+        location: StoreLocation,
+        *,
+        validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
+    ) -> MaintenanceResult:
+        return self._execute(
+            location,
+            write=True,
+            validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
+        )
+
+    def _execute(
+        self,
+        location: StoreLocation,
+        *,
+        write: bool,
+        validation_snapshot: FederatedSnapshot | None,
+        selected_local_validation: bool,
+    ) -> MaintenanceResult:
+        with self._locks.acquire((location,), timeout=self._lock_timeout):
+            inspection = inspect_store_shape(self._reader, location)
+            if inspection.diagnostics:
+                raise InvalidStoreState(
+                    inspection.diagnostics,
+                    _shape_result(self._reader, location, inspection),
+                )
+            snapshot = self._reader.load_local(location, headers_only=False)
+            diagnostics = (
+                _validate(snapshot)
+                if validation_snapshot is None
+                else (
+                    validate_selected_local(validation_snapshot)
+                    if selected_local_validation
+                    else validate_snapshot(validation_snapshot, require_children=False)
+                )
+            )
+            if _invalid(diagnostics):
+                raise InvalidStoreState(diagnostics, _invalid_result(snapshot, diagnostics))
+            expected, managed = view_comparisons(self._reader, location, self._views, snapshot)
+            intended = tuple(
+                path
+                for path in self._views.managed_paths()
+                if path in expected or not managed[path]
+            )
+            if write:
+                state = apply_views(self._reader, self._writer, location, self._views, snapshot)
+                changed = state.changed_paths
+                views_current = state.current
+                result_comparisons = state.comparisons
+            else:
+                changed = ()
+                views_current = all(managed.values())
+                result_comparisons = tuple(
+                    PathComparison(path, matches) for path, matches in managed.items()
+                )
+            return MaintenanceResult(
+                _receipt(
+                    snapshot,
+                    intended=intended,
+                    changed=changed,
+                    canonical_applied=False,
+                    views_current=views_current,
+                ),
+                result_comparisons,
+                diagnostics,
+            )
+
+
+class FormatStore:
+    def __init__(
+        self,
+        reader: StoreReader,
+        writer: StoreWriter,
+        locks: LockManager,
+        views: ViewRenderer,
+        formatter: CanonicalFormatter,
+        *,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._locks = locks
+        self._views = views
+        self._formatter = formatter
+        self._lock_timeout = lock_timeout
+
+    def check(
+        self,
+        location: StoreLocation,
+        *,
+        validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
+    ) -> MaintenanceResult:
+        return self._execute(
+            location,
+            write=False,
+            expected_store_revision=None,
+            validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
+        )
+
+    def write(
+        self,
+        location: StoreLocation,
+        *,
+        expected_store_revision: Revision | str,
+        validation_snapshot: FederatedSnapshot | None = None,
+        selected_local_validation: bool = False,
+    ) -> MaintenanceResult:
+        return self._execute(
+            location,
+            write=True,
+            expected_store_revision=(
+                expected_store_revision
+                if isinstance(expected_store_revision, Revision)
+                else Revision(expected_store_revision)
+            ),
+            validation_snapshot=validation_snapshot,
+            selected_local_validation=selected_local_validation,
+        )
+
+    def _execute(
+        self,
+        location: StoreLocation,
+        *,
+        write: bool,
+        expected_store_revision: Revision | None,
+        validation_snapshot: FederatedSnapshot | None,
+        selected_local_validation: bool,
+    ) -> MaintenanceResult:
+        with self._locks.acquire((location,), timeout=self._lock_timeout):
+            inspection = inspect_store_shape(self._reader, location)
+            if inspection.diagnostics:
+                raise InvalidStoreState(
+                    inspection.diagnostics,
+                    _shape_result(self._reader, location, inspection),
+                )
+            snapshot = self._reader.load_local(location, headers_only=False)
+            diagnostics = (
+                _validate(snapshot)
+                if validation_snapshot is None
+                else (
+                    validate_selected_local(validation_snapshot)
+                    if selected_local_validation
+                    else validate_snapshot(validation_snapshot, require_children=False)
+                )
+            )
+            if _invalid(diagnostics) or snapshot.store is None or snapshot.registry is None:
+                raise InvalidStoreState(diagnostics, _invalid_result(snapshot, diagnostics))
+            if (
+                expected_store_revision is not None
+                and snapshot.store_revision != expected_store_revision
+            ):
+                raise RevisionConflict("store revision guard does not match current state")
+
+            expected: dict[PurePosixPath, bytes] = {
+                PurePosixPath("store.toml"): self._formatter.store_bytes(snapshot.store),
+                PurePosixPath("registry.toml"): self._formatter.registry_bytes(snapshot.registry),
+            }
+            for record in snapshot.records:
+                assert record.body is not None
+                expected[record.path] = self._formatter.item_bytes(record.metadata, record.body)
+            comparisons = _comparisons(self._reader, location, expected)
+            changed: list[PurePosixPath] = []
+            if write:
+                for comparison in comparisons:
+                    if not comparison.matches:
+                        self._writer.replace(
+                            location, FileReplacement(comparison.path, expected[comparison.path])
+                        )
+                        changed.append(comparison.path)
+
+            canonical_changed = bool(changed)
+            after = self._reader.load_local(location, headers_only=False) if changed else snapshot
+            intended = list(expected)
+            if write:
+                view_state = apply_views(self._reader, self._writer, location, self._views, after)
+                intended.extend(view_state.intended_paths)
+                changed.extend(view_state.changed_paths)
+                views_current = view_state.current
+            else:
+                try:
+                    _, managed = view_comparisons(self._reader, location, self._views, after)
+                    views_current = all(managed.values())
+                except DiagnosticError:
+                    raise
+                except OSError, ValueError:
+                    views_current = False
+            result_comparisons = (
+                tuple(PathComparison(path, True) for path in expected) if write else comparisons
+            )
+            return MaintenanceResult(
+                _receipt(
+                    after,
+                    intended=tuple(intended),
+                    changed=tuple(changed),
+                    canonical_applied=canonical_changed,
+                    views_current=views_current,
+                ),
+                result_comparisons,
+                diagnostics,
+            )
+
+
+class RecursiveMaintenanceService:
+    """Coordinates recursive read-only maintenance while keeping writes selected-local."""
+
+    def __init__(
+        self,
+        federation: FederationService,
+        reader: StoreReader,
+        formatter: CanonicalFormatter,
+        views: ViewRenderer,
+        *,
+        local_formatter: FormatStore | None = None,
+        local_renderer: RenderStore | None = None,
+    ) -> None:
+        self._federation = federation
+        self._reader = reader
+        self._formatter = formatter
+        self._views = views
+        self._local_formatter = local_formatter
+        self._local_renderer = local_renderer
+
+    def _child_views_current(self, store: StoreSnapshot) -> bool:
+        if store.store is None:
+            return False
+        try:
+            _, managed = view_comparisons(
+                self._reader,
+                store.location,
+                self._views,
+                store,
+            )
+            return all(managed.values())
+        except DiagnosticError:
+            raise
+        except OSError, ValueError:
+            return False
+
+    @staticmethod
+    def _local_diagnostics(store: StoreSnapshot) -> tuple[Diagnostic, ...]:
+        local = FederatedSnapshot(store, (store,), Completeness())
+        return validate_snapshot(local, require_children=False)
+
+    def check(self, request: RecursiveCheckRequest) -> RecursiveCheckResult:
+        return self._federation.run(
+            request.location,
+            local=request.local,
+            action=lambda lease: self._check_loaded(request, lease),
+        )
+
+    def _check_loaded(
+        self,
+        request: RecursiveCheckRequest,
+        lease: FederationRead,
+    ) -> RecursiveCheckResult:
+        snapshot = lease.snapshot
+        if lease.reader is None:
+            unavailable = sort_diagnostics(snapshot.completeness.diagnostics)
+            return RecursiveCheckResult(False, False, (), unavailable)
+        diagnostics = list(validate_snapshot(snapshot, require_children=request.require_children))
+        selected_views_current = False
+        if snapshot.selected.store is not None and not any(
+            value.severity == "error" for value in snapshot.selected.load_diagnostics
+        ):
+            try:
+                _, managed = view_comparisons(
+                    self._reader,
+                    snapshot.selected.location,
+                    self._views,
+                    snapshot.selected,
+                )
+                selected_views_current = all(managed.values())
+                for path, matches in managed.items():
+                    if not matches:
+                        diagnostics.append(
+                            Diagnostic(
+                                code="ORC008",
+                                severity="error",
+                                path=path.as_posix(),
+                                field="",
+                                message="generated view is missing, stale, or inapplicable",
+                                hint="Run render --write locally in the selected store.",
+                            )
+                        )
+            except DiagnosticError:
+                raise
+            except OSError, ValueError:
+                selected_views_current = False
+        checks = []
+        for store in snapshot.stores:
+            local_diagnostics = list(self._local_diagnostics(store))
+            selected_store = store.location.real_root == snapshot.selected.location.real_root
+            views_current = (
+                selected_views_current if selected_store else self._child_views_current(store)
+            )
+            if not views_current:
+                local_diagnostics.append(
+                    Diagnostic(
+                        code="ORC008",
+                        severity="error",
+                        path=(store.location.root / "views").as_posix(),
+                        field="",
+                        message="generated views are missing or stale",
+                        hint="Run render --write locally in this store.",
+                    )
+                )
+            local_ordered = sort_diagnostics(local_diagnostics)
+            checks.append(
+                CheckResult(
+                    _store_id(store),
+                    store.store_revision,
+                    store.registry_revision,
+                    not any(value.severity == "error" for value in local_ordered),
+                    views_current,
+                    local_ordered,
+                )
+            )
+        ordered = sort_diagnostics(diagnostics)
+        return RecursiveCheckResult(
+            not any(value.severity == "error" for value in ordered)
+            and all(value.valid for value in checks),
+            True if request.local else snapshot.completeness.complete,
+            tuple(checks),
+            ordered,
+        )
+
+    def fmt_check(self, request: RecursiveFormatRequest) -> RecursiveFormatResult:
+        return self._federation.run(
+            request.location,
+            local=request.local,
+            action=lambda lease: self._fmt_loaded(request, lease),
+        )
+
+    def _fmt_loaded(
+        self,
+        request: RecursiveFormatRequest,
+        lease: FederationRead,
+    ) -> RecursiveFormatResult:
+        snapshot = lease.snapshot
+        if lease.reader is None:
+            return RecursiveFormatResult(
+                (),
+                False,
+                sort_diagnostics(snapshot.completeness.diagnostics),
+            )
+        diagnostics = (
+            validate_selected_local(snapshot)
+            if request.local
+            else validate_snapshot(snapshot, require_children=False)
+        )
+        comparisons: list[StorePathComparison] = []
+        stores = (snapshot.selected,) if request.local else snapshot.stores
+        for store in stores:
+            if store.store is None or store.registry is None:
+                continue
+            expected = {
+                PurePosixPath("store.toml"): self._formatter.store_bytes(store.store),
+                PurePosixPath("registry.toml"): self._formatter.registry_bytes(store.registry),
+            }
+            for record in store.records:
+                body = lease.reader.read_item_body(store.location, record.path)
+                expected[record.path] = self._formatter.item_bytes(record.metadata, body)
+            store_id = _store_id(store)
+            comparisons.extend(
+                StorePathComparison(store_id, value.path, value.matches)
+                for value in _comparisons(self._reader, store.location, expected)
+            )
+        return RecursiveFormatResult(
+            tuple(comparisons),
+            True if request.local else snapshot.completeness.complete,
+            diagnostics,
+        )
+
+    def fmt_write(
+        self,
+        request: RecursiveFormatRequest,
+        *,
+        expected_store_revision: Revision | str | None,
+    ) -> MaintenanceResult:
+        if not request.local:
+            raise ValueError("fmt --write requires local mode")
+        if expected_store_revision is None:
+            raise ValueError("fmt --write requires a store revision")
+        if self._local_formatter is None:
+            raise RuntimeError("local formatter was not configured")
+        return self._federation.run(
+            request.location,
+            local=True,
+            action=lambda lease: self._fmt_write_locked(
+                request,
+                expected_store_revision,
+                lease,
+            ),
+        )
+
+    def _fmt_write_locked(
+        self,
+        request: RecursiveFormatRequest,
+        expected_store_revision: Revision | str,
+        lease: FederationRead,
+    ) -> MaintenanceResult:
+        if lease.reader is None:
+            raise InvalidStoreState(
+                sort_diagnostics(lease.snapshot.completeness.diagnostics),
+                _invalid_result(
+                    lease.snapshot.selected,
+                    sort_diagnostics(lease.snapshot.completeness.diagnostics),
+                ),
+            )
+        assert self._local_formatter is not None
+        return self._local_formatter.write(
+            request.location,
+            expected_store_revision=expected_store_revision,
+            validation_snapshot=lease.snapshot,
+            selected_local_validation=True,
+        )
+
+    def render_check(self, location: StoreLocation) -> MaintenanceResult:
+        if self._local_renderer is None:
+            raise RuntimeError("local renderer was not configured")
+        return self._federation.run(
+            location,
+            local=True,
+            action=lambda lease: self._render_locked(location, lease, write=False),
+        )
+
+    def render_write(self, location: StoreLocation) -> MaintenanceResult:
+        if self._local_renderer is None:
+            raise RuntimeError("local renderer was not configured")
+        return self._federation.run(
+            location,
+            local=True,
+            action=lambda lease: self._render_locked(location, lease, write=True),
+        )
+
+    def _render_locked(
+        self,
+        location: StoreLocation,
+        lease: FederationRead,
+        *,
+        write: bool,
+    ) -> MaintenanceResult:
+        if lease.reader is None:
+            diagnostics = sort_diagnostics(lease.snapshot.completeness.diagnostics)
+            raise InvalidStoreState(
+                diagnostics,
+                _invalid_result(lease.snapshot.selected, diagnostics),
+            )
+        assert self._local_renderer is not None
+        method = self._local_renderer.write if write else self._local_renderer.check
+        return method(
+            location,
+            validation_snapshot=lease.snapshot,
+            selected_local_validation=True,
+        )

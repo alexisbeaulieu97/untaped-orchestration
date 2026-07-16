@@ -1,7 +1,7 @@
 # Untaped Orchestration v1 — design specification
 
 Date: 2026-07-09
-Status: proposed, docs-only
+Status: implemented; unreleased
 Repository: `alexisbeaulieu97/untaped-orchestration`
 Package and console command: `untaped-orchestration`
 Import package: `untaped_orchestration`
@@ -20,8 +20,9 @@ roadmap gate. The SDK prerequisite is satisfied by `untaped==3.1.0`, core commit
 `80bb841`, and GitHub release/tag `v3.1.0`.
 
 The design was previously approved in conversation and pressure-tested before
-repository creation. This document is the owning-repository contract. It does
-not authorize implementation, publication, or fleet migration.
+repository creation. This document is the owning-repository contract and now
+describes the reviewed implementation. It does not authorize publication,
+self-adoption, or fleet migration.
 
 ### 1.1 Goals
 
@@ -463,8 +464,10 @@ transitions. Entering a new stage places the item last unless relative
 placement is supplied, clears `revisit_when` except in backlog, and does not
 alter `review_on`. `task transition --to backlog --revisit-when TEXT` is also
 the only allowed same-stage transition and replaces the backlog trigger;
-update cannot write that lifecycle-owned field. Other same-stage changes use
-update, move, or review commands.
+last placement (the CLI default) is ignored, while first/before/after placement
+is refused. It never changes rank. Update cannot write that
+lifecycle-owned field. Other same-stage changes use update, move, or review
+commands.
 
 ### 5.4 Curation
 
@@ -549,10 +552,25 @@ Allowed decision mutations by derived state:
 | `evidence remove`, generic link add/remove | Allowed | Refused |
 | `decision supersede` / `decision retire` | Allowed | Refused |
 
-Supersede retry with the same predecessor set and ruling content reuses one
-already-written exact successor before finishing pin maintenance; a divergent
-incoming successor refuses recovery. Retire retry accepts the same already
-written retirement fields only to finish pin removal.
+Predecessors are a set for successor identity: request order does not affect
+the canonical successor links or exact-content comparison. Supersede retry
+with the same predecessor set and ruling content reuses one already-written
+exact successor only while the original pin list is still durable, then
+finishes pin maintenance; a divergent incoming successor refuses recovery.
+Once pin replacement is durable, the old store guard conflicts because the
+original pinned predecessor subset and order were destroyed and cannot be
+reconstructed from a one-way store hash. After rereading, fresh full guards on
+the exact successor/predecessor set and a final pin list containing no
+predecessor IDs return an `applied=false`, `replayed=false` no-op. The successor
+may be pinned or unpinned in that caller-accepted final state. Retire retry
+accepts the same already written retirement fields to finish pin removal or
+replay the final state; its one known removed pin has at most eleven prior
+positions, so exact reverse projection remains bounded.
+
+This fresh-final no-op observes and reports whether derived views are current
+but does not write them; a stale view remains `views_current=false` and is
+repaired explicitly with `render --write`. This preserves the promised
+`applied=false` result after acknowledgement loss.
 
 ## 7. Relations and graph safety
 
@@ -749,6 +767,12 @@ check is the only create path allowed to precede an otherwise-stale store
 revision conflict. For other stale-guard mutations,
 the caller rereads current state/revisions before choosing whether to retry;
 the tool never treats an unprovable stale revision as successful.
+In particular, a completed move or transition may have overwritten its source
+rank or generated timestamp, which cannot be reconstructed from one-way item
+and store hashes. V1 therefore rejects the old stale request rather than adding
+a journal or caller-supplied source snapshot. After rereading, a request with
+fresh item/store/current-parent/anchor guards whose target and placement are
+already exact succeeds as an `applied=false`, `replayed=false` no-op.
 
 Typed ownership:
 
@@ -797,9 +821,19 @@ preserves the SDK Pipe v1 envelope exactly, one NDJSON object per line:
 {"untaped":"1","kind":"orchestration.task","record":{"id":"tsk_..."}}
 ```
 
-Kinds are `orchestration.store`, `.task`, `.decision`, `.evidence`, and
-`.diagnostic`; `record` contains command data or the structured diagnostic.
-Pipe ignores columns. Raw output defaults its first field to stable ID;
+Kinds are `orchestration.store`, `.task`, `.decision`, `.evidence`,
+`.diagnostic`, and `.status`; `record` contains command data, a structured
+diagnostic, or the stream status. Every successful or expected-failure Pipe
+stream ends with exactly one status trailer:
+
+```json
+{"untaped":"1","kind":"orchestration.status","record":{"complete":true,"truncated":false}}
+```
+
+Data records appear first in stable order, followed by real canonical
+diagnostic records in stable order, followed by the status trailer. The tool
+never synthesizes or recodes a diagnostic to communicate stream status. Pipe
+ignores columns. Raw output defaults its first field to stable ID;
 repeatable `--columns FIELD`/`-c FIELD` controls additions and supports the
 SDK's dotted paths.
 
@@ -909,8 +943,9 @@ Format availability is command-specific:
 Every unlisted format/command combination is a usage error with exit 2. In
 particular, `brief`, `trace`, init, mutations, check, fmt, render, import, and
 repair reject `pipe` and row-projection `raw`; their compound result shapes
-use only table or JSON. Pipe kinds therefore remain limited to the five kinds
-in section 10.4 and never invent a receipt or brief kind. `id new --format raw`
+use only table or JSON. Pipe kinds therefore remain limited to the six kinds
+in section 10.4 and never invent a receipt or brief kind; `.status` is the
+mandatory stream trailer, not a command result kind. `id new --format raw`
 prints only the allocated ID; its table/JSON forms use the allocated-ID shape.
 
 `--before`/`--after` require `--if-anchor-revision`; other placements reject it.
@@ -1009,9 +1044,13 @@ use the fault-state protocol below.
   source. Superseded close writes the successor link first. An interruption
   can leave a semantically matched active/archive pair, never a missing task.
 - Decision supersession writes the linked successor before updating pins;
-  retirement writes the retirement fields before removing a pin. Retry accepts
-  an already-applied exact phase only when it matches the provided guarded
-  intent, then completes the remaining phase.
+  retirement writes the retirement fields before removing a pin. An old
+  supersede guard accepts only the exact successor-only phase, where deleting
+  the successor in projection reconstructs the complete guarded store, then
+  completes pin replacement from the still-original list. It never searches
+  possible destroyed pin histories or adds a journal, sidecar, hidden operation
+  ID, or caller source snapshot. Retirement retains its bounded exact reverse
+  projection because only one known pin can have been removed.
 - Rank rebalance uses the order-preserving protocol in section 5.2, finishes
   before the primary move/transition replacement, and is retryable from every
   replacement boundary with freshly read guards.
@@ -1022,10 +1061,10 @@ use the fault-state protocol below.
 |---|---|---|
 | Init | No anchor plus ignored lock/temp only; matching `store.toml` plus a prefix of exact scaffold; or complete scaffold before acknowledgement | Before the anchor, retry removes only its own validated temporary. `check` reports missing scaffold after the anchor; same-ID/config retry fills the exact remainder or returns complete state with `replayed=true`. Divergence refuses recovery. |
 | Task/decision create | The caller-stable ID is absent or one matching active item is fully durable | Retry with the same ID/inputs returns the existing item and `replayed=true`; mismatch or archived/inactive state conflicts. Fault injection includes final fsync before stdout. |
-| Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff, reread item/store revisions, rerun. Final target state is an idempotent success. |
+| Move or stage transition | Optional complete-scope same-order rebalance is partly/fully applied; primary parent/stage remain old while its rank may be old or neutral-rebalanced until the one final replacement | Store remains graph-valid and order-equivalent; inspect diff and reread item/store/anchor revisions. The old stale request conflicts. Rerun with fresh full guards; an already exact final target is an `applied=false`, `replayed=false` idempotent no-op. |
 | Ordinary close | Complete archive exists with matching active source, or the active source is gone and the archive is final but acknowledgement was lost | `check` reports a duplicate pair; guarded retry/`repair duplicate` removes only a match. Retry of the same outcome/note against the final archive returns it with `replayed=true`; divergent closure conflicts. |
 | Superseded close | Exact successor link may exist before the close pair, or the linked successor/final archive remain after active deletion but acknowledgement is lost | `check` reports a successor pointing at an active predecessor; reread both revisions and retry. When predecessor archive, successor link, outcome, and note exactly match the requested final state, retry returns `replayed=true`; every divergence conflicts. |
-| Decision supersede | One exact linked successor may exist before pin replacement, or successor/pins are final before acknowledgement | Inactive pin is reported; the same predecessor set/content reuses that successor and finishes deterministic pin replacement, or returns the final state with `replayed=true`. |
+| Decision supersede | One exact linked successor may exist before pin replacement; successor/pins may be final before acknowledgement, but the destroyed prior pin membership/order is not recoverable from the old hash | Inactive pin is reported during the successor-only phase; the same canonical predecessor set/content reuses that successor and finishes deterministic pin replacement. After pin replacement, the old stale request conflicts. Reread and pass fresh full guards: an exact successor/predecessor set with no predecessor IDs still pinned is an `applied=false`, `replayed=false` no-op, whether the successor is pinned or unpinned. |
 | Decision retire | Retirement fields may exist before pin removal, or retirement/pins are final before acknowledgement | Inactive pin is reported; same-note retry finishes removal or returns the final state with `replayed=true`. |
 | Import | Exact subset of the external manifest may exist | Generic `check` cannot infer intent; rerun the same manifest/`--if-clean`, which reconstructs the guarded base and writes the remainder. |
 | View render | Any subset of derived views may be stale after canonical success | `canonical_applied=true`, `views_current=false`; `render --write` replaces all applicable views deterministically. |
@@ -1372,8 +1411,14 @@ baseline measurement rather than inventing them in this specification.
 
 - Ruff, formatting, strict mypy, pytest, and `uv build --no-sources` pass.
 - Architecture test enforces inward imports.
-- Installed wheel verifies help/version/init/check/fmt/render.
-- Wheel contains `py.typed` and skill; excludes repository store.
+- Offline acceptance builds a fresh wheel and sdist outside `dist/`, audits
+  exact dependency metadata, WHEEL, entry points, RECORD integrity, packaged
+  skill, `py.typed`, and repository-state exclusions in both archives, and
+  reports exactly one explicit isolated-install skip.
+- PR CI sets `UNTAPED_ISOLATED_WHEEL_TEST=1`; that test resolves dependencies
+  normally into a fresh environment outside the checkout and verifies
+  help/version/init/check/fmt/render from the exact built wheel without
+  `PYTHONPATH`, editable installation, or development-site-package leakage.
 - TestPyPI/PyPI release follows explicit approvals and burn-once versioning.
 - Fresh `uvx` smoke proves the released package before any fleet pin.
 
@@ -1425,8 +1470,8 @@ Health cannot establish an HTTPS base, a source OID/hash changes, an adoption
 branch exists, coverage lacks a disposition, public stores leak unfinished
 tasks, or an external action lacks explicit approval.
 
-The fresh implementation plan is
-`docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md`. After
-this contract clarification and that companion plan are reviewed and merged,
-the only next action is a fresh implementation branch grounded in verified
-repository main. No implementation code belongs in the planning PR.
+The implementation plan remains recorded at
+`docs/superpowers/plans/2026-07-09-orchestration-v1-implementation.md`.
+Implementation completion does not advance the external gates: publication,
+self-adoption, and every fleet cohort still require their separately reviewed
+approvals and verified prerequisites.
