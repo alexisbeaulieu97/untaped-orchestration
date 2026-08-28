@@ -52,6 +52,7 @@ path = "{_relative(parent, child)}"
 
 
 ARCHIVED_TASK_ID = "tsk_019f0000000070008000000000000011"
+MISSING_TASK_ID = "tsk_019f0000000070008000000000000012"
 
 
 def _delivered_task_bytes() -> bytes:
@@ -338,6 +339,46 @@ def test_recursive_check_attributes_valid_cross_store_navigation_to_source_row(
     selected = next(value for value in result.checks if value.store_id == STORE_ID)
     assert selected.valid
     assert not any(value.code == "ORC004" for value in selected.diagnostics)
+
+
+@pytest.mark.integration
+def test_recursive_check_owns_overlapping_symlink_child_diagnostic_only_in_child_row(
+    tmp_path: Path,
+) -> None:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    parent.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
+    child.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
+    linked_child = parent / "linked-child"
+    linked_child.symlink_to(child, target_is_directory=True)
+    _registry(parent, linked_child)
+    task = child / "tasks" / f"{TASK_ID}-bad.md"
+    task.parent.mkdir()
+    task.write_bytes(
+        task_bytes().replace(
+            b"waiting_on = []\n+++",
+            (
+                "waiting_on = []\n\n"
+                "[[links]]\n"
+                'relation = "depends-on"\n'
+                f'target_store_id = "{CHILD_STORE_ID}"\n'
+                f'target = "{MISSING_TASK_ID}"\n'
+                "+++"
+            ).encode(),
+        )
+    )
+    _render_local(parent)
+    _render_local(child)
+
+    result = _service().check(RecursiveCheckRequest(location_from_root(parent)))
+
+    assert not result.valid
+    parent_check = next(value for value in result.checks if value.store_id == STORE_ID)
+    child_check = next(value for value in result.checks if value.store_id == CHILD_STORE_ID)
+    assert parent_check.valid
+    assert not any(value.code == "ORC004" for value in parent_check.diagnostics)
+    assert not child_check.valid
+    assert any(value.code == "ORC004" for value in child_check.diagnostics)
 
 
 @pytest.mark.integration

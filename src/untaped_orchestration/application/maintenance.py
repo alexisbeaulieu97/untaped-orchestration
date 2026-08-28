@@ -139,26 +139,40 @@ def _store_id(snapshot: StoreSnapshot) -> str | None:
     return None
 
 
-def _diagnostics_for_store(
-    store: StoreSnapshot,
+def _diagnostics_by_store(
+    stores: tuple[StoreSnapshot, ...],
     diagnostics: tuple[Diagnostic, ...],
-) -> tuple[Diagnostic, ...]:
-    root = store.location.root
-    local: list[Diagnostic] = []
+) -> tuple[tuple[Diagnostic, ...], ...]:
+    owned: list[list[Diagnostic]] = [[] for _ in stores]
     for diagnostic in diagnostics:
+        load_owner = next(
+            (
+                index
+                for index, store in enumerate(stores)
+                if any(value is diagnostic for value in store.load_diagnostics)
+            ),
+            None,
+        )
+        if load_owner is not None:
+            owned[load_owner].append(diagnostic)
+            continue
         if diagnostic.code == "ORC008":
             continue
-        if any(value is diagnostic for value in store.load_diagnostics):
-            local.append(diagnostic)
-            continue
         path = Path(diagnostic.path)
-        if path.is_absolute():
+        if not path.is_absolute():
+            continue
+        candidates = []
+        for index, store in enumerate(stores):
             try:
-                path.relative_to(root)
+                path.relative_to(store.location.root)
             except ValueError:
                 continue
-            local.append(diagnostic)
-    return sort_diagnostics(local)
+            candidates.append(
+                (len(store.location.root.parts), store.location.root.as_posix(), index)
+            )
+        if candidates:
+            owned[max(candidates)[2]].append(diagnostic)
+    return tuple(sort_diagnostics(value) for value in owned)
 
 
 def _invalid_result(
@@ -602,8 +616,9 @@ class RecursiveMaintenanceService:
             except OSError, ValueError:
                 selected_views_current = False
         checks = []
-        for store in snapshot.stores:
-            local_diagnostics = list(_diagnostics_for_store(store, tuple(diagnostics)))
+        diagnostics_by_store = _diagnostics_by_store(snapshot.stores, tuple(diagnostics))
+        for index, store in enumerate(snapshot.stores):
+            local_diagnostics = list(diagnostics_by_store[index])
             selected_store = store.location.real_root == snapshot.selected.location.real_root
             views_current = (
                 selected_views_current if selected_store else self._child_views_current(store)
