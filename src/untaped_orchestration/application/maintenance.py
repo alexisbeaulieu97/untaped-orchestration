@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from untaped_orchestration.application.federation import FederationRead, FederationService
 from untaped_orchestration.application.import_operations import (
@@ -124,7 +124,7 @@ def _federated(snapshot: StoreSnapshot) -> FederatedSnapshot:
 
 
 def _validate(snapshot: StoreSnapshot) -> tuple[Diagnostic, ...]:
-    return validate_snapshot(_federated(snapshot), require_children=True)
+    return validate_selected_local(_federated(snapshot))
 
 
 def _invalid(diagnostics: tuple[Diagnostic, ...]) -> bool:
@@ -137,6 +137,28 @@ def _store_id(snapshot: StoreSnapshot) -> str | None:
     if snapshot.registry is not None:
         return snapshot.registry.store_id.root
     return None
+
+
+def _diagnostics_for_store(
+    store: StoreSnapshot,
+    diagnostics: tuple[Diagnostic, ...],
+) -> tuple[Diagnostic, ...]:
+    root = store.location.root
+    local: list[Diagnostic] = []
+    for diagnostic in diagnostics:
+        if diagnostic.code == "ORC008":
+            continue
+        if any(value is diagnostic for value in store.load_diagnostics):
+            local.append(diagnostic)
+            continue
+        path = Path(diagnostic.path)
+        if path.is_absolute():
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            local.append(diagnostic)
+    return sort_diagnostics(local)
 
 
 def _invalid_result(
@@ -530,11 +552,6 @@ class RecursiveMaintenanceService:
         except OSError, ValueError:
             return False
 
-    @staticmethod
-    def _local_diagnostics(store: StoreSnapshot) -> tuple[Diagnostic, ...]:
-        local = FederatedSnapshot(store, (store,), Completeness())
-        return validate_snapshot(local, require_children=False)
-
     def check(self, request: RecursiveCheckRequest) -> RecursiveCheckResult:
         return self._federation.run(
             request.location,
@@ -551,7 +568,11 @@ class RecursiveMaintenanceService:
         if lease.reader is None:
             unavailable = sort_diagnostics(snapshot.completeness.diagnostics)
             return RecursiveCheckResult(False, False, (), unavailable)
-        diagnostics = list(validate_snapshot(snapshot, require_children=request.require_children))
+        diagnostics = list(
+            validate_selected_local(snapshot)
+            if request.local
+            else validate_snapshot(snapshot, require_children=request.require_children)
+        )
         selected_views_current = False
         if snapshot.selected.store is not None and not any(
             value.severity == "error" for value in snapshot.selected.load_diagnostics
@@ -582,7 +603,7 @@ class RecursiveMaintenanceService:
                 selected_views_current = False
         checks = []
         for store in snapshot.stores:
-            local_diagnostics = list(self._local_diagnostics(store))
+            local_diagnostics = list(_diagnostics_for_store(store, tuple(diagnostics)))
             selected_store = store.location.real_root == snapshot.selected.location.real_root
             views_current = (
                 selected_views_current if selected_store else self._child_views_current(store)

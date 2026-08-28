@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 (Unreleased)
+
+- Correct selected-local and recursive maintenance validation for cross-store
+  navigation, preserving unresolved-target warnings without fabricating archive
+  closure errors or invalidating valid source-store rows.
+
 ## 0.1.0 (2026-07-15)
 
 - Add strict TOML-front-matter task and decision stores with opaque Markdown

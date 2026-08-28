@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
+import tomllib
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -14,6 +17,7 @@ from tests.builders import (
     task_bytes,
     write_store,
 )
+from untaped_orchestration.__main__ import main
 from untaped_orchestration.application.federation import FederationService
 from untaped_orchestration.application.maintenance import (
     RecursiveCheckRequest,
@@ -22,6 +26,8 @@ from untaped_orchestration.application.maintenance import (
 )
 from untaped_orchestration.application.scaffold import AGENTS_BYTES
 from untaped_orchestration.cli.context import CliContext
+from untaped_orchestration.domain.models import ArchivedTask, TaskOutcome, TaskStage
+from untaped_orchestration.infrastructure.codec import CanonicalStoreFormatter
 from untaped_orchestration.infrastructure.filesystem import location_from_root
 from untaped_orchestration.infrastructure.locking import FileLockManager
 from untaped_orchestration.infrastructure.repository import FilesystemStoreRepository
@@ -43,6 +49,25 @@ path = "{_relative(parent, child)}"
 ''',
         encoding="utf-8",
     )
+
+
+ARCHIVED_TASK_ID = "tsk_019f0000000070008000000000000011"
+
+
+def _delivered_task_bytes() -> bytes:
+    _, frontmatter, body = task_bytes().split(b"+++\n", 2)
+    metadata = tomllib.loads(frontmatter.decode())
+    metadata.pop("stage")
+    metadata.update(
+        {
+            "id": ARCHIVED_TASK_ID,
+            "closed_from": TaskStage.PLANNED.value,
+            "outcome": TaskOutcome.DELIVERED.value,
+            "closed_at": "2026-07-10T01:02:03.004Z",
+            "close_note": "closed",
+        }
+    )
+    return CanonicalStoreFormatter().item_bytes(ArchivedTask.model_validate(metadata), body)
 
 
 class RecordingViews(MarkdownViewRenderer):
@@ -108,6 +133,40 @@ def _durable_files(root: Path) -> dict[Path, bytes]:
     }
 
 
+def _cross_store_navigation_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    parent = write_store(tmp_path / "parent", store_id=STORE_ID)
+    child = write_store(tmp_path / "child", store_id=CHILD_STORE_ID)
+    parent.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
+    child.joinpath("AGENTS.md").write_bytes(AGENTS_BYTES)
+    _registry(parent, child)
+    archive = parent / "archive" / "tasks" / f"{ARCHIVED_TASK_ID}-delivered.md"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(_delivered_task_bytes())
+    decision = child / "decisions" / f"{DECISION_ID}-ruling.md"
+    decision.parent.mkdir()
+    decision.write_bytes(decision_bytes())
+    task = parent / "tasks" / f"{TASK_ID}-task.md"
+    task.parent.mkdir()
+    task.write_bytes(
+        task_bytes()
+        .replace(b'stage = "inbox"\n', b'stage = "planned"\n')
+        .replace(
+            b"waiting_on = []\n+++",
+            (
+                "waiting_on = []\n\n"
+                "[[links]]\n"
+                'relation = "governed-by"\n'
+                f'target_store_id = "{CHILD_STORE_ID}"\n'
+                f'target = "{DECISION_ID}"\n'
+                "+++"
+            ).encode(),
+        )
+    )
+    _render_local(parent)
+    _render_local(child)
+    return parent, child
+
+
 @pytest.mark.integration
 def test_recursive_check_reports_all_invalid_children_but_missing_is_warning_by_default(
     tmp_path: Path,
@@ -139,6 +198,9 @@ def test_recursive_check_reports_all_invalid_children_but_missing_is_warning_by_
     required = _service().check(RecursiveCheckRequest(location, require_children=True))
     assert not required.valid
     assert {value.severity for value in required.diagnostics} == {"error"}
+    selected_required = next(value for value in required.checks if value.store_id == STORE_ID)
+    assert not selected_required.valid
+    assert any(value.code == "ORC005" for value in selected_required.diagnostics)
 
 
 @pytest.mark.integration
@@ -261,6 +323,152 @@ def test_local_fmt_and_render_validate_resolved_cross_store_navigation(tmp_path:
     )
     assert repaired.matches
     assert missing_context.maintenance().render_write(location).views_current
+
+
+@pytest.mark.integration
+def test_recursive_check_attributes_valid_cross_store_navigation_to_source_row(
+    tmp_path: Path,
+) -> None:
+    parent, _ = _cross_store_navigation_fixture(tmp_path)
+    location = location_from_root(parent)
+
+    result = _service().check(RecursiveCheckRequest(location))
+
+    assert result.valid
+    selected = next(value for value in result.checks if value.store_id == STORE_ID)
+    assert selected.valid
+    assert not any(value.code == "ORC004" for value in selected.diagnostics)
+
+
+@pytest.mark.integration
+def test_local_check_uses_selected_local_navigation_projection_with_delivered_archive(
+    tmp_path: Path,
+) -> None:
+    parent, _ = _cross_store_navigation_fixture(tmp_path)
+    location = location_from_root(parent)
+    context = CliContext.resolve(str(parent))
+
+    direct = context.check_store().execute(location)
+    assert direct.valid
+    assert any(
+        value.code == "ORC005" and value.severity == "warning" for value in direct.diagnostics
+    )
+    assert not any(value.code == "ORC004" for value in direct.diagnostics)
+
+    result = context.maintenance().check(RecursiveCheckRequest(location, local=True))
+
+    assert result.valid
+    assert result.complete
+    assert any(
+        value.code == "ORC005" and value.severity == "warning" for value in result.diagnostics
+    )
+    assert not any(value.code == "ORC004" for value in result.diagnostics)
+    assert not any(
+        value.code == "ORC006" and "delivered closure requires complete federation" in value.message
+        for value in result.diagnostics
+    )
+
+
+@pytest.mark.integration
+def test_local_fmt_and_render_ignore_navigation_incompleteness_for_delivered_archive(
+    tmp_path: Path,
+) -> None:
+    parent, _ = _cross_store_navigation_fixture(tmp_path)
+    location = location_from_root(parent)
+    context = CliContext.resolve(str(parent))
+
+    formatted = context.maintenance().fmt_check(RecursiveFormatRequest(location, local=True))
+    rendered = context.maintenance().render_check(location)
+
+    assert formatted.matches
+    assert rendered.matches
+    assert any(
+        value.code == "ORC005" and value.severity == "warning" for value in formatted.diagnostics
+    )
+    assert any(
+        value.code == "ORC005" and value.severity == "warning" for value in rendered.diagnostics
+    )
+    assert not any(value.code == "ORC006" for value in formatted.diagnostics)
+    assert not any(value.code == "ORC006" for value in rendered.diagnostics)
+
+
+@pytest.mark.integration
+def test_cli_local_check_fmt_and_render_accept_cross_store_navigation_with_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent, _ = _cross_store_navigation_fixture(tmp_path)
+
+    def invoke(*tokens: str) -> tuple[int, dict[str, object]]:
+        monkeypatch.setattr(
+            "sys.argv",
+            ["untaped-orchestration", *tokens, "--store", str(parent), "--format", "json"],
+        )
+        with pytest.raises(SystemExit) as raised:
+            main()
+        return raised.value.code, json.loads(capsys.readouterr().out)
+
+    check_code, check = invoke("check", "--local")
+    fmt_code, fmt = invoke("fmt", "--check", "--local")
+    render_code, render = invoke("render", "--check")
+
+    assert check_code == 0
+    assert fmt_code == 0
+    assert render_code == 0
+    for payload in (check, fmt):
+        diagnostics = payload["diagnostics"]
+        assert any(value["code"] == "ORC005" for value in diagnostics)
+        assert not any(
+            value["code"] == "ORC004" or value["code"] == "ORC006" for value in diagnostics
+        )
+    assert any(value["code"] == "ORC005" for value in render["diagnostics"])
+    assert not any(
+        value["code"] == "ORC004" or value["code"] == "ORC006" for value in render["diagnostics"]
+    )
+
+
+@pytest.mark.integration
+def test_local_maintenance_never_loads_or_locks_registered_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, child = _cross_store_navigation_fixture(tmp_path)
+    location = location_from_root(parent)
+    loaded_roots: list[Path] = []
+    locked_sets: list[tuple[Path, ...]] = []
+    original_load = FilesystemStoreRepository.load_local
+    original_acquire = FileLockManager.acquire
+
+    def tracked_load(self, store_location, *, headers_only):
+        loaded_roots.append(store_location.real_root)
+        return original_load(self, store_location, headers_only=headers_only)
+
+    @contextmanager
+    def tracked_acquire(self, locations, *, timeout):
+        locked_sets.append(tuple(value.real_root for value in locations))
+        with original_acquire(self, locations, timeout=timeout):
+            yield
+
+    monkeypatch.setattr(FilesystemStoreRepository, "load_local", tracked_load)
+    monkeypatch.setattr(FileLockManager, "acquire", tracked_acquire)
+    context = CliContext.resolve(str(parent))
+    store_location = location
+    revision = context.repository.load_local(store_location, headers_only=True).store_revision
+
+    context.maintenance().check(RecursiveCheckRequest(store_location, local=True))
+    context.maintenance().fmt_check(RecursiveFormatRequest(store_location, local=True))
+    context.maintenance().fmt_write(
+        RecursiveFormatRequest(store_location, local=True), expected_store_revision=revision
+    )
+    context.maintenance().render_check(store_location)
+    context.maintenance().render_write(store_location)
+
+    assert loaded_roots
+    assert set(loaded_roots) == {parent.resolve()}
+    assert locked_sets
+    assert all(lock_set == (parent.resolve(),) for lock_set in locked_sets)
+    assert child.resolve() not in loaded_roots
 
 
 @pytest.mark.integration

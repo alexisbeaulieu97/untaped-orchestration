@@ -105,7 +105,11 @@ def validate_selected_local(snapshot: FederatedSnapshot) -> tuple[Diagnostic, ..
         (snapshot.selected,),
         Completeness(incompleteness),
     )
-    return validate_snapshot(selected_only, require_children=False)
+    return validate_snapshot(
+        selected_only,
+        require_children=False,
+        require_complete_federation=False,
+    )
 
 
 def _valid_or_raise(

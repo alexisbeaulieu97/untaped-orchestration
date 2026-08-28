@@ -26,12 +26,14 @@ next` and recursive `fmt --check` preserve completeness, truncation, and
 ordered diagnostics in the top-level output contract.
 
 Federation is explicit in `registry.toml`. Reads recurse by default.
-`--local` is true-local: it selects only the chosen store and does not resolve
-or report registered children. Writes modify only the selected store, even
-when recursive validation locks and checks all resolved participants. Partial
-reads may return `complete=false`. `next`, readiness/delivery, and structural
-changes fail closed when required federation is incomplete. Public stores are
-decision-only; never place tasks in them.
+`--local` is true-local: it selects only the chosen store, does not load or
+lock registered children, and leaves cross-store `governed-by` and `follow-up-to`
+targets as ORC005 warnings because they are unresolved in the selected-local
+projection. Writes modify only the selected store, even when recursive
+validation locks and checks all resolved participants. Partial reads may return
+`complete=false`. `next`, readiness/delivery, and structural changes fail closed
+when required federation is incomplete. Public stores are decision-only; never
+place tasks in them.
 
 ## Output
 
