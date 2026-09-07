@@ -1,6 +1,6 @@
 [project]
 name = "untaped-orchestration"
-version = "0.1.0"
+version = "0.1.1"
 description = "Git-native typed orchestration for repository tasks and decisions."
 readme = "README.md"
 authors = [

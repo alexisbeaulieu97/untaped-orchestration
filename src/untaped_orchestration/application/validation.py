@@ -194,6 +194,7 @@ def validate_snapshot(
     snapshot: FederatedSnapshot,
     *,
     require_children: bool,
+    require_complete_federation: bool = True,
 ) -> tuple[Diagnostic, ...]:
     diagnostics: list[Diagnostic] = []
     for store in snapshot.stores:
@@ -204,7 +205,12 @@ def validate_snapshot(
         else:
             diagnostics.append(value)
     graph = _graph_state(snapshot)
-    diagnostics.extend(validate_graph(graph))
+    diagnostics.extend(
+        validate_graph(
+            graph,
+            require_complete_federation=require_complete_federation,
+        )
+    )
     diagnostics.extend(_policy_diagnostics(snapshot, graph))
     diagnostics.extend(_inactive_governance_diagnostics(graph))
     return sort_diagnostics(diagnostics)

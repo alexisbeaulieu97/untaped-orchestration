@@ -31,7 +31,7 @@ EXPECTED_REQUIREMENTS = (
 EXPECTED_METADATA_FIELDS = {
     "Metadata-Version": ("2.4",),
     "Name": ("untaped-orchestration",),
-    "Version": ("0.1.0",),
+    "Version": ("0.1.1",),
     "Summary": ("Git-native typed orchestration for repository tasks and decisions.",),
     "Author": ("Alexis Beaulieu",),
     "Author-email": ("Alexis Beaulieu <alexisbeaulieu97@gmail.com>",),
@@ -195,7 +195,7 @@ def test_metadata_contract_rejects_stable_header_or_body_corruption(
     replacement: bytes,
 ) -> None:
     with zipfile.ZipFile(built_artifacts.wheel) as archive:
-        raw = archive.read("untaped_orchestration-0.1.0.dist-info/METADATA")
+        raw = archive.read("untaped_orchestration-0.1.1.dist-info/METADATA")
     assert original in raw
 
     with pytest.raises(AssertionError):
@@ -208,7 +208,7 @@ def test_wheel_metadata_record_and_package_contents_are_exact(
     checkout_bytes = _expected_package_bytes()
     with zipfile.ZipFile(built_artifacts.wheel) as archive:
         files = {value.filename for value in archive.infolist() if not value.is_dir()}
-        dist_info = "untaped_orchestration-0.1.0.dist-info"
+        dist_info = "untaped_orchestration-0.1.1.dist-info"
         metadata_name = f"{dist_info}/METADATA"
         wheel_name = f"{dist_info}/WHEEL"
         entry_points_name = f"{dist_info}/entry_points.txt"
@@ -264,7 +264,7 @@ def test_wheel_metadata_record_and_package_contents_are_exact(
 def test_sdist_metadata_and_package_contents_are_exact(
     built_artifacts: BuiltArtifacts,
 ) -> None:
-    root = "untaped_orchestration-0.1.0"
+    root = "untaped_orchestration-0.1.1"
     checkout_bytes = _expected_package_bytes()
     support_bytes = {
         "LICENSE": (REPO_ROOT / "LICENSE").read_bytes(),
@@ -342,7 +342,7 @@ assert all(development != value and development not in value.parents for value i
     assert _run(console, "--help", cwd=root, cache=cache).stdout.startswith(
         b"Usage: untaped-orchestration"
     )
-    assert _run(console, "--version", cwd=root, cache=cache).stdout == b"0.1.0\n"
+    assert _run(console, "--version", cwd=root, cache=cache).stdout == b"0.1.1\n"
 
     repository = root / "repository"
     repository.mkdir()

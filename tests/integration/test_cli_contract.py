@@ -31,7 +31,7 @@ def test_version_is_exact_without_store_or_profile(monkeypatch, capsys) -> None:
         main()
     assert raised.value.code == 0
     captured = capsys.readouterr()
-    assert captured.out == "0.1.0\n"
+    assert captured.out == "0.1.1\n"
     assert captured.err == ""
 
 

@@ -19,7 +19,7 @@ import yaml
 # The ONLY block that varies between tools.
 DIST_NAME = "untaped-orchestration"
 CONSOLE_SCRIPT = "untaped-orchestration"
-EXPECTED_VERSION = "0.1.0"
+EXPECTED_VERSION = "0.1.1"
 # Internal untaped-ecosystem deps, as (PEP 508 requirement, uv-source rev or None):
 #   rev = "vX.Y.Z" when the dep is git-sourced in [tool.uv.sources]; None when it installs from PyPI.
 INTERNAL_DEPS: list[tuple[str, str | None]] = [

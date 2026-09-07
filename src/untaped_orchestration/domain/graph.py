@@ -856,6 +856,8 @@ def _delivered_diagnostics(
     graph: GraphState,
     active_descendants: list[TaskNode],
     undelivered: list[TaskNode],
+    *,
+    require_complete_federation: bool,
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     result = _readiness_for_node(node, graph)
@@ -885,7 +887,7 @@ def _delivered_diagnostics(
                 hint="Finish and deliver every descendant first.",
             )
         )
-    if not graph.completeness.complete:
+    if require_complete_federation and not graph.completeness.complete:
         diagnostics.append(
             _diagnostic(
                 node,
@@ -898,7 +900,11 @@ def _delivered_diagnostics(
     return diagnostics
 
 
-def _archive_lifecycle_diagnostics(graph: GraphState) -> list[Diagnostic]:
+def _archive_lifecycle_diagnostics(
+    graph: GraphState,
+    *,
+    require_complete_federation: bool,
+) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     task_incoming, _ = _incoming_supersession(graph)
     for task_node in graph.tasks:
@@ -914,7 +920,13 @@ def _archive_lifecycle_diagnostics(graph: GraphState) -> list[Diagnostic]:
         ]
         if task_node.task.outcome is TaskOutcome.DELIVERED:
             diagnostics.extend(
-                _delivered_diagnostics(task_node, graph, active_descendants, undelivered)
+                _delivered_diagnostics(
+                    task_node,
+                    graph,
+                    active_descendants,
+                    undelivered,
+                    require_complete_federation=require_complete_federation,
+                )
             )
         elif active_descendants:
             diagnostics.append(
@@ -940,7 +952,11 @@ def _archive_lifecycle_diagnostics(graph: GraphState) -> list[Diagnostic]:
     return diagnostics
 
 
-def validate_graph(graph: GraphState) -> tuple[Diagnostic, ...]:
+def validate_graph(
+    graph: GraphState,
+    *,
+    require_complete_federation: bool = True,
+) -> tuple[Diagnostic, ...]:
     tasks = _task_index(graph)
     decisions = _decision_index(graph)
     edges = _empty_edges()
@@ -951,6 +967,11 @@ def validate_graph(graph: GraphState) -> tuple[Diagnostic, ...]:
     diagnostics.extend(_cardinality_diagnostics(graph))
     diagnostics.extend(_cycle_diagnostics(edges, tasks, decisions))
     diagnostics.extend(_decision_lifecycle_diagnostics(graph))
-    diagnostics.extend(_archive_lifecycle_diagnostics(graph))
+    diagnostics.extend(
+        _archive_lifecycle_diagnostics(
+            graph,
+            require_complete_federation=require_complete_federation,
+        )
+    )
 
     return sort_diagnostics(diagnostics)

@@ -213,6 +213,36 @@ def test_selected_local_validation_warns_for_unresolved_remote_navigation_withou
     assert not any(value.code == "ORC004" for value in diagnostics)
 
 
+@pytest.mark.parametrize(
+    ("relation_kind", "target"),
+    [
+        (LinkRelation.GOVERNED_BY, did(2)),
+        (LinkRelation.FOLLOW_UP_TO, tid(2)),
+    ],
+)
+def test_selected_local_navigation_does_not_invalidate_unrelated_delivered_archive(
+    relation_kind: LinkRelation,
+    target: TaskId | DecisionId,
+) -> None:
+    delivered = archived(1, TaskOutcome.DELIVERED)
+    navigation = task(2, links=(relation(relation_kind, target, OTHER),))
+    selected = store_snapshot(
+        STORE,
+        (
+            loaded("archive/tasks/delivered.md", delivered),
+            loaded("tasks/navigation.md", navigation),
+        ),
+    )
+
+    diagnostics = validate_selected_local(snapshot(selected))
+
+    assert any(value.code == "ORC005" and value.severity == "warning" for value in diagnostics)
+    assert not any(
+        value.code == "ORC006" and "delivered closure requires complete federation" in value.message
+        for value in diagnostics
+    )
+
+
 @pytest.mark.parametrize("relation_kind", [LinkRelation.DEPENDS_ON, LinkRelation.SUPERSEDES])
 def test_selected_local_validation_preserves_illegal_cross_store_structural_errors(
     relation_kind: LinkRelation,

@@ -191,7 +191,12 @@ def register(app: App) -> None:  # noqa: C901
                 if check
                 else context.maintenance().render_write(context.location)
             )
-            return CommandResult("render", result, exit_code=0 if result.matches else 1)
+            return CommandResult(
+                "render",
+                result,
+                diagnostics=result.diagnostics,
+                exit_code=result_exit_code(result.diagnostics, 0 if result.matches else 1),
+            )
 
         run_command("render", action, fmt=format, allowed=("table", "json"), columns=columns)
 
