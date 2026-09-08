@@ -1,3 +1,19 @@
+# Retired: untaped-orchestration
+
+This repository is retired and retained as historical evidence. The standalone
+package is no longer maintained, and untaped 5.0.0 removes the built-in
+orchestration capability without a compatibility command.
+
+Active application development belongs in
+[untaped](https://github.com/alexisbeaulieu97/untaped). Work tracking uses GitHub
+Issues and Projects; architectural rationale lives in plain Markdown in the
+owning repository. Private planning remains private.
+
+The documentation below describes the historical package. Do not use its
+installation or development workflow for new work.
+
+---
+
 # untaped-orchestration
 
 `untaped-orchestration` is a standalone Python 3.14 CLI for Git-native, typed

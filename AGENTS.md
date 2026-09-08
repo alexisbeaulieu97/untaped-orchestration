@@ -1,3 +1,12 @@
+# Retired repository
+
+Do not implement or publish new work here. This repository is retained as
+historical evidence after retirement of the custom orchestration system.
+Use the owning active repository's AGENTS.md and GitHub planning workflow.
+The former development instructions below are historical and no longer active.
+
+---
+
 # AGENTS.md — untaped-orchestration
 
 This public repository owns the `untaped-orchestration` standalone CLI. It is a
